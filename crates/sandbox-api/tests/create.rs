@@ -145,6 +145,40 @@ async fn admits_a_valid_request() {
 }
 
 #[tokio::test]
+async fn bearer_scheme_is_case_insensitive_while_credentials_remain_exact() {
+    let Some(f) = fixture("active").await else {
+        return;
+    };
+    for (index, scheme) in ["Bearer", "bearer", "BEARER", "bEaReR"]
+        .into_iter()
+        .enumerate()
+    {
+        let key = format!("bearer-casing-request-{index}");
+        let mut request = f.request(Some(&key), Some(&f.token), f.valid_body());
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("{scheme} {}", f.token).parse().unwrap(),
+        );
+        let (status, body, _) = f.send(request).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{scheme}: {body}");
+    }
+    let wrong = ProjectToken::generate().unwrap().render_once();
+    for value in [
+        format!("bearer {wrong}"),
+        format!("Basic {}", f.token),
+        format!("BearerX {}", f.token),
+    ] {
+        let mut request = f.request(Some("invalid-auth-request-01"), None, f.valid_body());
+        request
+            .headers_mut()
+            .insert(header::AUTHORIZATION, value.parse().unwrap());
+        let (status, _, _) = f.send(request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    f.cleanup().await;
+}
+
+#[tokio::test]
 async fn a_retry_returns_the_same_handles() {
     let Some(f) = fixture("active").await else {
         return;
