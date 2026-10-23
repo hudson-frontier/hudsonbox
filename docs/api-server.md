@@ -53,6 +53,10 @@ Retry the same command with the same file after any uncertain result. It verifie
 
 ## Local control-plane example
 
+The [local certificate command](local-certificates.md) prepares a private
+development CA and distinct API/host/service identities. The standalone example
+below also supports an explicitly trusted self-signed loopback certificate.
+
 Prerequisites: the pinned Rust toolchain, `protoc`, Python 3, OpenSSL, and the [local PostgreSQL stack](implementation/dev-env.md). Run `make up` and configure `DATABASE_URL` from `.env.example`; the binary does not load `.env` automatically. This example uses a synthetic image digest to exercise admission. No runnable image is shipped and no customer command runs.
 
 Create private local configuration outside the repository:
