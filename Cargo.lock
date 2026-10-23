@@ -2350,6 +2350,7 @@ name = "sandbox-store"
 version = "0.0.0"
 dependencies = [
  "hex",
+ "percent-encoding",
  "sandbox-artifacts",
  "sandbox-cleanup",
  "sandbox-protocol",
@@ -2357,6 +2358,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqlx",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",

@@ -60,7 +60,7 @@ jobs:
       - name: Install protobuf compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler e2fsprogs
+          sudo apt-get install -y protobuf-compiler e2fsprogs postgresql-client-16
           protoc --version
 
       - name: Set up contract validation

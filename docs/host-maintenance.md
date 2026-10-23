@@ -107,6 +107,10 @@ epoch conflicts, and invalid/overflowing epochs are refused. Statement and lock
 waits are bounded to two seconds and one second respectively. An epoch floor
 does not replace a backup/restore protocol or authorize a database rollback.
 
+## Upgrade and recovery
+
+Follow the [offline upgrade and recovery procedure](operator-recovery.md) before replacing application/supervisor versions or restoring database state. It includes the compatibility matrix, private backup boundaries, quarantine requirements and an executable PostgreSQL dump/restore rehearsal. A restored epoch is not independent proof that old execution or storage writers have stopped.
+
 ## Validation and limits
 
 [Store tests](../crates/sandbox-store/tests/host_maintenance.rs) exercise epoch fencing, idempotence, unhealthy refusal, stale health and explicit reopening. [Controller tests](../crates/sandbox-controller/tests/host_maintenance.rs) prove placement exclusion while an admitted command reports a nonzero exit, followed by explicit destruction and reopening. The command's unit test rejects unsafe/private configuration boundaries.
