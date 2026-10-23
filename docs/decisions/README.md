@@ -12,6 +12,7 @@ A record belongs here when a choice is hard to reverse, when a reader would othe
 | [0002: no MCP server in the initial scope](0002-no-mcp-server-initially.md) | Revised: optional local SDK adapter | How agents reach the service |
 | [0003: root inside the guest, on our kernel and our init](0003-guest-root-with-our-kernel.md) | Accepted | What privilege a customer holds inside their own sandbox |
 | [0004: Apache-2.0 license](0004-apache-2-0-license.md) | Accepted | Terms the project is released under |
+| [0005: explicit literal-IP and DNS egress grants](0005-explicit-ip-and-dns-egress-grants.md) | Accepted | How static permissions and expiring DNS pins compose |
 
 ## Writing one
 
