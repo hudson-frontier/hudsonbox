@@ -66,7 +66,7 @@ pub(super) async fn execute(
     }
 }
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_history_rpc_reclaims_full_command_and_file_slots_and_preserves_fences() {
     let mut f = Fixture::new().await;
     let mut c = f.client().await;
@@ -305,7 +305,7 @@ async fn real_history_rpc_reclaims_full_command_and_file_slots_and_preserves_fen
     );
 }
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_history_reconciles_guest_completion_but_refuses_enlarged_guest_floor() {
     let mut f = Fixture::new().await;
     let mut c = f.client().await;
@@ -403,7 +403,7 @@ async fn real_history_reconciles_guest_completion_but_refuses_enlarged_guest_flo
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_history_refuses_staging_and_failed_host_persistence_never_deletes_guest_history() {
     let mut f = Fixture::new().await;
     let mut c = f.client().await;
@@ -575,7 +575,7 @@ pub(super) async fn public_capacity_retirement(
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_released_history_requires_cleanup_and_reconciles_across_epochs() {
     use sandbox_protocol::supervisor::ReleasedHistoryRequest;
     let mut f = Fixture::new().await;
@@ -703,7 +703,7 @@ async fn real_released_history_requires_cleanup_and_reconciles_across_epochs() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_released_history_fenced_absence_requires_retained_owner_and_clean_paths() {
     use sandbox_protocol::supervisor::ReleasedHistoryRequest;
     let mut f = Fixture::new().await;

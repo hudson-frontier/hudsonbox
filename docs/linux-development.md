@@ -103,25 +103,30 @@ The production supervisor must account for this behavior. A launcher acknowledge
 
 ## Prepare the pinned controlled-test artifacts
 
-The opt-in helper downloads the exact aarch64 Firecracker 1.17.0 archive and
-6.1.186 kernel URLs/hashes recorded in the boot evidence. It accepts only a new
+The opt-in helper downloads the native `aarch64` or `x86_64` Firecracker 1.17.0
+archive and 6.1.186 development kernel using the reviewed
+[runtime artifact pins](../dev/runtime-artifacts.json). The aarch64 pins preserve
+the recorded boot/public-execute artifacts; the x86_64 archive matches the
+[published release digest](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.17.0).
+The versioned upstream CI kernels are pinned by observed SHA-256; this is not
+kernel source attestation or a production image build. It accepts only a new
 absolute destination under an existing canonical parent, verifies bounded HTTPS
-downloads before writing, verifies extracted binary hashes from the tracked
-public-execute evidence, selects only the two exact regular binary members
+downloads before writing, verifies the selected architecture's extracted binary
+hashes, selects only the two exact regular binary members
 without extracting archive paths, and refuses overwrite. If publication fails, it leaves the partial destination
 for operator inspection; it never deletes that destination or retries over it.
 It runs without sudo
-and never creates or starts a VM. It does not build a production guest image,
-attest the upstream kernel, or support x86_64; reviewed pins for that architecture
-remain separate work. Network access is explicit when invoking it.
-Native `arm64`/`ARM64` host labels are accepted as aliases for `aarch64`, so
-preparing those same artifacts on an ARM host does not require a spelling override.
+and never creates or starts a VM. Network access is explicit when invoking it.
+Native `arm64`/`ARM64` host labels select `aarch64`; `amd64`/`AMD64` select
+`x86_64`. The controlled VM fixture uses the same pin file and selects the native
+test binary's architecture. It does not permit architecture emulation.
 
 Run inside the development Linux host, with trusted operator-selected paths:
 
 ```sh
 python3 scripts/prepare_runtime_artifacts.py \
   --architecture aarch64 --destination /absolute/new/runtime-artifacts
+# On a native x86_64 Linux host, select --architecture x86_64 instead.
 cargo build --locked --release -p sandbox-guest
 export HUDSON_GUARDIAN_ARTIFACT_DIR=/absolute/new/runtime-artifacts
 export HUDSON_GUARDIAN_GUEST_BINARY=/absolute/source/target/release/sandbox-guest
@@ -132,8 +137,10 @@ Firecracker, jailer and kernel hashes. The guest binary remains a reviewed local
 build; the fixture constructs a disposable BusyBox image containing that binary
 and its local runtime libraries. Supply the environment explicitly through your
 reviewed root test invocation; do not preserve an entire untrusted environment.
-The fixture still requires aarch64 Linux/KVM, BusyBox, e2fsprogs and its dedicated
-cgroup parent. Database and private object-storage configuration are independent
+The fixture requires native Linux/KVM, cgroup v2, BusyBox, e2fsprogs and its
+dedicated cgroup parent. Preparing x86_64 artifacts or compiling its fixture does
+not establish that the real-VM tests or supported-host qualification passed.
+Database and private object-storage configuration are independent
 prerequisites for API/output/file cases. No helper supplies credentials or runs
 privileged tests automatically.
 
