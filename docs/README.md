@@ -22,6 +22,7 @@ The repository is in **early implementation**. PostgreSQL-backed API routes, the
 | [Guest runner](guest-runner.md) | Guest process execution, bounded output and local recovery receipts | What the command component implements and what host protections remain |
 | [Linux development](linux-development.md) | Nested Linux/KVM setup and real boot evidence | How to develop the guest and real supervisor |
 | [API server](api-server.md) | HTTPS transport, offline provisioning, and runnable local setup | How to start and call the implemented API |
+| [Native source installation](source-installation.md) | Committed source builds, native binary profiles and private installation receipts | How to install tools without replacing an existing instance |
 | [API contract](api-contract.md) | Admission, SDK/CLI behavior, request retries, response/errors, files, streaming semantics | How clients interact with the service |
 | [Rust client and project CLI](client-cli.md) | Private configuration, stable keys, commands, files, streams and exit codes | How to use the implemented Project API |
 | [Python and TypeScript clients](language-clients.md) | Language APIs, integer precision, streams, files and package validation | How to call the Project API from Python or Node |
