@@ -107,6 +107,47 @@ async fn report(
 }
 
 impl Store {
+    /// Issue exactly one successor database epoch under operator authority.
+    /// Draining/unhealthy hosts remain closed to placement. An exact retry can
+    /// report the successor's current state, but cannot refresh or reopen it.
+    /// This neither stops a physical incarnation nor releases any reservation.
+    pub async fn advance_host_epoch(
+        &self,
+        host: HostId,
+        expected_epoch: i64,
+    ) -> Result<HostMaintenance, Error> {
+        let next = expected_epoch
+            .checked_add(1)
+            .filter(|_| expected_epoch > 0)
+            .ok_or(Error::Conflict)?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET LOCAL statement_timeout='2s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout='1s'")
+            .execute(&mut *tx)
+            .await?;
+        let (current, status): (i64, String) =
+            sqlx::query_as("SELECT supervisor_epoch,status FROM hosts WHERE id=$1 FOR UPDATE")
+                .bind(host.uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(Error::Conflict)?;
+        if current != next {
+            if current != expected_epoch || !matches!(status.as_str(), "draining" | "unhealthy") {
+                return Err(Error::Conflict);
+            }
+            let changed = sqlx::query("UPDATE hosts SET supervisor_epoch=$3,status='draining',last_seen_at=NULL,updated_at=clock_timestamp() WHERE id=$1 AND supervisor_epoch=$2")
+                .bind(host.uuid()).bind(expected_epoch).bind(next).execute(&mut *tx).await?.rows_affected();
+            if changed != 1 {
+                return Err(Error::Conflict);
+            }
+        }
+        let value = report(&mut tx, host, next).await?;
+        tx.commit().await?;
+        Ok(value)
+    }
+
     /// Provision once in draining state, without an authenticated observation.
     /// Exact retries report the current state; they never reset health, reopen
     /// admission, change an epoch or overwrite an existing host's configuration.
