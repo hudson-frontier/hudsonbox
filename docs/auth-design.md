@@ -29,6 +29,8 @@ Keep the existing opaque project tokens: a random 256-bit secret, nonsecret look
 
 Hudson's backend or another application's backend sends the token in an Authorization bearer header over HTTPS. No call to Hudson's identity system is needed. Project credentials cannot authenticate to admin routes, even if the client submits `role=admin`, changes a URL, or knows another project's ID.
 
+The HTTP authentication scheme is case-insensitive: `Bearer`, `bearer` and mixed-case spellings identify the same scheme, as required by [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#section-11.1). The credential itself is preserved byte-for-byte and remains case-sensitive.
+
 ### Admin credentials
 
 Use a separate opaque credential with a random 256-bit secret. Local setup, running under installation-administrator authority, creates the first named admin credential. Store its ID, label, hash, expiry, revocation state, and configuration revision in administrator-controlled deployment configuration. Never store its raw value in project rows, repository files, or UI assets.

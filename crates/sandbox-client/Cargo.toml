@@ -27,7 +27,7 @@ url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "test-util"] }
 axum.workspace = true
 rcgen.workspace = true
 sandbox-api = { path = "../sandbox-api" }

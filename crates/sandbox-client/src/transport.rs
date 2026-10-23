@@ -159,11 +159,12 @@ impl Client {
         status: u16,
     ) -> Result<EventStream, Error> {
         // API streams last at most 90 seconds. Idle timeout remains 20 seconds.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
         let response = self
             .send(request.timeout(Duration::from_secs(100)), status)
             .await?;
         content_type(&response, "text/event-stream")?;
-        Ok(EventStream::new(response))
+        Ok(EventStream::new(response, deadline))
     }
     pub(super) async fn binary(
         &self,
