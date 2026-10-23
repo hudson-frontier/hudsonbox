@@ -5,7 +5,7 @@ use sandbox_store::{Store, lists::PageLimit, reads::OperationView};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
-async fn fixture(pool: &PgPool) -> (Store, ProjectId, OperationId) {
+async fn fixture(pool: &PgPool, controlled_clock: bool) -> (Store, ProjectId, OperationId) {
     let project = ProjectId::generate();
     let sandbox = SandboxId::generate();
     let operation = OperationId::generate();
@@ -23,8 +23,9 @@ async fn fixture(pool: &PgPool) -> (Store, ProjectId, OperationId) {
         .bind(json!({"exit_code":1})).bind(json!({"code":"fixture_failure"})).execute(pool).await.unwrap();
     // The macro owns this entire isolated database. Only the dedicated reader
     // below uses this shadow clock; no shared cluster function is replaced.
-    sqlx::raw_sql(
-        r#"
+    if controlled_clock {
+        sqlx::raw_sql(
+            r#"
         CREATE SEQUENCE expiry_read_clock;
         CREATE FUNCTION public.clock_timestamp() RETURNS timestamptz
         LANGUAGE plpgsql VOLATILE AS $$
@@ -37,10 +38,11 @@ async fn fixture(pool: &PgPool) -> (Store, ProjectId, OperationId) {
           RETURN expiry+interval '1 millisecond';
         END $$;
     "#,
-    )
-    .execute(pool)
-    .await
-    .unwrap();
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
     let reader = PgPoolOptions::new()
         .max_connections(1)
         .after_connect(|connection, _| {
@@ -78,7 +80,7 @@ fn coherent(view: &OperationView) {
 async fn operation_expiry_and_payload_remain_coherent_when_the_clock_crosses_the_deadline(
     pool: PgPool,
 ) {
-    let (store, project, operation) = fixture(&pool).await;
+    let (store, project, operation) = fixture(&pool, true).await;
     let view = store
         .operation_for_project(project, operation)
         .await
@@ -99,7 +101,7 @@ async fn operation_expiry_and_payload_remain_coherent_when_the_clock_crosses_the
 async fn collection_expiry_and_payload_remain_coherent_when_the_clock_crosses_the_deadline(
     pool: PgPool,
 ) {
-    let (store, project, operation) = fixture(&pool).await;
+    let (store, project, operation) = fixture(&pool, true).await;
     let page = store
         .list_operations(project, None, None, PageLimit::new(1).unwrap())
         .await
@@ -114,5 +116,53 @@ async fn collection_expiry_and_payload_remain_coherent_when_the_clock_crosses_th
     assert_eq!(expired.items.len(), 1);
     assert!(expired.items[0].response_expired());
     coherent(&expired.items[0]);
+    store.pool().close().await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn cached_operation_query_samples_database_time_after_relation_lock_wait(pool: PgPool) {
+    use std::time::Duration;
+    let (store, project, operation) = fixture(&pool, false).await;
+    let warm = store
+        .operation_for_project(project, operation)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!warm.response_expired);
+    let expiry: time::OffsetDateTime = sqlx::query_scalar("UPDATE operations SET response_expires_at=pg_catalog.clock_timestamp()+interval '500 milliseconds' WHERE id=$1 RETURNING response_expires_at")
+        .bind(operation.uuid()).fetch_one(&pool).await.unwrap();
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE operations IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let reader = store.clone();
+    let task = tokio::spawn(async move { reader.operation_for_project(project, operation).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'WITH response_clock AS MATERIALIZED%SELECT id,sandbox_id,%')")
+                .fetch_one(&pool).await.unwrap();
+            if blocked { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        loop {
+            let expired: bool = sqlx::query_scalar("SELECT pg_catalog.clock_timestamp()>=$1")
+                .bind(expiry).fetch_one(&pool).await.unwrap();
+            if expired { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    lock.commit().await.unwrap();
+    let view = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        view.response_expired,
+        "database decision must be fresh without the API fallback"
+    );
+    assert!(view.result.is_none() && view.error.is_none());
     store.pool().close().await;
 }
