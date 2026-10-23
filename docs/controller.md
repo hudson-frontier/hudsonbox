@@ -174,7 +174,8 @@ and recover its upload under replacement workers without duplicate publication.
 These checks use PostgreSQL and authenticated fake-host RPCs, not a real VM.
 The [shutdown tests](../crates/sandbox-controller/tests/shutdown.rs) exercise
 completion of current work, idle wake-up, a shared drain deadline, task failure
-supervision, and real SIGINT/SIGTERM delivery to the controller binary.
+supervision, real SIGINT/SIGTERM delivery to the controller binary, and a second
+signal interrupting a tick blocked on a database lock.
 
 ## Command admission and dispatch ownership
 

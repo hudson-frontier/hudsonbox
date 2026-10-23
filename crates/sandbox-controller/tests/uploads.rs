@@ -905,7 +905,7 @@ async fn worker_pool_maintains_and_destroys_other_sandboxes_during_a_blocked_sou
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
-async fn worker_pool_shutdown_cancels_blocked_reads_and_recovers_without_republishing(
+async fn worker_pool_drain_deadline_cancels_blocked_reads_and_recovers_without_republishing(
     pool: PgPool,
 ) {
     let _guard = TEST_LOCK.lock().await;

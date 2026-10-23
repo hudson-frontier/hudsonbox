@@ -126,7 +126,7 @@ async fn service_binary_drains_on_sigterm_and_sigint(pool: PgPool) {
     // Reuse this test's isolated database, not the repository's shared database.
     use sqlx::ConnectOptions;
     let database_url = pool.connect_options().to_url_lossy().to_string();
-    for signal in ["-TERM", "-INT"] {
+    for (signal, force) in [("-TERM", false), ("-INT", false), ("-TERM", true)] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_sandbox-controller"))
             .env("DATABASE_URL", &database_url)
             .arg("--endpoint")
@@ -163,6 +163,34 @@ async fn service_binary_drains_on_sigterm_and_sigint(pool: PgPool) {
         })
         .await
         .unwrap();
+        // Keep a real tick in flight so a second signal must end the drain.
+        let blocker = if force {
+            let mut transaction = pool.begin().await.unwrap();
+            sqlx::query("LOCK TABLE hosts IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    let waiting: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                         WHERE datname=current_database() AND wait_event_type='Lock')",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    if waiting {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            Some(transaction)
+        } else {
+            None
+        };
         assert!(
             Command::new("kill")
                 .arg(signal)
@@ -172,6 +200,29 @@ async fn service_binary_drains_on_sigterm_and_sigint(pool: PgPool) {
                 .unwrap()
                 .success()
         );
+        let mut drained = false;
+        if force {
+            timeout(Duration::from_secs(2), async {
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    if line == "sandbox controller: stopping new ticks and draining workers" {
+                        drained = true;
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(drained);
+            assert!(
+                Command::new("kill")
+                    .arg("-INT")
+                    .arg(child.id().unwrap().to_string())
+                    .status()
+                    .await
+                    .unwrap()
+                    .success()
+            );
+        }
         assert!(
             timeout(Duration::from_secs(5), child.wait())
                 .await
@@ -179,10 +230,15 @@ async fn service_binary_drains_on_sigterm_and_sigint(pool: PgPool) {
                 .unwrap()
                 .success()
         );
-        let mut drained = false;
+        let mut forced = false;
         while let Some(line) = lines.next_line().await.unwrap() {
             drained |= line == "sandbox controller: stopping new ticks and draining workers";
+            forced |= line == "sandbox controller: second stop signal; interrupting workers";
         }
         assert!(drained, "{signal} bypassed the controller drain");
+        assert_eq!(forced, force);
+        if let Some(transaction) = blocker {
+            transaction.rollback().await.unwrap();
+        }
     }
 }
