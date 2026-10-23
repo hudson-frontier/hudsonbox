@@ -9,11 +9,11 @@ from unittest.mock import patch
 import prepare_runtime_artifacts as artifacts
 
 
-def archive(kind='files'):
+def archive(kind='files', architecture='aarch64'):
     data = io.BytesIO()
     with tarfile.open(fileobj=data, mode='w:gz') as output:
         for name in ('firecracker', 'jailer'):
-            member = tarfile.TarInfo(f'release-v1.17.0-aarch64/{name}-v1.17.0-aarch64')
+            member = tarfile.TarInfo(f'release-v1.17.0-{architecture}/{name}-v1.17.0-{architecture}')
             if kind == 'symlink':
                 member.type = tarfile.SYMTYPE
                 member.linkname = '/etc/passwd'
@@ -55,6 +55,27 @@ class PreparationTests(unittest.TestCase):
     def test_downgrade_redirect_is_rejected(self):
         with self.assertRaises(ValueError):
             artifacts.HTTPSRedirects().redirect_request(None, None, 302, '', {}, 'http://example.test/')
+
+    def test_native_x86_names_select_only_the_x86_release_and_kernel(self):
+        with tempfile.TemporaryDirectory() as root:
+            for index, architecture in enumerate(('x86_64', 'amd64', 'AMD64')):
+                requested = []
+                def fetch(spec):
+                    requested.append(spec['url'])
+                    return archive(architecture='x86_64') if 'tgz' in spec['url'] else b'kernel'
+                destination = Path(root).resolve() / f'artifacts-{index}'
+                artifacts.prepare(destination, architecture, fetch)
+                self.assertTrue(all('x86_64' in url for url in requested))
+                self.assertEqual((destination / 'vmlinux-6.1.186').read_bytes(), b'kernel')
+                self.assertEqual(len(list(destination.rglob('*x86_64'))), 3)
+                self.assertFalse(any(destination.rglob('*aarch64*')))
+
+    def test_wrong_architecture_archive_fails_before_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root).resolve() / 'artifacts'
+            with self.assertRaises(ValueError):
+                artifacts.prepare(destination, 'x86_64', lambda _: archive())
+            self.assertFalse(destination.exists())
 
     def test_oversized_download(self):
         response = io.BytesIO(b'12345')
@@ -109,7 +130,7 @@ class PreparationTests(unittest.TestCase):
 
     def test_unsupported_architecture_fails_before_download(self):
         with self.assertRaises(ValueError):
-            artifacts.prepare('/tmp/unused', 'x86_64', lambda _: self.fail('download'))
+            artifacts.prepare('/tmp/unused', 'riscv64', lambda _: self.fail('download'))
 
     def test_corrupt_download_fails(self):
         response = io.BytesIO(b'corrupt')

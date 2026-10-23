@@ -24,7 +24,7 @@ pub(super) fn upload(owner: &Ownership, path: &str, bytes: &[u8]) -> FileRequest
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_supervisor_file_fencing_publication_capacity_and_restart() {
     let mut f = Fixture::new().await;
     let mut c = f.client().await;
