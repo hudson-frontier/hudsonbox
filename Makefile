@@ -36,7 +36,11 @@ reset-db: ## Drop and recreate the development schema
 	docker compose exec -T postgres psql -U sandbox -d sandbox -q \
 		-c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 
-check: runtime-artifacts-test guest-image-check host-image-check api sdk-check mcp-check lint test docs doctor-check ## Everything CI checks
+check: runtime-artifacts-test guest-image-check host-image-check api sdk-check mcp-check lint test docs doctor-check source-install-check ## Everything CI checks
+
+.PHONY: source-install-check
+source-install-check: ## Test native source installation without compiling or starting services
+	python3 -m unittest discover -s scripts -p test_install_source.py
 
 docs: ## Documentation link and fence checks
 	python3 scripts/check_docs.py

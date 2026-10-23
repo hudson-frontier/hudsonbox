@@ -27,6 +27,8 @@ jobs:
           persist-credentials: false
       - name: Test runtime artifact preparation
         run: make runtime-artifacts-test
+      - name: Test native source installation boundaries
+        run: make source-install-check
       - name: Check documentation
         run: python3 scripts/check_docs.py
       - name: Test local prerequisite diagnosis

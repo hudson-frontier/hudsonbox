@@ -42,6 +42,11 @@ and [authenticated API setup](api-server.md). Starting local dependencies and
 provisioning credentials are explicit operator steps, not doctor side effects.
 The fake supervisor never executes customer code and is not an isolation substitute.
 
+The [source installer](source-installation.md) builds committed native tools into
+a new private prefix and records their source and binary hashes. It provides
+application binaries; instance provisioning and runtime acceptance retain their
+separate gates.
+
 ## Check the actual Linux runtime host
 
 Firecracker requires Linux/KVM. Run this profile **inside** the dedicated Linux
