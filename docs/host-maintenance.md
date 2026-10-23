@@ -1,6 +1,6 @@
 # Local host maintenance
 
-The offline `sandbox-host-manager` command provides the draining slice of [#116](https://github.com/hudson-frontier/hudsonbox/issues/116). It uses trusted operator database access; no new public management endpoint or guest authority is exposed. [Capability enrollment](host-capabilities.md) adds a separate operator-approved compatibility contract. Backup/restore rehearsals and supported-host upgrade qualification remain work in that issue.
+The offline `sandbox-host-manager` command provides initial host provisioning and draining for [#116](https://github.com/hudson-frontier/hudsonbox/issues/116). It uses trusted operator database access; no new public management endpoint or guest authority is exposed. [Capability enrollment](host-capabilities.md) adds a separate operator-approved compatibility contract. Backup/restore rehearsals and supported-host upgrade qualification remain work in that issue.
 
 ## Private configuration and commands
 
@@ -15,7 +15,47 @@ cargo run -p sandbox-controller --bin sandbox-host-manager -- \
   --database-config /private/database.json --host-id HOST_ID --host-epoch CURRENT_EPOCH finish-drain
 ```
 
-Use the explicitly provisioned typed host ID and expected positive epoch. These drain/status commands do not issue/replace an epoch, change capacity, approve an image or turn an unhealthy host ready. The separate `set-capabilities` action approves a contract only on an empty draining host. Database access is installation-wide operator authority, not a Project credential or implicit delegation to an agent.
+Use the explicitly chosen typed host ID and expected positive epoch retained in the host's private configuration. The initial provisioning command below creates its database row. The drain/status commands do not issue/replace an epoch, change capacity, approve an image or turn an unhealthy host ready. The separate `set-capabilities` action approves a contract only on an empty draining host. Database access is installation-wide operator authority, not a Project credential or implicit delegation to an agent.
+
+## Initial host provisioning
+
+Prepare an operator-owned `0600` JSON document with these fields:
+
+| Field | Required value |
+| --- | --- |
+| `version` | `1` |
+| `capacity` | Total schedulable `vcpu`, `memory_mib` and `disk_mib`, after operator headroom |
+| `capabilities` | The complete approved version 1 [capability contract](host-capabilities.md#contract-and-evidence) |
+
+All capacities must be positive, fit their database integer types and cover the
+advertised per-allocation limits. The document and private database configuration
+have the same ownership, regular-file, permission and 64 KiB bounds. Unknown or
+duplicate fields and incompatible capability metadata fail validation.
+
+```sh
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json --host-id HOST_ID --host-epoch INITIAL_EPOCH \
+  provision --host-config /private/host-provision.json
+```
+
+The transaction creates a host in `draining` state with approved compatibility
+metadata and no service observation. It returns the ordinary maintenance report.
+The host cannot admit a new placement until the configured controller observes
+matching host identity, epoch and capabilities over gRPC/mTLS, then the operator
+explicitly runs `finish-drain`. Credentials, certificates, immutable runtime
+artifacts and the host process are provisioned through their existing operator
+procedures. This command approves metadata; it does not establish physical
+capacity, execution, image integrity or isolation qualification.
+
+Retain the ID, epoch and exact input before making the first attempt. After a
+lost response, retry that same tuple. An exact retry reports current state,
+including an already ready, draining or unhealthy host, without changing its
+timestamps, observations, capacity, allocations or pending work. Changed
+capacity, policy or epoch conflicts. Existing legacy rows cannot be implicitly
+enrolled through this command; use the explicit empty-host capability procedure.
+Statement execution is bounded to two seconds and lock waits to one second in
+the provisioning transaction. A failed response can follow a successful commit;
+retrying reconciles the existing row instead of assigning another identity.
 
 ## Drain and completion semantics
 
@@ -30,5 +70,10 @@ Let admitted work finish or explicitly cancel/destroy the relevant sandbox throu
 ## Validation and limits
 
 [Store tests](../crates/sandbox-store/tests/host_maintenance.rs) exercise epoch fencing, idempotence, unhealthy refusal, stale health and explicit reopening. [Controller tests](../crates/sandbox-controller/tests/host_maintenance.rs) prove placement exclusion while an admitted command reports a nonzero exit, followed by explicit destruction and reopening. The command's unit test rejects unsafe/private configuration boundaries.
+
+[Provisioning tests](../crates/sandbox-store/tests/host_provisioning.rs) cover a
+new draining host, exact and competing retries, changed-input conflicts,
+legacy refusal, bounds, authenticated-observation gating and retained allocation
+claims on a busy draining host.
 
 These PostgreSQL/simulated-host checks validate maintenance coordination, not a real host drain or backup/restore procedure. Supported-host qualification, independent operator acceptance and future multi-host/cloud/provider decisions remain the [roadmap](roadmap.md). Saved-memory draining requires verified full pause/resume; it is not implied by this command.
