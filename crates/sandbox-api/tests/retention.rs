@@ -326,7 +326,8 @@ async fn response_expiry_is_rechecked_after_a_database_lock_wait(pool: PgPool) {
     });
     tokio::time::timeout(Duration::from_secs(5),async {
         loop {
-            let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT id,sandbox_id,%FROM operations WHERE id=$1 AND project_id=$2')")
+            // Match the unique read prefix: pg_stat_activity can truncate long SQL.
+            let blocked:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'WITH response_clock AS MATERIALIZED%SELECT id,sandbox_id,%')")
                 .fetch_one(&pool).await.unwrap();
             if blocked { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;

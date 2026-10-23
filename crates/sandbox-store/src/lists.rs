@@ -1,7 +1,7 @@
 //! Tenant-scoped bounded collection reads. Cursors supply positions, never authority.
 use crate::{
     Store, StoreError,
-    reads::{OPERATION_COLUMNS, OperationView, SandboxView, operation_view, sandbox_view},
+    reads::{OPERATION_READ, OperationView, SandboxView, operation_view, sandbox_view},
 };
 use sandbox_protocol::{Id, ProjectId, SandboxId};
 use sqlx::{Postgres, QueryBuilder};
@@ -80,9 +80,7 @@ impl Store {
         before: Option<Position>,
         limit: PageLimit,
     ) -> Result<Page<OperationView>, StoreError> {
-        let mut query = QueryBuilder::new(format!(
-            "SELECT {OPERATION_COLUMNS} FROM operations WHERE project_id="
-        ));
+        let mut query = QueryBuilder::new(format!("{OPERATION_READ} WHERE project_id="));
         query.push_bind(project.uuid());
         if let Some(sandbox) = sandbox {
             query.push(" AND sandbox_id=").push_bind(sandbox.uuid());
