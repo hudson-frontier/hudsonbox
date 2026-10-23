@@ -198,7 +198,19 @@ async fn cleanup_completion_rechecks_lease_after_both_lock_waits(pool: PgPool) {
         assert!(matches!(task.await.unwrap(), Err(OutputError::LostClaim)));
         assert!(stored(&f).await.is_none());
         // Complete this fixture so the next iteration does not claim it.
-        let next = next(&f).await;
+        // Failed completion drops its transaction. SQLx queues the rollback,
+        // so SKIP LOCKED can temporarily find no replacement claim until that
+        // connection finishes releasing its row locks.
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(claim) = f.store.claim_output_cleanup(30).await.unwrap() {
+                    break claim;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("rollback must release the cleanup claim");
         let receipt = completion(&ready(&f, &next).await);
         f.store
             .complete_output_cleanup(&next, &receipt, true)
