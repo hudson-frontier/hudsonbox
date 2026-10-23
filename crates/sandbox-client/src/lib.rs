@@ -121,6 +121,25 @@ impl Client {
         }
     }
 
+    /// Read one operation with a caller-selected JSON byte limit (1 byte to 2 MiB).
+    /// The limit applies before decoding, including ignored fields and whitespace.
+    /// Oversized success bodies are protocol errors; oversized problems retain
+    /// their HTTP status without their body. This never retries or mutates.
+    pub async fn get_operation_bounded(
+        &self,
+        args: requests::GetOperation<'_>,
+        max_response_bytes: usize,
+    ) -> Result<models::OperationBody, Error> {
+        if !(1..=2 * 1024 * 1024).contains(&max_response_bytes) {
+            return Err(Error::Request);
+        }
+        let request = self.request(
+            reqwest::Method::GET,
+            &["v1", "operations", args.operation_id],
+        )?;
+        self.json_bounded(request, 200, max_response_bytes).await
+    }
+
     /// Polls only this operation. Timeout and disconnect never cancel or resubmit it.
     pub async fn wait(
         &self,

@@ -114,10 +114,18 @@ impl Client {
             .body(body.to_vec()))
     }
     async fn send(&self, request: RequestBuilder, status: u16) -> Result<Response, Error> {
+        self.send_bounded_problem(request, status, 65536).await
+    }
+    async fn send_bounded_problem(
+        &self,
+        request: RequestBuilder,
+        status: u16,
+        problem_limit: usize,
+    ) -> Result<Response, Error> {
         let response = request.send().await.map_err(|_| Error::Transport)?;
         if response.status().as_u16() != status {
             let status = response.status().as_u16();
-            let problem = bounded(response, 65536)
+            let problem = bounded(response, problem_limit)
                 .await
                 .ok()
                 .and_then(|b| serde_json::from_slice::<ProblemBody>(&b).ok())
@@ -141,9 +149,19 @@ impl Client {
         request: RequestBuilder,
         status: u16,
     ) -> Result<T, Error> {
-        let response = self.send(request, status).await?;
+        self.json_bounded(request, status, 2 * 1024 * 1024).await
+    }
+    pub(super) async fn json_bounded<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        status: u16,
+        limit: usize,
+    ) -> Result<T, Error> {
+        let response = self
+            .send_bounded_problem(request, status, limit.min(65536))
+            .await?;
         content_type(&response, "application/json")?;
-        let body = bounded(response, 2 * 1024 * 1024).await?;
+        let body = bounded(response, limit).await?;
         serde_json::from_slice(&body).map_err(|_| Error::Protocol)
     }
     pub(super) async fn empty(&self, request: RequestBuilder, status: u16) -> Result<(), Error> {
