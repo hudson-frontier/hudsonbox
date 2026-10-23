@@ -31,7 +31,7 @@ For a terminal operation at or after its assigned deadline:
 
 Current authentication and tenant ownership still apply. Missing and cross-project IDs return the same `404`; revoked credentials do not gain access to expired identities. All responses remain `Cache-Control: no-store`. Before expiry, existing response shapes are preserved and the optional `response_expired` field is absent.
 
-Individual and list queries suppress expired result/error bodies using database time. The API checks expiry again before forming the body, retaining the database's expired decision even if its own clock is behind. Retry expiry is evaluated at database retry resolution, after digest comparison and before considering today's sandbox lifecycle. Active and unknown operations remain inspectable even if an out-of-band edit gave them an elapsed response deadline; ordinary policy assignment never does that.
+Individual and list queries use one fresh database-time observation after lock waits for the expiry flag, result/error filtering and output-expiry metadata. Separate clock evaluations cannot label a body unexpired while filtering it as expired. The API checks expiry again before forming the body, retaining the database's expired decision even if its own clock is behind. Retry expiry is evaluated at database retry resolution, after digest comparison and before considering today's sandbox lifecycle. Active and unknown operations remain inspectable even if an out-of-band edit gave them an elapsed response deadline; ordinary policy assignment never does that.
 
 ## Payload compaction
 

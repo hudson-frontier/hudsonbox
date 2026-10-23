@@ -12,15 +12,19 @@ use uuid::Uuid;
 
 use crate::{Store, StoreError};
 
-// Shared by individual and collection reads. Do not fetch expired result/error
-// bodies into API memory. The wire layer also rechecks time before serialization.
-pub(crate) const OPERATION_COLUMNS: &str = "id,sandbox_id,target_operation_id,kind,status,phase,created_at,completed_at,
+// Share one database-time observation across expiry flags and bodies. Materialize
+// only the clock, keeping operation filters/indexes available to the planner.
+// Do not fetch expired result/error bodies into API memory.
+// The wire layer also rechecks time before serialization.
+pub(crate) const OPERATION_READ: &str = "WITH response_clock AS MATERIALIZED (SELECT clock_timestamp() AS read_at)
+    SELECT id,sandbox_id,target_operation_id,kind,status,phase,created_at,completed_at,
     CASE WHEN status IN ('succeeded','failed','cancelled') THEN response_expires_at END AS response_expires_at,
-    COALESCE(status IN ('succeeded','failed','cancelled') AND response_expires_at<=clock_timestamp(),false) AS response_expired,
-    CASE WHEN status IN ('succeeded','failed','cancelled') AND response_expires_at<=clock_timestamp() THEN NULL ELSE result END AS result,
-    CASE WHEN status IN ('succeeded','failed','cancelled') AND response_expires_at<=clock_timestamp() THEN NULL ELSE error END AS error,
-    CASE WHEN output_status<>'none' AND (output_expires_at<=clock_timestamp() OR response_expires_at<=clock_timestamp())
-        THEN 'expired' ELSE output_status END AS output_status";
+    COALESCE(status IN ('succeeded','failed','cancelled') AND response_expires_at<=response_clock.read_at,false) AS response_expired,
+    CASE WHEN status IN ('succeeded','failed','cancelled') AND response_expires_at<=response_clock.read_at THEN NULL ELSE result END AS result,
+    CASE WHEN status IN ('succeeded','failed','cancelled') AND response_expires_at<=response_clock.read_at THEN NULL ELSE error END AS error,
+    CASE WHEN output_status<>'none' AND (output_expires_at<=response_clock.read_at OR response_expires_at<=response_clock.read_at)
+        THEN 'expired' ELSE output_status END AS output_status
+    FROM operations CROSS JOIN response_clock";
 
 /// An operation as a caller sees it.
 #[derive(Debug, Clone)]
@@ -105,14 +109,12 @@ impl Store {
         project_id: ProjectId,
         operation_id: OperationId,
     ) -> Result<Option<OperationView>, StoreError> {
-        let row = sqlx::query(&format!(
-            "SELECT {OPERATION_COLUMNS} FROM operations WHERE id=$1 AND project_id=$2"
-        ))
-        .bind(operation_id.uuid())
-        .bind(project_id.uuid())
-        .fetch_optional(self.pool())
-        .await
-        .map_err(StoreError::Query)?;
+        let row = sqlx::query(&format!("{OPERATION_READ} WHERE id=$1 AND project_id=$2"))
+            .bind(operation_id.uuid())
+            .bind(project_id.uuid())
+            .fetch_optional(self.pool())
+            .await
+            .map_err(StoreError::Query)?;
 
         let Some(row) = row else { return Ok(None) };
 
