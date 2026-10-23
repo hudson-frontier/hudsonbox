@@ -4,7 +4,7 @@ The version 1 capability contract adds authenticated compatibility checks to the
 
 ## Contract and evidence
 
-An operator provisions the existing host row, positive supervisor epoch, capacity, host server certificate and controller certificate pins. `hosts.compatibility` holds the approved contract. The controller obtains `HostInfo.capabilities_json` through its configured gRPC/mTLS connection, verifies host ID, epoch and simulation policy, then stores matching metadata in `hosts.runtime_capabilities`. Health cannot insert a host, approve its own policy, change capacity/epoch or promote a draining host.
+An operator uses [offline provisioning](host-maintenance.md#initial-host-provisioning) for the initial draining host row, positive supervisor epoch, capacity and approved policy, and separately supplies the host server certificate and controller certificate pins. `hosts.compatibility` holds the approved contract. The controller obtains `HostInfo.capabilities_json` through its configured gRPC/mTLS connection, verifies host ID, epoch and simulation policy, then stores matching metadata in `hosts.runtime_capabilities`. Health cannot insert a host, approve its own policy, change capacity/epoch or promote a draining host.
 
 [The shared contract](../crates/sandbox-protocol/src/host_capabilities.rs) rejects unknown/duplicate fields, unsupported versions, duplicate image digests and input above 64 KiB. It records:
 
