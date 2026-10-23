@@ -2,6 +2,30 @@
 
 Status: a dedicated nested aarch64 Linux/KVM environment and a real Firecracker/jailer boot have been verified locally. The [guest command runner](guest-runner.md) now has separate execution evidence; the [real lifecycle supervisor](real-supervisor.md) now integrates create/execute/renew/destroy, including public command admission and results. This environment makes that work testable; it does not satisfy the supported x86_64 release gates.
 
+## Delivered development environment and execution path
+
+The development-environment and execution integration requested by
+[#28](https://github.com/hudson-frontier/hudsonbox/issues/28) are implemented.
+Its original description predates the guest runner, real supervisor and public
+execute path. The following records establish those completed development
+deliverables at their recorded revisions:
+
+| Requested deliverable | Implementation and recorded evidence |
+| --- | --- |
+| Dedicated Linux/KVM environment without host mounts, SSH agent forwarding or automatic application forwarding | [Pinned Lima configuration](../dev/lima-linux.yaml), [startup procedure](#start-a-dedicated-development-host) and [boot record](evidence/2026-09-21-aarch64-boot.json) |
+| KVM API, cgroup v2 and pinned Firecracker/jailer verified with a real guest boot | [Host preflight](../scripts/check_linux_host.py), [verified boot](#verified-boot-and-its-limits) and [artifact preparation](#prepare-the-pinned-controlled-test-artifacts) |
+| Durable guest commands, bounded output, process-tree cleanup and absolute deadlines | [Guest runner](guest-runner.md) and [command execution record](evidence/2026-09-21-aarch64-commands.json) |
+| Authenticated public execution and reconciliation without replaying uncertain effects | [Controller command ownership](controller.md#command-admission-and-dispatch-ownership), [public execute record](evidence/2026-09-21-aarch64-public-execute.json) and [cancellation record](evidence/2026-09-21-aarch64-cancellation.json) |
+
+These are historical execution records, not a new run of the current source.
+Closing the development-environment issue does not complete the supported-host
+or hostile-workload gates. [Networking](networking.md),
+[supported configuration](compatibility.md), [history reclamation](history-reclamation.md)
+and [the workload quickstart](local-workload.md) retain their own unfinished
+implementation and acceptance requirements. Native aarch64 image builds,
+current-source sustained reuse and independent operator reproduction also remain
+separate work in their respective issues.
+
 ## Start a dedicated development host
 
 The [Lima configuration](../dev/lima-linux.yaml) requires Lima 2.2.0 or newer and an Apple Silicon Mac with nested virtualization support (M3 or later, macOS 15 or later). See [Lima's VZ documentation](https://lima-vm.io/docs/config/vmtype/vz/) and [nested virtualization configuration](https://github.com/lima-vm/lima/blob/v2.2.0/templates/default.yaml). It allocates four vCPUs, 4 GiB RAM and a sparse 24 GiB disk. The Ubuntu image is pinned to a dated URL and checksum, without an unpinned fallback.
