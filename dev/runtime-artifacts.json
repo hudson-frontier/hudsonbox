@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "firecracker_version": "1.17.0",
+  "kernel_version": "6.1.186",
+  "architectures": {
+    "aarch64": {
+      "firecracker_archive": {
+        "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-aarch64.tgz",
+        "sha256": "e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256"
+      },
+      "guest_kernel": {
+        "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260916-dcfc69b625d0-0/aarch64/vmlinux-6.1.186",
+        "sha256": "0913a93462f1762581e3b25c434212aeadc06084e97f2e9c21ec4fca3fc54b42"
+      },
+      "binary_sha256": {
+        "firecracker": "fe726e0b43c04363ac07e358be4dee982c3947c65ed3ae10c770fef5e1cd756c",
+        "jailer": "4d8d2dd4dfc1d47932b2bd261479181dd0c54f0a2f32714421a7e7f9f07ddec8"
+      }
+    },
+    "x86_64": {
+      "firecracker_archive": {
+        "url": "https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz",
+        "sha256": "06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558"
+      },
+      "guest_kernel": {
+        "url": "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260916-dcfc69b625d0-0/x86_64/vmlinux-6.1.186",
+        "sha256": "ce8be408a5df15d4fc8e73b5483bcbbf91affcf2f0109feedd942a07e7d1547d"
+      },
+      "binary_sha256": {
+        "firecracker": "99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5",
+        "jailer": "65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f"
+      }
+    }
+  }
+}

@@ -11,8 +11,7 @@ import tempfile
 import urllib.request
 from urllib.parse import urlsplit
 
-EVIDENCE = Path(__file__).resolve().parents[1] / 'docs/evidence/2026-09-21-aarch64-boot.json'
-BINARY_EVIDENCE = EVIDENCE.parent / '2026-09-21-aarch64-public-execute.json'
+PINS = Path(__file__).resolve().parents[1] / 'dev/runtime-artifacts.json'
 MAX_BYTES = 128 * 1024 * 1024
 
 
@@ -37,27 +36,33 @@ def download(spec):
     return data
 
 
-def binary_pins():
-    evidence = json.loads(BINARY_EVIDENCE.read_text())
-    def find(value):
-        if isinstance(value, dict):
-            if 'artifact_sha256' in value:
-                return value['artifact_sha256']
-            for child in value.values():
-                result = find(child)
-                if result is not None:
-                    return result
-        return None
-    pins = find(evidence)
-    if pins is None:
-        raise ValueError('tracked binary pins unavailable')
-    return pins
+def architecture_name(architecture):
+    aliases = {'arm64': 'aarch64', 'ARM64': 'aarch64',
+               'amd64': 'x86_64', 'AMD64': 'x86_64'}
+    architecture = aliases.get(architecture, architecture)
+    if architecture not in ('aarch64', 'x86_64'):
+        raise ValueError('unsupported development architecture')
+    return architecture
 
 
-def select_binaries(data):
-    names = {f'release-v1.17.0-aarch64/{kind}-v1.17.0-aarch64': kind
+def artifact_pins(architecture):
+    architecture = architecture_name(architecture)
+    pins = json.loads(PINS.read_text())
+    if pins['version'] != 1:
+        raise ValueError('unsupported runtime artifact pins')
+    return pins, pins['architectures'][architecture]
+
+
+def binary_pins(architecture='aarch64'):
+    return artifact_pins(architecture)[1]['binary_sha256']
+
+
+def select_binaries(data, architecture='aarch64'):
+    architecture = architecture_name(architecture)
+    version = artifact_pins(architecture)[0]['firecracker_version']
+    names = {f'release-v{version}-{architecture}/{kind}-v{version}-{architecture}': kind
              for kind in ('firecracker', 'jailer')}
-    pins = binary_pins()
+    pins = binary_pins(architecture)
     result = {}
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
         for member in archive:
@@ -75,23 +80,20 @@ def select_binaries(data):
 
 
 def prepare(destination, architecture, fetch=download):
-    if architecture in ('arm64', 'ARM64'):
-        architecture = 'aarch64'
-    if architecture != 'aarch64':
-        raise ValueError('only tracked aarch64 development artifacts are pinned; x86_64 is unsupported')
+    architecture = architecture_name(architecture)
     destination = Path(destination)
     if not destination.is_absolute() or destination.exists() or destination.is_symlink():
         raise ValueError('destination must be a new absolute path')
     parent = destination.parent.resolve(strict=True)
     if parent != destination.parent:
         raise ValueError('destination parent must be canonical')
-    evidence = json.loads(EVIDENCE.read_text())['artifacts']
-    binaries = select_binaries(fetch(evidence['firecracker_archive']))
+    pins, evidence = artifact_pins(architecture)
+    binaries = select_binaries(fetch(evidence['firecracker_archive']), architecture)
     kernel = fetch(evidence['guest_kernel'])
     with tempfile.TemporaryDirectory(prefix='.hudson-artifacts-', dir=parent) as temporary:
         stage = Path(temporary) / 'artifacts'
         stage.mkdir(mode=0o700)
-        for name, data in {**binaries, 'vmlinux-6.1.186': kernel}.items():
+        for name, data in {**binaries, f"vmlinux-{pins['kernel_version']}": kernel}.items():
             path = stage / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)

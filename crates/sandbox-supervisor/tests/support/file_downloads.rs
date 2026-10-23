@@ -6,7 +6,7 @@ use sandbox_protocol::{
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_file_reader_auth_capture_reconnect_replacement_destroy_and_restart() {
     let mut f = Fixture::new().await;
     let mut controller = f.client().await;

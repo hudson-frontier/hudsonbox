@@ -14,7 +14,7 @@ use std::{
 use vm::{Fixture, artifact};
 
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn real_vm_stop_renewal_fences_and_exact_retry() {
     let f = Fixture::new(5000);
     let mut child = f.spawn();
@@ -133,7 +133,7 @@ fn real_vm_stop_renewal_fences_and_exact_retry() {
     );
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn supervisor_loss_does_not_disable_lease_expiry() {
     let f = Fixture::new(4000);
     let mut child = f.spawn();
@@ -155,7 +155,7 @@ fn supervisor_loss_does_not_disable_lease_expiry() {
     f.stopped();
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn killing_namespace_guardian_kills_vm_without_a_surviving_supervisor() {
     let f = Fixture::new(20000);
     let mut child = f.spawn();
@@ -192,7 +192,7 @@ fn killing_namespace_guardian_kills_vm_without_a_surviving_supervisor() {
     f.stopped();
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn staging_digest_failure_and_recovery_fence_prevent_delayed_launch() {
     let mut f = Fixture::new(20000);
     f.manifest.config.rootfs.sha256 = "0".repeat(64);
@@ -215,7 +215,7 @@ fn staging_digest_failure_and_recovery_fence_prevent_delayed_launch() {
 }
 
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn stalled_control_clients_do_not_disable_expiry() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
@@ -237,7 +237,7 @@ fn stalled_control_clients_do_not_disable_expiry() {
     assert!(guardian::wall_ms() < f.manifest.start.expires_unix_ms + 5000);
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn concurrent_stop_and_renewal_never_revive_the_vm() {
     let f = Fixture::new(20000);
     let mut child = f.spawn();
@@ -266,7 +266,7 @@ fn concurrent_stop_and_renewal_never_revive_the_vm() {
     assert_eq!(f.manifest.prepare().unwrap().state, State::Stopped);
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn recovery_of_launch_intent_fences_before_any_new_spawn() {
     let f = Fixture::new(20000);
     let mut receipt = f.manifest.prepare().unwrap();
@@ -285,7 +285,7 @@ fn recovery_of_launch_intent_fences_before_any_new_spawn() {
 }
 
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, release guest binary and aarch64 artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, release guest binary and native runtime artifacts"]
 fn bootstrapped_guest_executes_only_after_durable_binding() {
     use sandbox_protocol::guest::Stream;
     use sandbox_protocol::guest_model::Execute;
@@ -369,7 +369,7 @@ fn bootstrapped_guest_executes_only_after_durable_binding() {
     assert!(f.manifest.guest_client().is_err());
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified aarch64 Firecracker artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and verified native Firecracker artifacts"]
 fn changed_bootstrap_is_fenced_before_launch() {
     let f = Fixture::new(20000);
     let prepared = f.manifest.prepare().unwrap();
@@ -385,7 +385,7 @@ fn changed_bootstrap_is_fenced_before_launch() {
 }
 
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, release guest binary and aarch64 artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, release guest binary and native runtime artifacts"]
 fn shared_base_image_keeps_allocation_credentials_separate() {
     use sandbox_supervisor::{guest::GuestClient, identity::Identity};
     let first = Fixture::build(30000, true);
@@ -458,7 +458,7 @@ fn task_identity(pid: u32) -> Option<(String, u64, u64)> {
     ))
 }
 #[test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, loopback ext4/fsfreeze and aarch64 artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, loopback ext4/fsfreeze and native runtime artifacts"]
 fn journal_stall_cannot_keep_vm_executing_past_expiry() {
     let disk = frozen_fs::Filesystem::new();
     let mut f = Fixture::new(15000);
