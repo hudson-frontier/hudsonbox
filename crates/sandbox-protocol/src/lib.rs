@@ -8,6 +8,7 @@ pub mod host_capabilities;
 pub mod idempotency;
 pub mod ids;
 pub mod images;
+pub mod network_policy;
 pub mod resources;
 pub mod token;
 
