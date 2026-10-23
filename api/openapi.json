@@ -1295,7 +1295,8 @@
               {
                 "type": "string",
                 "maxLength": 200,
-                "x-max-utf8-bytes": 200
+                "x-max-utf8-bytes": 200,
+                "pattern": "^[^\u0000]*$"
               },
               {
                 "type": "null"
@@ -1309,7 +1310,8 @@
           "correlation_id": {
             "anyOf": [
               {
-                "type": "string"
+                "type": "string",
+                "pattern": "^[^\u0000]*$"
               },
               {
                 "type": "null"
@@ -1402,7 +1404,8 @@
               {
                 "type": "string",
                 "maxLength": 200,
-                "x-max-utf8-bytes": 200
+                "x-max-utf8-bytes": 200,
+                "pattern": "^[^\u0000]*$"
               },
               {
                 "type": "null"

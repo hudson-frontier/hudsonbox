@@ -20,6 +20,13 @@ pub async fn destroy(
 ) -> Result<Response, Problem> {
     let Path(id) = path.map_err(|_| Problem::BadRequest("invalid sandbox id"))?;
     let Json(request) = request.map_err(Problem::from_json)?;
+    if request
+        .correlation_id
+        .as_ref()
+        .is_some_and(|value| value.contains('\0'))
+    {
+        return Err(Problem::BadRequest("correlation_id must not contain NUL"));
+    }
     let sandbox: SandboxId = id
         .parse()
         .map_err(|_| Problem::BadRequest("that is not a valid sandbox id"))?;
