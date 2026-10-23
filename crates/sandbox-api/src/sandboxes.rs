@@ -18,6 +18,19 @@ use sandbox_protocol::resources::{MAX_DISK_MIB, MAX_MEMORY_MIB, MAX_VCPU};
 
 /// Check what the service can answer for without touching the database.
 fn validate(request: &CreateRequest) -> Result<Resources, Problem> {
+    if request
+        .name
+        .as_ref()
+        .is_some_and(|value| value.contains('\0'))
+        || request
+            .correlation_id
+            .as_ref()
+            .is_some_and(|value| value.contains('\0'))
+    {
+        return Err(Problem::BadRequest(
+            "name and correlation_id must not contain NUL",
+        ));
+    }
     let digest = &request.image_digest;
     if !valid_image_digest(digest) {
         return Err(Problem::BadRequest(
