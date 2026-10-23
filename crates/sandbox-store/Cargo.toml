@@ -22,9 +22,11 @@ tokio = { workspace = true, features = ["time"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+percent-encoding.workspace = true
+tempfile.workspace = true
 sandbox-cleanup = { path = "../sandbox-cleanup" }
 sandbox-artifacts.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process"] }
 uuid = { workspace = true }
 
 [lints]

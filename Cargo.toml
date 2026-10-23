@@ -16,6 +16,7 @@ publish = false
 # the first crate actually takes the dependency.
 [workspace.dependencies]
 base64 = "0.22"
+percent-encoding = "2"
 sandbox-client = { path = "crates/sandbox-client" }
 sandbox-protocol = { path = "crates/sandbox-protocol" }
 sandbox-store = { path = "crates/sandbox-store" }

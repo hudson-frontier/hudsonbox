@@ -24,6 +24,8 @@ enum Action {
         #[arg(long)]
         host_config: PathBuf,
     },
+    /// Advance one database epoch on a drained/unhealthy host; retain all reservations.
+    AdvanceEpoch,
     /// Report counts only; absence is not independent physical cleanup proof.
     Status,
     /// Prevent new placements; preserves work, capacity and epoch.
@@ -94,6 +96,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
             )?;
             store
                 .provision_host(args.host_id, args.host_epoch, &request)
+                .await?
+        }
+        Action::AdvanceEpoch => {
+            store
+                .advance_host_epoch(args.host_id, args.host_epoch)
                 .await?
         }
         Action::Status => {

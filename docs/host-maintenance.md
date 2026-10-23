@@ -67,6 +67,50 @@ Let admitted work finish or explicitly cancel/destroy the relevant sandbox throu
 
 `finish-drain` is a separate explicit action. It requires draining status at the expected epoch, zero outstanding reservations and a fresh service observation within thirty seconds. The host row remains locked through checking/reopening, so new placement cannot race the absence check. Authenticated controller health refresh cannot promote draining automatically. Retention/retirement continue independently after a verified physical release.
 
+## Epoch issuance and restart
+
+The operator can advance a draining or unhealthy host to its exact successor
+database epoch without changing capacity or discarding old ownership:
+
+```sh
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json --host-id HOST_ID --host-epoch PREVIOUS_EPOCH \
+  advance-epoch
+```
+
+Drain placement before planned maintenance and coordinate stopping the old
+controller/supervisor through the installation's process manager. An unhealthy
+host can enter this recovery path directly. Preserve its journals, allocation
+directories, immutable images and credentials. Independent guardian deadlines
+remain authoritative while the service is unavailable.
+
+The command locks the host row, advances exactly one positive epoch and sets
+the host to `draining` with no fresh service observation. It retains approved
+compatibility and prior capability evidence under their original epoch. Old
+allocations, claims, leases, operation outcomes, request keys and capacity
+charges remain unchanged. The returned epoch is a database fence, not a physical
+stop, release receipt, saved-memory proof or instruction to replay work.
+
+Retain the returned epoch in the host and controller configurations before
+starting the replacement. Matching authenticated health must arrive under that
+epoch. Older allocations use the
+[previous-epoch recovery path](controller.md#previous-epoch-allocation-recovery)
+with their original ownership and the new reporting epoch. `finish-drain` still
+requires zero outstanding reservations and fresh health; health alone never
+reopens placement.
+
+After an uncertain response, retry with the same previous epoch. If its exact
+successor is already current, the command reports its current state without
+resetting health or returning it to draining. Concurrent duplicate requests
+advance once. A ready host cannot begin a new advancement, a newer-than-expected
+epoch conflicts, and invalid/overflowing epochs are refused. Statement and lock
+waits are bounded to two seconds and one second respectively. An epoch floor
+does not replace a backup/restore protocol or authorize a database rollback.
+
+## Upgrade and recovery
+
+Follow the [offline upgrade and recovery procedure](operator-recovery.md) before replacing application/supervisor versions or restoring database state. It includes the compatibility matrix, private backup boundaries, quarantine requirements and an executable PostgreSQL dump/restore rehearsal. A restored epoch is not independent proof that old execution or storage writers have stopped.
+
 ## Validation and limits
 
 [Store tests](../crates/sandbox-store/tests/host_maintenance.rs) exercise epoch fencing, idempotence, unhealthy refusal, stale health and explicit reopening. [Controller tests](../crates/sandbox-controller/tests/host_maintenance.rs) prove placement exclusion while an admitted command reports a nonzero exit, followed by explicit destruction and reopening. The command's unit test rejects unsafe/private configuration boundaries.
@@ -77,3 +121,9 @@ legacy refusal, bounds, authenticated-observation gating and retained allocation
 claims on a busy draining host.
 
 These PostgreSQL/simulated-host checks validate maintenance coordination, not a real host drain or backup/restore procedure. Supported-host qualification, independent operator acceptance and future multi-host/cloud/provider decisions remain the [roadmap](roadmap.md). Saved-memory draining requires verified full pause/resume; it is not implied by this command.
+
+[Epoch tests](../crates/sandbox-store/tests/host_epochs.rs) cover closed-placement
+requirements, duplicate requests, stale and overflowing epochs, unhealthy
+recovery, fresh-observation gating, exact retries and retained old-epoch
+allocation/operation records. They exercise database authority with no physical
+host restart.
