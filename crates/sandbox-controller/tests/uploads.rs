@@ -905,7 +905,7 @@ async fn worker_pool_maintains_and_destroys_other_sandboxes_during_a_blocked_sou
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
-async fn worker_pool_shutdown_cancels_blocked_reads_and_recovers_without_republishing(
+async fn worker_pool_drain_deadline_cancels_blocked_reads_and_recovers_without_republishing(
     pool: PgPool,
 ) {
     let _guard = TEST_LOCK.lock().await;
@@ -927,9 +927,15 @@ async fn worker_pool_shutdown_cancels_blocked_reads_and_recovers_without_republi
     tokio::time::timeout(Duration::from_secs(3), sources.started.notified())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), workers.shutdown())
+    assert!(
+        !tokio::time::timeout(
+            Duration::from_secs(2),
+            workers.drain(Duration::from_millis(50)),
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap()
+    );
     drop(workers);
     assert_eq!(f.fake.total_file_commits().await, 0);
     assert_eq!(sources.reads.load(Ordering::SeqCst), 1);

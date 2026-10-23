@@ -1,4 +1,5 @@
 //! One-host controller. Operator provisioning and TLS are required in every mode.
+mod stop_signals;
 use clap::Parser;
 use sandbox_controller::{
     Controller, ControllerConfig,
@@ -104,69 +105,86 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // Install both handlers before the first worker can claim durable work.
+    let mut signals = stop_signals::StopSignals::install()?;
     let mut workers = WorkerPool::start(&controller, args.workers)?;
-    let allocations = if args.retire_allocations {
+    if args.retire_allocations {
         let mut worker = controller.allocation_retirer();
-        Some(tokio::spawn(async move {
-            loop {
+        workers.spawn_background(|mut stopping| async move {
+            while !stopping.is_stopping() {
                 match worker.tick().await {
                     Ok(sandbox_controller::retirement::RetirementTick::Idle)
                     | Ok(sandbox_controller::retirement::RetirementTick::Deferred) => {}
                     Ok(tick) => eprintln!("sandbox allocation retirement: {tick:?}"),
                     Err(error) => eprintln!("sandbox allocation retirement: {error}"),
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
             }
-        }))
-    } else {
-        None
-    };
-    let retirement = if args.retire_history {
+        });
+    }
+    if args.retire_history {
         let mut worker = controller.history_retirer();
-        Some(tokio::spawn(async move {
-            loop {
+        workers.spawn_background(|mut stopping| async move {
+            while !stopping.is_stopping() {
                 match worker.tick().await {
                     Ok(sandbox_controller::history::HistoryTick::Idle) => {}
                     Ok(tick) => eprintln!("sandbox history: {tick:?}"),
                     Err(error) => eprintln!("sandbox history: {error}"),
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
             }
-        }))
-    } else {
-        None
-    };
-    let archival = if args.archive_output {
+        });
+    }
+    if args.archive_output {
         let mut worker = controller.output_archiver(
             args.output_retention_seconds,
             args.output_cleanup_grace_seconds,
         )?;
-        Some(tokio::spawn(async move {
-            loop {
+        workers.spawn_background(|mut stopping| async move {
+            while !stopping.is_stopping() {
                 match worker.tick().await {
                     Ok(sandbox_controller::archive::ArchiveTick::Idle) => {}
                     Ok(tick) => eprintln!("sandbox output: {tick:?}"),
                     Err(error) => eprintln!("sandbox output: {error}"),
                 }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
             }
-        }))
-    } else {
-        None
-    };
+        });
+    }
+    eprintln!("sandbox controller: workers ready");
     let stopped = tokio::select! {
-        signal = tokio::signal::ctrl_c() => signal.map_err(anyhow::Error::from),
+        biased;
+        _ = signals.recv() => Ok(()),
         result = workers.join_next() => Err(anyhow::anyhow!("controller worker exited: {result:?}")),
     };
-    workers.shutdown().await;
-    if let Some(task) = retirement {
-        task.abort();
-    }
-    if let Some(task) = allocations {
-        task.abort();
-    }
-    if let Some(task) = archival {
-        task.abort();
+    eprintln!("sandbox controller: stopping new ticks and draining workers");
+    let drained = tokio::select! {
+        biased;
+        _ = signals.recv() => None,
+        result = workers.drain(Duration::from_secs(10)) => Some(result),
+    };
+    match drained {
+        None => {
+            eprintln!("sandbox controller: second stop signal; interrupting workers");
+            workers.shutdown().await;
+        }
+        Some(Ok(false)) => {
+            eprintln!("sandbox controller: drain deadline elapsed; workers interrupted")
+        }
+        Some(Err(error)) => return Err(error.into()),
+        Some(Ok(true)) => {}
     }
     stopped
 }
