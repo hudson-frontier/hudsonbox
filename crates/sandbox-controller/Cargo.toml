@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+rcgen = { workspace = true }
 serde = { workspace = true }
 rustix = { workspace = true }
 sandbox-artifacts.workspace = true
@@ -35,7 +36,6 @@ sandbox-fake-host = { path = "../sandbox-fake-host" }
 axum = { workspace = true }
 http = { workspace = true }
 hex = { workspace = true }
-rcgen = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 tokio-stream = { workspace = true }
