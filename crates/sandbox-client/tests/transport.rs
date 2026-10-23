@@ -42,6 +42,136 @@ fn output_event(cursor: &str) -> String {
         json!({"stream":"stdout","offset":0,"next_offset":3,"data_base64":"YQD/","at_end":true,"complete":true,"seen":5,"stored":3,"truncated":true,"simulated":true,"guest_reported":true})
     )
 }
+
+#[tokio::test]
+async fn bounded_operation_reads_reject_ignored_wire_bytes_before_decoding_or_eof() {
+    use tokio_stream::StreamExt;
+    for chunked in [false, true] {
+        let mut value = operation("succeeded");
+        value["future_field"] = "x".repeat(8192).into();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let exact = bytes.len();
+        let s = Server::start(Router::new().route(
+            "/v1/operations/op_fixture",
+            get(move || {
+                let bytes = bytes.clone();
+                async move {
+                    let body = if chunked {
+                        // No Content-Length and no EOF: rejection must follow the
+                        // byte bound without waiting for the request timeout.
+                        Body::from_stream(
+                            tokio_stream::iter([Ok::<_, std::io::Error>(bytes)])
+                                .chain(tokio_stream::pending()),
+                        )
+                    } else {
+                        Body::from(bytes)
+                    };
+                    (
+                        [
+                            ("cache-control", "no-store"),
+                            ("content-type", "application/json"),
+                        ],
+                        body,
+                    )
+                }
+            }),
+        ))
+        .await;
+        let client = s.client();
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_operation_bounded(
+                GetOperation {
+                    operation_id: "op_fixture",
+                },
+                4096,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(rejected, Err(Error::Protocol)));
+        if !chunked {
+            assert_eq!(
+                client
+                    .get_operation_bounded(
+                        GetOperation {
+                            operation_id: "op_fixture"
+                        },
+                        exact
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                "succeeded"
+            );
+            // The generated method keeps its existing 2 MiB response contract.
+            assert_eq!(
+                client
+                    .get_operation(GetOperation {
+                        operation_id: "op_fixture"
+                    })
+                    .await
+                    .unwrap()
+                    .status,
+                "succeeded"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_operation_reads_validate_limits_before_io() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let s = Server::start(Router::new().route(
+        "/v1/operations/op_fixture",
+        get(move || {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                json_response(operation("succeeded"))
+            }
+        }),
+    ))
+    .await;
+    for limit in [0, 2 * 1024 * 1024 + 1] {
+        assert!(matches!(
+            s.client()
+                .get_operation_bounded(
+                    GetOperation {
+                        operation_id: "op_fixture"
+                    },
+                    limit
+                )
+                .await,
+            Err(Error::Request)
+        ));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bounded_operation_problem_keeps_status_without_oversized_body() {
+    let s = Server::start(Router::new().route("/v1/operations/op_fixture", get(|| async {
+        (StatusCode::GONE, axum::Json(json!({"status":410,"title":"expired","code":"response_expired","future_field":"x".repeat(8192)})))
+    }))).await;
+    assert!(matches!(
+        s.client()
+            .get_operation_bounded(
+                GetOperation {
+                    operation_id: "op_fixture"
+                },
+                4096
+            )
+            .await,
+        Err(Error::Http {
+            status: 410,
+            code: None,
+            operation_id: None
+        })
+    ));
+}
+
 #[tokio::test]
 async fn configuration_rejects_unsafe_origins_permissions_symlinks_and_oversize() {
     let s = Server::start(Router::new()).await;
