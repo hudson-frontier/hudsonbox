@@ -176,10 +176,11 @@ fn extract(parts: &Parts) -> Result<ProjectToken, Rejection> {
         .get(AUTHORIZATION)
         .ok_or(Rejection::MissingHeader)?;
     let value = header.to_str().map_err(|_| Rejection::Malformed)?;
-    let raw = value
-        .strip_prefix("Bearer ")
-        .ok_or(Rejection::NotBearer)?
-        .trim();
+    let (scheme, raw) = value.split_once(' ').ok_or(Rejection::NotBearer)?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Err(Rejection::NotBearer);
+    }
+    let raw = raw.trim();
 
     ProjectToken::parse(raw).map_err(|_| Rejection::Malformed)
 }
