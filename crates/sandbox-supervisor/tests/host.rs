@@ -359,7 +359,7 @@ fn lease(o: &Ownership, revision: i64) -> LeaseOwnership {
     }
 }
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_rpc_duplicate_create_lease_stop_and_fences() {
     let f = Fixture::new().await;
     let mut c = f.client().await;
@@ -490,7 +490,7 @@ async fn real_rpc_duplicate_create_lease_stop_and_fences() {
     );
 }
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn restart_advances_epoch_stops_old_owner_and_preserves_capacity() {
     let mut f = Fixture::new().await;
     let mut c = f.client().await;
@@ -565,7 +565,7 @@ async fn restart_advances_epoch_stops_old_owner_and_preserves_capacity() {
     f.ready(&mut c, next.ownership.as_ref().unwrap()).await;
 }
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn lost_create_caller_reconciles_one_vm_and_rejects_other_controller() {
     let f = Fixture::new().await;
     let mut c = f.client().await;
@@ -605,7 +605,7 @@ async fn lost_create_caller_reconciles_one_vm_and_rejects_other_controller() {
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn capacity_remains_reserved_until_real_cleanup() {
     let f = Fixture::new().await;
     let mut c = f.client().await;
@@ -636,7 +636,7 @@ async fn capacity_remains_reserved_until_real_cleanup() {
     );
 }
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn running_vmm_without_guest_handshake_never_becomes_ready() {
     let f = Fixture::with_agent(false).await;
     let mut c = f.client().await;
@@ -692,17 +692,17 @@ async fn http(
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, local PostgreSQL and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, local PostgreSQL and native KVM artifacts"]
 async fn authenticated_api_controller_creates_renews_and_destroys_real_vm(pool: sqlx::PgPool) {
     api_lifecycle(pool, false, false).await;
 }
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, local PostgreSQL and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1, local PostgreSQL and native KVM artifacts"]
 async fn authenticated_controller_automatically_retires_real_allocation(pool: sqlx::PgPool) {
     api_lifecycle(pool, false, true).await;
 }
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and a sustained aarch64 KVM run"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and a sustained native KVM run"]
 async fn sustained_real_allocation_reuse_keeps_an_older_vm_live(pool: sqlx::PgPool) {
     use sandbox_protocol::{ProjectId, ProjectToken};
     use serde_json::json;
@@ -1647,7 +1647,7 @@ async fn public_cancel_case(
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_command_rpc_retains_results_fences_absence_and_survives_request_end() {
     use sandbox_protocol::{
         guest_model as m,
@@ -1875,7 +1875,7 @@ async fn public_output(
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_live_output_reads_binary_reconnects_without_journal_mutation_or_reexecution() {
     use sandbox_protocol::{
         guest as w, guest_model as m,
@@ -2131,7 +2131,7 @@ async fn public_stream(app: &axum::Router, token: &str, operation: &str, expecte
 }
 
 #[tokio::test]
-#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and aarch64 KVM artifacts"]
+#[ignore = "requires root, HUDSON_GUARDIAN_TEST_VM=1 and native KVM artifacts"]
 async fn real_guest_file_upload_execute_and_captured_download_round_trip() {
     use sandbox_protocol::{files as files_model, guest_model as m};
     use sha2::{Digest, Sha256};

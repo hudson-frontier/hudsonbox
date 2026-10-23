@@ -53,11 +53,23 @@ impl Fixture {
     pub(super) fn build(ttl_ms: i64, agent: bool) -> Self {
         assert_eq!(std::env::var("HUDSON_GUARDIAN_TEST_VM").as_deref(), Ok("1"));
         assert!(rustix::process::geteuid().is_root());
-        assert_eq!(
-            std::env::consts::ARCH,
-            "aarch64",
-            "controlled artifacts currently support aarch64 only"
-        );
+        let architecture = std::env::consts::ARCH;
+        assert!(matches!(architecture, "aarch64" | "x86_64"));
+        // The downloader and native VM fixture share the same reviewed pins.
+        let pins: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../dev/runtime-artifacts.json"
+        )))
+        .unwrap();
+        assert_eq!(pins["version"], 1);
+        let runtime_version = pins["firecracker_version"].as_str().unwrap();
+        let kernel_version = pins["kernel_version"].as_str().unwrap();
+        let selected = &pins["architectures"][architecture];
+        let binary_path = |kind: &str| {
+            format!(
+                "release-v{runtime_version}-{architecture}/{kind}-v{runtime_version}-{architecture}"
+            )
+        };
         let artifacts = configured_path("HUDSON_GUARDIAN_ARTIFACT_DIR");
         let guest_binary = agent.then(|| configured_path("HUDSON_GUARDIAN_GUEST_BINARY"));
         let temp = tempfile::Builder::new().prefix("hg-").tempdir().unwrap();
@@ -111,16 +123,16 @@ impl Fixture {
                 state_root: root.join("s"),
                 cgroup_parent: PathBuf::from("/sys/fs/cgroup/hudson-guardians-tests"),
                 firecracker: pinned_artifact(
-                    artifacts.join("release-v1.17.0-aarch64/firecracker-v1.17.0-aarch64"),
-                    "fe726e0b43c04363ac07e358be4dee982c3947c65ed3ae10c770fef5e1cd756c",
+                    artifacts.join(binary_path("firecracker")),
+                    selected["binary_sha256"]["firecracker"].as_str().unwrap(),
                 ),
                 jailer: pinned_artifact(
-                    artifacts.join("release-v1.17.0-aarch64/jailer-v1.17.0-aarch64"),
-                    "4d8d2dd4dfc1d47932b2bd261479181dd0c54f0a2f32714421a7e7f9f07ddec8",
+                    artifacts.join(binary_path("jailer")),
+                    selected["binary_sha256"]["jailer"].as_str().unwrap(),
                 ),
                 kernel: pinned_artifact(
-                    artifacts.join("vmlinux-6.1.186"),
-                    "0913a93462f1762581e3b25c434212aeadc06084e97f2e9c21ec4fca3fc54b42",
+                    artifacts.join(format!("vmlinux-{kernel_version}")),
+                    selected["guest_kernel"]["sha256"].as_str().unwrap(),
                 ),
                 rootfs: artifact(rootfs),
                 jail_uid: 65534,
