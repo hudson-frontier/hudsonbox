@@ -5,6 +5,7 @@ use crate::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use std::fmt;
+use tokio::time::{Instant, timeout_at};
 
 /// The cursor denotes bytes after this complete event. Persist after consuming it.
 #[derive(Serialize)]
@@ -36,6 +37,7 @@ impl fmt::Debug for Event {
 /// same operation with the last consumed cursor. EOF is not command completion.
 pub struct EventStream {
     response: reqwest::Response,
+    deadline: Instant,
     pending: Vec<u8>,
     position: usize,
     parser: Parser,
@@ -47,9 +49,10 @@ impl fmt::Debug for EventStream {
     }
 }
 impl EventStream {
-    pub(super) fn new(response: reqwest::Response) -> Self {
+    pub(super) fn new(response: reqwest::Response, deadline: Instant) -> Self {
         Self {
             response,
+            deadline,
             pending: Vec::new(),
             position: 0,
             parser: Parser::default(),
@@ -60,7 +63,15 @@ impl EventStream {
         if self.ended {
             return Ok(None);
         }
-        let result = self.read_next().await;
+        // Buffered bytes must not bypass the request's total lifetime. The
+        // transport starts this deadline before receiving response headers.
+        let result = if Instant::now() >= self.deadline {
+            Err(Error::Transport)
+        } else {
+            timeout_at(self.deadline, self.read_next())
+                .await
+                .unwrap_or(Err(Error::Transport))
+        };
         if result.is_err()
             || result
                 .as_ref()
@@ -220,6 +231,25 @@ fn decode(kind: &str, id: Option<String>, data: &str) -> Result<Event, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn total_deadline_applies_to_already_buffered_events() -> Result<(), Error> {
+        let output = serde_json::json!({
+            "stream":"stdout", "offset":0, "next_offset":1, "data_base64":"eA==",
+            "at_end":true, "complete":false, "seen":1, "stored":1,
+            "truncated":false, "simulated":false, "guest_reported":true,
+        });
+        let frame = format!("event: output\nid: saved-cursor\ndata: {output}\n\n");
+        let response = reqwest::Response::from(axum::http::Response::new(frame.repeat(2)));
+        let mut stream = EventStream::new(
+            response,
+            Instant::now() + std::time::Duration::from_secs(100),
+        );
+        assert!(matches!(stream.next().await?, Some(Event::Output { .. })));
+        tokio::time::advance(std::time::Duration::from_secs(101)).await;
+        assert!(matches!(stream.next().await, Err(Error::Transport)));
+        assert!(stream.next().await?.is_none());
+        Ok(())
+    }
     fn frames(bytes: &[u8]) -> Result<Vec<Event>, Error> {
         let mut parser = Parser::default();
         let mut events = Vec::new();
