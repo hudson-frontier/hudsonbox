@@ -927,9 +927,15 @@ async fn worker_pool_shutdown_cancels_blocked_reads_and_recovers_without_republi
     tokio::time::timeout(Duration::from_secs(3), sources.started.notified())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), workers.shutdown())
+    assert!(
+        !tokio::time::timeout(
+            Duration::from_secs(2),
+            workers.drain(Duration::from_millis(50)),
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .unwrap()
+    );
     drop(workers);
     assert_eq!(f.fake.total_file_commits().await, 0);
     assert_eq!(sources.reads.load(Ordering::SeqCst), 1);

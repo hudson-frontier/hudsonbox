@@ -153,16 +153,28 @@ at most one verified upload source, up to 8 MiB, so the pool can retain up to
 `N * 8 MiB` of source bytes in addition to in-flight transport buffers. Sources
 can be read again when another worker claims the next upload phase.
 
-Shutdown cancels and joins the reconciliation workers. Committed claims expire
-through the existing recovery path; cancellation neither releases reservations
-nor proves that a dispatched operation did not run. An unexpected worker exit
-stops the controller process so its service supervisor can restart it.
+SIGINT and SIGTERM stop scheduling further ticks and allow current ticks to
+finish within one shared ten-second drain budget. Reconciliation, optional
+output publication, history retirement and allocation retirement all use the
+same supervised task set. Idle workers wake immediately on shutdown. A second
+stop signal or the drain deadline interrupts unfinished work and joins its
+tasks before exit. The handlers are installed before workers start. `--once`
+continues to run only its requested finite ticks.
+
+Committed claims expire through the existing recovery path; interruption
+neither releases reservations nor proves that a dispatched operation did not
+run. A drain does not destroy sandboxes or extend execution leases. An
+unexpected exit or panic in any supervised worker stops the controller process
+so its service supervisor can restart it.
 
 The [file-upload integration tests](../crates/sandbox-controller/tests/uploads.rs)
 block a source read and require another sandbox's creation, maintenance and
 destruction to complete before releasing it. They also cancel an in-flight read
 and recover its upload under replacement workers without duplicate publication.
 These checks use PostgreSQL and authenticated fake-host RPCs, not a real VM.
+The [shutdown tests](../crates/sandbox-controller/tests/shutdown.rs) exercise
+completion of current work, idle wake-up, a shared drain deadline, task failure
+supervision, and real SIGINT/SIGTERM delivery to the controller binary.
 
 ## Command admission and dispatch ownership
 
