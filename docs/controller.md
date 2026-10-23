@@ -163,8 +163,8 @@ continues to run only its requested finite ticks.
 
 Committed claims expire through the existing recovery path; interruption
 neither releases reservations nor proves that a dispatched operation did not
-run. A drain does not destroy sandboxes or extend execution leases. An
-unexpected exit or panic in any supervised worker stops the controller process
+run. Draining does not destroy sandboxes; a current tick may still renew a
+lease under the existing bounds. An unexpected exit or panic in any supervised worker stops the controller process
 so its service supervisor can restart it.
 
 The [file-upload integration tests](../crates/sandbox-controller/tests/uploads.rs)
