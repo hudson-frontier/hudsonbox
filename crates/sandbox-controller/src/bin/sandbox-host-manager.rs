@@ -18,6 +18,12 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Provision a new draining host or inspect an exact retry; never refresh or reopen it.
+    Provision {
+        /// Private owned JSON containing version, total capacity and approved capabilities.
+        #[arg(long)]
+        host_config: PathBuf,
+    },
     /// Report counts only; absence is not independent physical cleanup proof.
     Status,
     /// Prevent new placements; preserves work, capacity and epoch.
@@ -82,6 +88,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let store = Store::connect(&cfg.database_url, 2).await?;
     // Maintenance never migrates or resets a user's database.
     let value = match args.action {
+        Action::Provision { host_config } => {
+            let request = sandbox_store::host_maintenance::HostProvision::from_json(
+                &private_bytes(&host_config)?,
+            )?;
+            store
+                .provision_host(args.host_id, args.host_epoch, &request)
+                .await?
+        }
         Action::Status => {
             store
                 .host_maintenance(args.host_id, args.host_epoch)

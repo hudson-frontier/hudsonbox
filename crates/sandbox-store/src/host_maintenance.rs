@@ -1,7 +1,7 @@
 //! Offline operator maintenance. Drain serializes with placement; never frees capacity.
 
 use sandbox_protocol::{HostId, Id};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::Store;
@@ -27,6 +27,53 @@ pub enum Error {
     Outstanding,
     #[error("host maintenance storage query failed")]
     Query(#[from] sqlx::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostCapacity {
+    pub vcpu: u32,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
+}
+
+/// Retained operator input. Database access is the authorization boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProvision {
+    pub version: u32,
+    pub capacity: HostCapacity,
+    pub capabilities: sandbox_protocol::host_capabilities::Capabilities,
+}
+impl HostProvision {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.is_empty() || bytes.len() > 65536 {
+            return Err(Error::Conflict);
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|_| Error::Conflict)?;
+        value.encoded()?;
+        Ok(value)
+    }
+    fn encoded(&self) -> Result<(i32, i64, i64, serde_json::Value), Error> {
+        if self.version != 1
+            || self.capacity.vcpu == 0
+            || self.capacity.memory_mib == 0
+            || self.capacity.disk_mib == 0
+            || self.capabilities.validate().is_err()
+            || self.capabilities.limits.vcpu > self.capacity.vcpu
+            || self.capabilities.limits.memory_mib > self.capacity.memory_mib
+            || self.capabilities.limits.disk_mib > self.capacity.disk_mib
+        {
+            return Err(Error::Conflict);
+        }
+        let cpu = i32::try_from(self.capacity.vcpu).map_err(|_| Error::Conflict)?;
+        let memory = i64::try_from(self.capacity.memory_mib).map_err(|_| Error::Conflict)?;
+        let disk = i64::try_from(self.capacity.disk_mib).map_err(|_| Error::Conflict)?;
+        let policy =
+            serde_json::from_slice(&self.capabilities.to_json().map_err(|_| Error::Conflict)?)
+                .map_err(|_| Error::Conflict)?;
+        Ok((cpu, memory, disk, policy))
+    }
 }
 
 async fn report(
@@ -60,6 +107,40 @@ async fn report(
 }
 
 impl Store {
+    /// Provision once in draining state, without an authenticated observation.
+    /// Exact retries report the current state; they never reset health, reopen
+    /// admission, change an epoch or overwrite an existing host's configuration.
+    pub async fn provision_host(
+        &self,
+        host: HostId,
+        expected_epoch: i64,
+        request: &HostProvision,
+    ) -> Result<HostMaintenance, Error> {
+        if expected_epoch <= 0 {
+            return Err(Error::Conflict);
+        }
+        let (cpu, memory, disk, policy) = request.encoded()?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET LOCAL statement_timeout='2s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout='1s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,compatibility,supervisor_epoch,last_seen_at) VALUES($1,'draining',$2,$3,$4,$5,$6,NULL) ON CONFLICT(id) DO NOTHING")
+            .bind(host.uuid()).bind(cpu).bind(memory).bind(disk).bind(&policy).bind(expected_epoch)
+            .execute(&mut *tx).await?;
+        let matches: bool = sqlx::query_scalar("SELECT supervisor_epoch=$2 AND cpu_capacity=$3 AND memory_capacity_mib=$4 AND disk_capacity_mib=$5 AND compatibility=$6 FROM hosts WHERE id=$1 FOR UPDATE")
+            .bind(host.uuid()).bind(expected_epoch).bind(cpu).bind(memory).bind(disk).bind(&policy)
+            .fetch_one(&mut *tx).await?;
+        if !matches {
+            return Err(Error::Conflict);
+        }
+        let value = report(&mut tx, host, expected_epoch).await?;
+        tx.commit().await?;
+        Ok(value)
+    }
+
     /// Explicit operator approval; only a drained, empty host can change policy.
     /// Invalidate freshness until matching authenticated health arrives. Never
     /// downgrade to legacy metadata or modify ownership/capacity/epoch.
