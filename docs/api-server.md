@@ -118,7 +118,7 @@ An empty project returns `{"items":[],"next_cursor":null}`. Use the [implemented
 
 ## Migrations, certificates, and verification
 
-Both `serve` and `provision-project` run embedded migrations before proceeding. `sandbox-api migrate` runs them without opening a listener. Coordinate schema upgrades across operators and services; migration 0004 builds ordinary indexes and can block writes during construction. There is no automatic rollback or zero-downtime upgrade claim.
+Both `serve` and `provision-project` run embedded migrations before proceeding. `sandbox-api migrate` runs them without opening a listener. Coordinate schema upgrades across operators and services; migrations 0004 and 0024 build ordinary indexes and can block writes during construction. There is no automatic rollback or zero-downtime upgrade claim.
 
 Certificates and keys are read once at startup. Replace them and restart to rotate; automatic renewal and reload are not implemented. The seven-day certificate above is for local development only. Do not disable certificate verification in clients.
 
