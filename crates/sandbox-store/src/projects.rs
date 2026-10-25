@@ -46,6 +46,19 @@ pub struct TokenRecord {
     pub revoked_at: Option<OffsetDateTime>,
 }
 
+const TOKEN_LOOKUP: &str = r"
+    SELECT p.id AS project_id,
+           p.status AS project_status,
+           t.value->>'key_id' AS key_id,
+           decode(t.value->>'hash', 'hex') AS hash,
+           (t.value->>'expires_at')::timestamptz AS expires_at,
+           (t.value->>'revoked_at')::timestamptz AS revoked_at
+      FROM projects p
+      CROSS JOIN LATERAL jsonb_array_elements(p.api_tokens) AS t(value)
+     WHERE p.api_tokens @> jsonb_build_array(jsonb_build_object('key_id', $1::text))
+       AND t.value->>'key_id' = $1
+";
+
 impl Store {
     /// Find the token metadata for a key identifier.
     ///
@@ -63,26 +76,15 @@ impl Store {
         &self,
         key_id: &TokenKeyId,
     ) -> Result<Option<TokenRecord>, StoreError> {
-        // api_tokens is a bounded array on the project, so the token is found
-        // by expanding it. At most two active tokens per project keeps this
-        // small; if that ever changes, this becomes its own table.
-        let row = sqlx::query(
-            r"
-            SELECT p.id            AS project_id,
-                   p.status        AS project_status,
-                   t.value->>'key_id'      AS key_id,
-                   decode(t.value->>'hash', 'hex') AS hash,
-                   (t.value->>'expires_at')::timestamptz AS expires_at,
-                   (t.value->>'revoked_at')::timestamptz AS revoked_at
-              FROM projects p
-              CROSS JOIN LATERAL jsonb_array_elements(p.api_tokens) AS t(value)
-             WHERE t.value->>'key_id' = $1
-            ",
-        )
-        .bind(key_id.as_str())
-        .fetch_optional(self.pool())
-        .await
-        .map_err(StoreError::Query)?;
+        // The GIN containment predicate selects candidate projects before the
+        // lateral expansion. An unknown key must not walk every project's array.
+        // Read the token and current project status together; the index is not
+        // cached authorization and does not replace secret/expiry/revocation checks.
+        let row = sqlx::query(TOKEN_LOOKUP)
+            .bind(key_id.as_str())
+            .fetch_optional(self.pool())
+            .await
+            .map_err(StoreError::Query)?;
 
         let Some(row) = row else { return Ok(None) };
 
@@ -110,4 +112,87 @@ pub(crate) fn token_record(row: &sqlx::postgres::PgRow) -> Result<TokenRecord, S
         expires_at: row.try_get("expires_at").map_err(StoreError::Query)?,
         revoked_at: row.try_get("revoked_at").map_err(StoreError::Query)?,
     })
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use sandbox_protocol::ProjectToken;
+    use serde_json::json;
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn unknown_tokens_use_an_index_before_project_token_expansion(pool: sqlx::PgPool) {
+        let mut rows = Vec::with_capacity(4096);
+        let mut known = None;
+        for _ in 0..4096 {
+            let project = ProjectId::generate();
+            let first = ProjectToken::generate().unwrap();
+            let second = ProjectToken::generate().unwrap();
+            rows.push(json!({"id":project.uuid(),"api_tokens":[
+                {"key_id":first.key_id().as_str(),"hash":hex::encode(first.hash().as_bytes())},
+                {"key_id":second.key_id().as_str(),"hash":hex::encode(second.hash().as_bytes())}
+            ]}));
+            known = Some((project, second.key_id().clone(), second.hash()));
+        }
+        sqlx::query("INSERT INTO projects(id,name,status,limits,api_tokens) SELECT p.id,'lookup-fixture','active','{}'::jsonb,p.api_tokens FROM jsonb_to_recordset($1) AS p(id uuid,api_tokens jsonb)")
+            .bind(serde_json::Value::Array(rows)).execute(&pool).await.unwrap();
+        sqlx::query("ANALYZE projects")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unknown = ProjectToken::generate().unwrap();
+        let query = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {TOKEN_LOOKUP}");
+        let plan: serde_json::Value = sqlx::query_scalar(&query)
+            .bind(unknown.key_id().as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut pending = vec![&plan[0]["Plan"]];
+        let mut indexes = Vec::new();
+        let mut expansions = 0;
+        let mut project_rows = 0;
+        while let Some(node) = pending.pop() {
+            if let Some(index) = node["Index Name"].as_str() {
+                indexes.push(index.to_owned());
+            }
+            if node["Node Type"] == "Function Scan" {
+                expansions += node["Actual Loops"].as_u64().unwrap_or(0);
+            }
+            if node["Node Type"] == "Seq Scan" && node["Relation Name"] == "projects" {
+                project_rows += node["Actual Rows"].as_u64().unwrap_or(0);
+            }
+            if let Some(children) = node["Plans"].as_array() {
+                pending.extend(children);
+            }
+        }
+        eprintln!(
+            "token lookup fixture: {}",
+            json!({"projects":4096,"tokens_per_project":2,
+            "execution_ms":plan[0]["Execution Time"],"shared_hit_blocks":plan[0]["Plan"]["Shared Hit Blocks"],
+            "sequential_project_rows":project_rows,"array_expansion_loops":expansions,"indexes":indexes})
+        );
+        assert!(
+            indexes
+                .iter()
+                .any(|index| index == "projects_api_token_key_lookup"),
+            "unknown-token lookup scanned project data instead of using its token-key index"
+        );
+        assert_eq!(
+            expansions, 0,
+            "unknown-token lookup expanded unrelated token arrays"
+        );
+        let store = Store::from_pool(pool);
+        assert!(
+            store
+                .token_by_key_id(unknown.key_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (project, key, hash) = known.unwrap();
+        let record = store.token_by_key_id(&key).await.unwrap().unwrap();
+        assert_eq!(record.project_id, project);
+        assert!(record.hash.verify(&hash));
+    }
 }
