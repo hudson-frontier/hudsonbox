@@ -553,19 +553,22 @@ async fn expiry_during_upload_blocks_publication_and_retained_reads(pool: PgPool
 async fn expired_claim_while_waiting_for_project_lock_cannot_persist_ticket(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     f.finish().await;
-    let claim = f.store.claim_output(1).await.unwrap().unwrap();
     let mut lock = pool.begin().await.unwrap();
     sqlx::query("SELECT id FROM projects WHERE id=$1 FOR UPDATE")
         .bind(f.project.uuid())
         .fetch_one(&mut *lock)
         .await
         .unwrap();
+    // Finish setup before starting the lease. A one-second lease can expire
+    // before the worker reaches the intended project lock on a loaded machine.
+    let claim = f.store.claim_output(10).await.unwrap().unwrap();
+    let expires_at = claim.lease_expires_at;
     let store = f.store.clone();
     let waiting = tokio::spawn(async move { store.prepare_output(&claim, 3600, 600, true).await });
     // Wait for a real blocked query, then for the DB lease to expire. The lock
     // is held by this test, so releasing it controls the resumed transaction.
     let mut blocked = false;
-    for _ in 0..100 {
+    for _ in 0..500 {
         let (n,):(i64,)=sqlx::query_as("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'")
             .fetch_one(&pool).await.unwrap();
         if n > 0 {
@@ -575,7 +578,8 @@ async fn expired_claim_while_waiting_for_project_lock_cannot_persist_ticket(pool
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(blocked);
-    sqlx::query("SELECT pg_sleep(1.1)")
+    sqlx::query("SELECT pg_sleep(GREATEST(0.0,EXTRACT(EPOCH FROM ($1::timestamptz-clock_timestamp())))::double precision+0.05)")
+        .bind(expires_at)
         .execute(&pool)
         .await
         .unwrap();
