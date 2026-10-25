@@ -129,7 +129,7 @@ Project bearer authentication has [executable tests](../crates/sandbox-api/src/a
 
 ## Implemented offline project provisioning
 
-The operator-only `sandbox-api provision-project` command temporarily supplies project access before Admin APIs and UI setup exist. It requires direct database authority and a private Unix credential directory; it exposes no HTTP bootstrap route and does not issue an Admin credential. The planned Admin-first setup flow above remains deferred.
+The operator-only `sandbox-api provision-project` command temporarily supplies project access before Admin APIs and UI setup exist. It requires direct database authority and a private Unix credential directory owned by the operator's effective user; existing credentials must have that same owner. Directory and file checks apply to opened descriptors, and credential files cannot have additional hard links. It exposes no HTTP bootstrap route and does not issue an Admin credential. The planned Admin-first setup flow above remains deferred.
 
 The [implementation](../crates/sandbox-api/src/provision.rs) saves a randomly generated project ID and 256-bit bearer secret in a private file before inserting hash-only token metadata. The token expires after 30 days. Retrying the same file reconciles the original intent; a changed project, quota, or credential is a conflict, and expiry/revocation is never reset. This is an offline operator recovery mechanism, not the future Admin audit/receipt implementation. Rotation, Admin provisioning, audit persistence, and management APIs remain separate work.
 
