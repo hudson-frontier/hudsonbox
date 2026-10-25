@@ -2148,6 +2148,7 @@ dependencies = [
  "hyper-util",
  "object_store",
  "rcgen",
+ "rustix",
  "sandbox-artifacts",
  "sandbox-protocol",
  "sandbox-store",
