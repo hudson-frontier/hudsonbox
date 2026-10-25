@@ -87,6 +87,8 @@ API ID: `prj_<uuidv7>`.
 
 Project token metadata is stored on the project; the credential/session validation and rotation rules are owned by [auth design](auth-design.md#project-credentials). The Admin API/UI and local admin tooling manage project tokens; installation Admin credentials are maintained separately in controlled deployment configuration. Display names are not unique lookup keys. A project with no active tokens grants no Project access.
 
+[Migration 0024](../migrations/0024_project_token_lookup.sql) indexes the token metadata for authentication lookup. A containment predicate selects candidate projects before expanding their token arrays, so an unknown key does not scan every project's credentials. The same query still reads current project status, token hash, expiry, and revocation metadata; the index does not cache an authorization decision. Token-index writes are applied directly rather than buffered in a pending list, favoring predictable authentication reads over batched credential updates.
+
 ### 2. sandboxes — the persistent environment
 
 API ID: `sbx_<uuidv7>`.
