@@ -45,12 +45,15 @@ The JSON configuration has these fields:
 | `host`, `epoch` | Operator-provisioned typed host ID and fresh positive supervisor epoch |
 | `state_root` | Short canonical private root-owned directory, under trusted ancestors; guardian socket paths must fit Unix limits |
 | `cgroup_parent` | Dedicated empty delegated cgroup-v2 parent under `/sys/fs/cgroup` |
-| `guardian_binary` | Absolute path to the reviewed `sandbox-supervisor` binary |
+| `guardian_binary` | Canonical absolute path to the reviewed root-owned `sandbox-supervisor` binary, under protected root-owned ancestors |
 | `firecracker`, `jailer` | Each has an absolute `path` and lowercase SHA-256 hex `sha256` |
 | `images` | Map from allowlisted `sha256:` image identifiers to `kernel` and `rootfs` artifacts, each with `path`/`sha256` |
 | `capabilities` | Optional [version 1 operator contract](host-capabilities.md); startup/health probe native architecture, kernel, KVM and cgroups, and bind its digests to configured artifacts |
 | `jail_uid`, `jail_gid` | Unprivileged jailer IDs, each at least 65534 |
 | `capacity` | `vcpu`, `memory_mib`, `disk_mib`, including the allowances above |
+
+Guardian executable ancestors cannot be symbolic links or group/world writable.
+Root-owned sticky directories are permitted, matching verified operator-path checks.
 
 The real host accepts 1–4 vCPU, 128–8192 MiB of guest memory and 64–65536 MiB of writable disk. Admission, placement, the fake and real hosts, and guardian validation now use the same [resource envelope](../crates/sandbox-protocol/src/resources.rs). New undersized requests receive `400` before admission; existing retry handles and uncertain dispatch evidence remain available. The image must boot the [guest init and agent](guest-bootstrap.md); an arbitrary disk image without that agent cannot pass readiness. Guest userspace stays writable and workloads retain the [guest-root contract](decisions/0003-guest-root-with-our-kernel.md). The current guardian has no NIC, so this integration does not implement the network policy or claim internet access.
 
