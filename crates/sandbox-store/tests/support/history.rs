@@ -486,7 +486,17 @@ async fn history_scan_rotates_past_more_than_one_batch_of_empty_allocations(pool
         f.host = first.host;
         last = Some(f);
     }
-    let f = last.unwrap();
+    let mut f = last.unwrap();
+    // Bulk setup can outlive the simulated heartbeat and leases on a slow DB.
+    // This case exercises scan order, so refresh the running fixtures before admission.
+    sqlx::query("UPDATE hosts SET last_seen_at=clock_timestamp() WHERE id=$1")
+        .bind(first.host.uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE allocations SET lease_expires_at=clock_timestamp()+interval '60 seconds' WHERE host_id=$1")
+        .bind(first.host.uuid()).execute(&pool).await.unwrap();
+    f.request.command.deadline_unix_ms = now_ms() + 60_000;
     // Put the history-bearing allocation after the first batch explicitly.
     // Generated identity order is not the scan priority this test exercises.
     // The other 33 allocations are unscanned (NULLS FIRST); this old timestamp
