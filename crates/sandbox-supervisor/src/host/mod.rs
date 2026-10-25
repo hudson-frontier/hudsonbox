@@ -3,6 +3,7 @@ mod archive;
 mod authority;
 mod capabilities;
 mod commands;
+mod executable;
 mod file_downloads;
 mod files;
 mod forgetting;
@@ -183,12 +184,7 @@ impl Host {
             }
             .validate()?;
         }
-        let binary = fs::symlink_metadata(&config.guardian_binary)?;
-        use std::os::unix::fs::MetadataExt;
-        anyhow::ensure!(
-            binary.is_file() && binary.uid() == 0 && binary.mode() & 0o022 == 0,
-            "guardian binary must be root-owned and not group/world writable"
-        );
+        executable::validate(&config.guardian_binary, 0)?;
         let (file, mut journal) = journal::open(&config)?;
         let authority = authority::open(&config, &mut journal)?;
         Ok(Self {
