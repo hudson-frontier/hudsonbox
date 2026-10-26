@@ -91,7 +91,7 @@ impl SourceRetirer {
         plan: &SourcePlan,
         selected: Option<&SourceRef>,
     ) -> Result<SourceRetirement, Error> {
-        let receipt = match self.current(plan, selected).await? {
+        let receipt = match self.store.current_retirement(plan, selected).await? {
             Current::Retired(receipt) => receipt,
             current => {
                 let (previous, mode) = match current {
@@ -143,7 +143,7 @@ impl SourceRetirer {
                     // or write a different marker after a lost acknowledgement.
                     Err(error) => return Err(storage_error(error)),
                 }
-                match self.current(plan, selected).await? {
+                match self.store.current_retirement(plan, selected).await? {
                     Current::Retired(receipt) => receipt,
                     _ => return Err(Error::Conflict),
                 }
@@ -151,19 +151,72 @@ impl SourceRetirer {
         };
         self.remove_previous(plan, &receipt).await?;
         // Absence of the old version is insufficient if the marker vanished.
-        match self.current(plan, selected).await? {
+        match self.store.current_retirement(plan, selected).await? {
             Current::Retired(current) if current == receipt => Ok(receipt),
             _ => Err(Error::Conflict),
         }
     }
+}
 
-    async fn current(
+impl SourceStore {
+    /// Read-only verification of an exact retirement receipt from a trusted
+    /// offline recovery ledger. Missing/changed markers and reappeared retired
+    /// versions fail without modifying storage or extending read authority.
+    pub async fn verify_retirement(
+        &self,
+        plan: &SourcePlan,
+        owner: &SourceOwner,
+        expected: &SourceRetirement,
+    ) -> Result<(), Error> {
+        plan.validate()?;
+        if &plan.owner != owner {
+            return Err(Error::OwnerMismatch);
+        }
+        expected.validate(plan)?;
+        let _permit = TRANSFERS.try_acquire().map_err(|_| Error::Busy)?;
+        tokio::time::timeout(TRANSFER_TIMEOUT, async {
+            match self
+                .current_retirement(plan, expected.previous.as_ref())
+                .await?
+            {
+                Current::Retired(current) if &current == expected => {}
+                Current::Missing => return Err(Error::Missing),
+                _ => return Err(Error::Conflict),
+            }
+            if let Some(previous) = &expected.previous
+                && let Some(version) = &previous.object_version
+                && Some(version) != expected.marker_version.as_ref()
+            {
+                match self
+                    .store
+                    .inner
+                    .get_opts(
+                        &Path::from(plan.object_key()?),
+                        GetOptions {
+                            version: Some(version.clone()),
+                            head: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => return Err(storage_error(error)),
+                    Ok(_) => return Err(Error::Conflict),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
+    async fn current_retirement(
         &self,
         plan: &SourcePlan,
         selected: Option<&SourceRef>,
     ) -> Result<Current, Error> {
         let response = match self
-            .store
             .store
             .inner
             .get_opts(&Path::from(plan.object_key()?), GetOptions::default())
@@ -212,7 +265,9 @@ impl SourceRetirer {
         }
         Ok(Current::Retired(receipt))
     }
+}
 
+impl SourceRetirer {
     async fn remove_previous(
         &self,
         plan: &SourcePlan,

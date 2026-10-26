@@ -117,6 +117,28 @@ The supervisor client tests reject altered acknowledgement scope/prefix and lost
 
 Hosted PR runners compile but do not execute the privileged suite. These checks establish guest and host behavior in the tested development configuration. The database and controller tests additionally cover admission ordering, exhausted slot/byte refunds, boot binding, stale claims, corrupt evidence, consumer retirement and unchanged retries. A controlled real API/controller/Firecracker case fills 32 command slots, blocks while output is unexpired, retires through the automatic worker, executes another command and confirms teardown. File database tests use explicitly simulated observations; the separate real host/guest RPC case exercises file pruning. These checks do not establish supported x86_64 release readiness or hostile-workload isolation.
 
+## Verifying retained storage fences
+
+Offline recovery can use `ArtifactStore::verify_reference` and
+`SourceStore::verify_reference` to verify the full pinned payload, or
+`verify_retirement` on either store to verify the exact retained retirement
+receipt. These methods perform only bounded reads, return no payload and do not
+extend customer read/write deadlines. The expected owner, plan and receipt must
+come from the trusted recovery ledger. Use storage credentials restricted to
+GET/HEAD for an audit.
+
+Retirement verification requires the current marker's complete content, ETag
+and version to match the saved receipt and the previously deleted version to
+remain absent. Missing markers, restored payloads and identically recreated
+markers with a different version fail without repair. A cleanup call is not an
+audit: it may install a marker or delete an old version. Keep workers stopped
+and storage quiescent throughout recovery verification. Passing an audit does
+not fence old writers, authorize replay, or permit marker deletion. The
+[storage regressions](../crates/sandbox-artifacts/src/retirement/tests.rs) and
+[source regressions](../crates/sandbox-artifacts/src/sources/retirement/tests.rs)
+cover missing/changed fences, payload corruption, ownership and capacity bounds,
+plus exact marker identity and incomplete deletion against private MinIO.
+
 ## Whole-allocation lifecycle
 
 The [whole-allocation retirement protocol](allocation-retirement.md) now has database preparation, host launch fencing, consumer closure and recoverable guardian metadata deletion components. The database retains exact metadata completion and the forgetting store/RPC handoff removes bounded host records. An opt-in [controller worker](allocation-retirement.md#automatic-controller-worker) now drives this handoff. Only the authenticated metadata-retirement RPC may remove verified guardian metadata; the subsequent forgetting RPC may remove protocol records after database acknowledgement. Manual deletion does not establish cleanup or restore admission capacity.

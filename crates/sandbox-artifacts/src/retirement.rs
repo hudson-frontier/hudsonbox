@@ -90,7 +90,7 @@ impl ArtifactRetirer {
         plan: &OutputPlan,
         selected: Option<&OutputRef>,
     ) -> Result<OutputRetirement, Error> {
-        let receipt = match self.current(plan, selected).await? {
+        let receipt = match self.store.current_retirement(plan, selected).await? {
             Current::Retired(receipt) => receipt,
             current => {
                 let (previous, mode) = match current {
@@ -141,7 +141,7 @@ impl ArtifactRetirer {
                     // or write a different marker after a lost acknowledgement.
                     Err(error) => return Err(storage_error(error)),
                 }
-                match self.current(plan, selected).await? {
+                match self.store.current_retirement(plan, selected).await? {
                     Current::Retired(receipt) => receipt,
                     _ => return Err(Error::Conflict),
                 }
@@ -149,19 +149,72 @@ impl ArtifactRetirer {
         };
         self.remove_previous(plan, &receipt).await?;
         // Absence of the old version is insufficient if the marker vanished.
-        match self.current(plan, selected).await? {
+        match self.store.current_retirement(plan, selected).await? {
             Current::Retired(current) if current == receipt => Ok(receipt),
             _ => Err(Error::Conflict),
         }
     }
+}
 
-    async fn current(
+impl ArtifactStore {
+    /// Verify retained storage evidence during an offline recovery audit. This
+    /// performs only reads and never repairs a missing or changed marker. The
+    /// expected owner and receipt must come from the trusted recovery ledger.
+    /// Success does not authorize customer access, replay or marker deletion.
+    pub async fn verify_retirement(
+        &self,
+        plan: &OutputPlan,
+        owner: &OutputOwner,
+        expected: &OutputRetirement,
+    ) -> Result<(), Error> {
+        plan.validate()?;
+        if &plan.owner != owner {
+            return Err(Error::OwnerMismatch);
+        }
+        expected.validate(plan)?;
+        let _permit = TRANSFERS.try_acquire().map_err(|_| Error::Busy)?;
+        tokio::time::timeout(TRANSFER_TIMEOUT, async {
+            match self
+                .current_retirement(plan, expected.previous.as_ref())
+                .await?
+            {
+                Current::Retired(current) if &current == expected => {}
+                Current::Missing => return Err(Error::Missing),
+                _ => return Err(Error::Conflict),
+            }
+            if let Some(previous) = &expected.previous
+                && let Some(version) = &previous.object_version
+                && Some(version) != expected.marker_version.as_ref()
+            {
+                match self
+                    .inner
+                    .get_opts(
+                        &Path::from(plan.object_key()?),
+                        GetOptions {
+                            version: Some(version.clone()),
+                            head: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => return Err(storage_error(error)),
+                    Ok(_) => return Err(Error::Conflict),
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| Error::Unavailable)?
+    }
+
+    async fn current_retirement(
         &self,
         plan: &OutputPlan,
         selected: Option<&OutputRef>,
     ) -> Result<Current, Error> {
         let response = match self
-            .store
             .inner
             .get_opts(&Path::from(plan.object_key()?), GetOptions::default())
             .await
@@ -209,7 +262,9 @@ impl ArtifactRetirer {
         }
         Ok(Current::Retired(receipt))
     }
+}
 
+impl ArtifactRetirer {
     async fn remove_previous(
         &self,
         plan: &OutputPlan,
