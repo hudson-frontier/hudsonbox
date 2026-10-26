@@ -148,6 +148,23 @@ async fn source_identity(
     op: &PgRow,
     file: &PgRow,
 ) -> Result<(SourcePlan, Option<SourceRef>), DispatchError> {
+    source_identity_impl(db, op, file, true).await
+}
+
+pub(crate) async fn source_identity_for_audit(
+    db: &mut PgConnection,
+    op: &PgRow,
+    file: &PgRow,
+) -> Result<(SourcePlan, Option<SourceRef>), DispatchError> {
+    source_identity_impl(db, op, file, false).await
+}
+
+async fn source_identity_impl(
+    db: &mut PgConnection,
+    op: &PgRow,
+    file: &PgRow,
+    share_lock: bool,
+) -> Result<(SourcePlan, Option<SourceRef>), DispatchError> {
     let project: uuid::Uuid = op.try_get("project_id")?;
     let sandbox: uuid::Uuid = op.try_get("sandbox_id")?;
     if op.try_get::<String, _>("kind")? != "file_write"
@@ -164,14 +181,17 @@ async fn source_identity(
     if op.try_get::<Option<uuid::Uuid>, _>("file_allocation_id")? != Some(allocation) {
         return Err(DispatchError::InvalidData);
     }
-    let a = sqlx::query(
-        "SELECT * FROM allocations WHERE id=$1 AND project_id=$2 AND sandbox_id=$3 FOR SHARE",
-    )
-    .bind(allocation)
-    .bind(project)
-    .bind(sandbox)
-    .fetch_one(&mut *db)
-    .await?;
+    let query = if share_lock {
+        "SELECT * FROM allocations WHERE id=$1 AND project_id=$2 AND sandbox_id=$3 FOR SHARE"
+    } else {
+        "SELECT * FROM allocations WHERE id=$1 AND project_id=$2 AND sandbox_id=$3"
+    };
+    let a = sqlx::query(query)
+        .bind(allocation)
+        .bind(project)
+        .bind(sandbox)
+        .fetch_one(&mut *db)
+        .await?;
     let expected = SourceOwner {
         operation_id: OperationId::from_uuid(op.try_get("id")?),
         scope: sandbox_protocol::file_downloads::ReadScope {

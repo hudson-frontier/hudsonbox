@@ -12,7 +12,7 @@ This procedure covers offline operator coordination and a reproducible PostgreSQ
 | Guest/kernel/Firecracker/image policy | Qualify the exact digest/version tuple separately; approve the capability policy only on an empty draining host; obtain matching fresh health | Keep old pinned artifacts for their original allocations. A new policy does not rewrite existing allocation ownership or make snapshots compatible |
 | Database/storage restore | Restore into quarantine, verify the full retained ledger and immutable objects, and reconcile independent physical ownership before any service can dispatch | A backup can predate issued epochs, permits, barriers, token revocations and external effects. Starting workers against it is unsafe without a separately verified recovery fence |
 
-There is no released mixed-version compatibility promise. Record the source revision, migration versions/checksums, binary hashes, image/kernel/Firecracker digests, host capability policy and configuration format for both sides of any upgrade. The current schema is migration 0023; histories require migrations 0015/0016, launch registration 0017/0018, and whole-allocation retirement 0019–0022. The matching API, controller, cleanup and supervisor must all understand the active protocols. Existing migration regression tests check upgrades from retained older rows; they do not certify arbitrary historical binaries.
+There is no released mixed-version compatibility promise. Record the source revision, migration versions/checksums, binary hashes, image/kernel/Firecracker digests, host capability policy and configuration format for both sides of any upgrade. Use the complete migration ledger embedded in the selected source revision; histories require migrations 0015/0016, launch registration 0017/0018, and whole-allocation retirement 0019–0022. The matching API, controller, cleanup and supervisor must all understand the active protocols. Existing migration regression tests check upgrades from retained older rows; they do not certify arbitrary historical binaries.
 
 Before a supervisor restart, drain through the operator command, reconcile outstanding/unknown operations, confirm all required physical cleanup and stop the old supervisor. `advance-epoch` clears freshness and keeps placement closed. Configure the replacement with that issued epoch; matching health and `finish-drain` are separate steps. An epoch update alone neither stops a VM nor releases capacity. Saved execution requires the still-unimplemented full snapshot protocol.
 
@@ -52,6 +52,58 @@ Do not use `--clean` against a running installation, suppress restore failures, 
 Keep the restored copy quarantined. A backup is an earlier observation, not a monotonic authority. It may resurrect a credential revoked after capture, forget a higher host epoch or reserved retirement floor, or describe an operation whose external effects already occurred. Before reconnecting any live component, independently fence all old execution and storage writers, reconcile the greatest issued host/permit/barrier authority from retained trusted state, rotate/revoke affected credentials and determine honest outcomes for work after the recovery point. Never rerun an arbitrary command to discover its outcome. If that evidence is unavailable, stop recovery with an explicit unknown/loss report. The current toolset does not automate or certify this live recovery step.
 
 Do not restore old object payloads over current retirement markers or replace a current host journal with an earlier copy. Local timeout, task cancellation and elapsed retention cannot prove that an issued storage write has stopped. Database claim expiry allows reconciliation; it does not prove physical release or invalidate an in-flight object-store request.
+
+## Read-only storage evidence audit
+
+After verifying the restored database inventory, keep services stopped and
+object storage quiescent. Use the finite audit command against the quarantined
+database and the corresponding retained output/source buckets:
+
+```sh
+cargo run -p sandbox-cleanup --bin sandbox-storage-audit -- \
+  --database-config /private/quarantine-database.json \
+  --output-config /private/output-readonly.json \
+  --file-source-config /private/source-readonly.json \
+  --timeout-seconds 300
+```
+
+The database configuration is an operator-owned `0600` JSON file containing
+`version: 1` and `database_url`. Final symlinks, special, oversized, permissive
+or foreign-owned files, unknown/duplicate fields and unsupported versions are
+rejected. Storage configurations use the existing private
+[S3 configuration format](output-storage.md#operator-configuration), with
+GET/HEAD credentials for both current and pinned versions. An omitted bucket
+configuration is accepted only if no retained evidence needs that bucket.
+
+The command starts a repeatable-read, read-only transaction, requires its exact
+complete migration ledger and checksums, scans every output
+and source page with bounded queries, validates the descriptors against retained
+operation/allocation ownership, and checks full pinned payload hashes or exact
+retirement receipts. It rejects unresolved upload authority, corrupt metadata,
+missing/changed markers and retained versions that should have been deleted.
+Expired references are checked without returning bytes or extending customer
+access. Simulated output is refused unless `--allow-simulated` is explicitly
+selected for development fixtures. The whole audit has a one-hour maximum
+deadline; timeout or any failed page produces a nonzero exit and requires a
+fresh audit. No migration, cleanup, metadata repair or dispatch occurs.
+
+The JSON report contains only verified object counts and the scope
+`storage_evidence_only`. Database/storage credentials, object keys, file paths
+and payloads are omitted from diagnostics. A passing audit confirms the observed
+storage evidence against that database snapshot. It does not verify backup
+freshness, stop an old writer, restore permissions, reconcile revoked tokens,
+release compute, or authorize reopening the installation. Keep quarantine until
+the independent recovery fences described above are established.
+
+PostgreSQL tests cover paging beyond one batch, a concurrent ledger change,
+compacted output, pending/unknown upload authority, source ownership and exact
+completed receipts. Executable tests require no database writes and verify that
+an empty/incompatible schema is never migrated. The opt-in local/CI
+`output_minio_storage_recovery` test uses real versioned source payloads and
+markers: storage progressing beyond the database fails; the acknowledged exact
+retirement passes; an altered saved marker fails without changing the ledger.
+These are recovery-verification checks, not a full object-store backup mechanism
+or supported-host qualification.
 
 ## Reproducible database rehearsal
 

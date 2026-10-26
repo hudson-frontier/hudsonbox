@@ -6,6 +6,9 @@ use sandbox_store::output_cleanup::CleanupCompletion;
 #[path = "compaction.rs"]
 mod compaction_tests;
 
+#[path = "storage_audit.rs"]
+mod audit_tests;
+
 fn completion(m: &CleanupManifest) -> CleanupCompletion {
     let Some(plans) = &m.plans else {
         return CleanupCompletion::NoUploadsAuthorized;

@@ -46,7 +46,7 @@ pub enum CleanupCompletion {
     },
 }
 impl CleanupCompletion {
-    fn validate(&self, manifest: &CleanupManifest) -> Result<(), OutputError> {
+    pub(crate) fn validate(&self, manifest: &CleanupManifest) -> Result<(), OutputError> {
         match (self, &manifest.plans) {
             (Self::NoUploadsAuthorized, None) if manifest.references.is_none() => Ok(()),
             (Self::Retired { stdout, stderr }, Some(plans)) => {
@@ -82,7 +82,10 @@ fn lease(seconds: u32) -> Result<f64, OutputError> {
     Ok(f64::from(seconds))
 }
 
-async fn manifest(db: &mut PgConnection, row: &PgRow) -> Result<CleanupManifest, OutputError> {
+pub(crate) async fn manifest(
+    db: &mut PgConnection,
+    row: &PgRow,
+) -> Result<CleanupManifest, OutputError> {
     let status: String = row.try_get("output_status")?;
     if !matches!(status.as_str(), "uploading" | "published" | "expired") {
         return Err(OutputError::Corrupt);

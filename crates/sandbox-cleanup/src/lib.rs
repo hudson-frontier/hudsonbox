@@ -1,5 +1,6 @@
 //! Independent storage cleanup. No supervisor/guest credentials, command
 //! dispatch, or VM lifecycle calls belong in this worker.
+pub mod audit;
 pub mod sources;
 use sandbox_artifacts::{ArtifactRetirer, Error as ArtifactError};
 use sandbox_protocol::{
