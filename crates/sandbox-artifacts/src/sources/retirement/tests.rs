@@ -4,6 +4,204 @@ use crate::sources::tests::{memory, owner, plan};
 use crate::tests::TESTS;
 use object_store::ObjectStoreExt;
 
+#[tokio::test]
+async fn recovery_verifies_pinned_bytes_without_extending_customer_read_authority() {
+    let _test = TESTS.lock().await;
+    let store = memory();
+    let p = plan(b"private-recovery-bytes");
+    let reference = store
+        .upload(&p, &p.owner, 1000, b"private-recovery-bytes")
+        .await
+        .unwrap();
+    store.verify_reference(&reference, &p.owner).await.unwrap();
+    assert!(matches!(
+        store.read(&reference, &p.owner, 3000).await,
+        Err(Error::Expired)
+    ));
+    assert_eq!(
+        store.verify_reference(&reference, &owner()).await,
+        Err(Error::OwnerMismatch)
+    );
+    let mut wrong = reference.clone();
+    wrong.etag = "wrong-etag".into();
+    assert!(store.verify_reference(&wrong, &p.owner).await.is_err());
+    let permit = TRANSFERS.acquire_many(4).await.unwrap();
+    assert_eq!(
+        store.verify_reference(&reference, &p.owner).await,
+        Err(Error::Busy)
+    );
+    drop(permit);
+    let path = Path::from(p.object_key().unwrap());
+    store
+        .store
+        .inner
+        .put(&path, b"restored-corrupt-bytes".to_vec().into())
+        .await
+        .unwrap();
+    assert!(store.verify_reference(&reference, &p.owner).await.is_err());
+    assert_eq!(
+        store
+            .store
+            .inner
+            .get(&path)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        b"restored-corrupt-bytes"[..]
+    );
+}
+
+#[tokio::test]
+async fn recovery_requires_exact_marker_without_repairing_or_reopening_retired_keys() {
+    let _test = TESTS.lock().await;
+    for uploaded in [false, true] {
+        let store = memory();
+        let p = plan(b"retired");
+        let reference = if uploaded {
+            Some(store.upload(&p, &p.owner, 1000, b"retired").await.unwrap())
+        } else {
+            None
+        };
+        let receipt = retirer(&store)
+            .retire(&p, &p.owner, reference.as_ref(), 3000)
+            .await
+            .unwrap();
+        store
+            .verify_retirement(&p, &p.owner, &receipt)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.verify_retirement(&p, &owner(), &receipt).await,
+            Err(Error::OwnerMismatch)
+        );
+        let mut wrong = receipt.clone();
+        wrong.marker_etag = "different-marker".into();
+        assert_eq!(
+            store.verify_retirement(&p, &p.owner, &wrong).await,
+            Err(Error::Conflict)
+        );
+        wrong = receipt.clone();
+        wrong.plan_sha256 = "0".repeat(64);
+        assert_eq!(
+            store.verify_retirement(&p, &p.owner, &wrong).await,
+            Err(Error::InvalidMetadata)
+        );
+        let path = Path::from(p.object_key().unwrap());
+        let before = store.store.inner.head(&path).await.unwrap();
+        let permit = TRANSFERS.acquire_many(4).await.unwrap();
+        assert_eq!(
+            store.verify_retirement(&p, &p.owner, &receipt).await,
+            Err(Error::Busy)
+        );
+        drop(permit);
+        store
+            .verify_retirement(&p, &p.owner, &receipt)
+            .await
+            .unwrap();
+        assert_eq!(store.store.inner.head(&path).await.unwrap(), before);
+        store.store.inner.delete(&path).await.unwrap();
+        assert_eq!(
+            store.verify_retirement(&p, &p.owner, &receipt).await,
+            Err(Error::Missing)
+        );
+        assert!(matches!(
+            store.store.inner.head(&path).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        // Restoring payload bytes over a forgotten fence must be rejected, not
+        // "fixed" by installing another marker with a new storage identity.
+        store
+            .store
+            .inner
+            .put_opts(
+                &path,
+                b"retired".to_vec().into(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    attributes: Attributes::from_iter([(
+                        crate::sources::metadata_key(),
+                        p.metadata_digest().unwrap(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.verify_retirement(&p, &p.owner, &receipt).await,
+            Err(Error::Conflict | Error::Corrupt)
+        ));
+        assert_eq!(
+            store
+                .store
+                .inner
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            b"retired"[..]
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires private versioned MinIO bucket"]
+async fn output_minio_file_source_recovery_rejects_recreated_marker_identity() {
+    let _test = TESTS.lock().await;
+    let store = config(true).build_sources().unwrap();
+    let cleaner = config(true).build_source_retirer().unwrap();
+    let p = plan(b"retained-version");
+    let reference = store
+        .upload(&p, &p.owner, 1000, b"retained-version")
+        .await
+        .unwrap();
+    store.verify_reference(&reference, &p.owner).await.unwrap();
+    let receipt = cleaner
+        .retire(&p, &p.owner, Some(&reference), 3000)
+        .await
+        .unwrap();
+    store
+        .verify_retirement(&p, &p.owner, &receipt)
+        .await
+        .unwrap();
+    let path = Path::from(p.object_key().unwrap());
+    let current = store.store.inner.get(&path).await.unwrap();
+    let attributes = current.attributes.clone();
+    let bytes = current.bytes().await.unwrap();
+    let replacement = store
+        .store
+        .inner
+        .put_opts(
+            &path,
+            bytes.into(),
+            PutOptions {
+                attributes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(replacement.version, receipt.marker_version);
+    assert_eq!(
+        store.verify_retirement(&p, &p.owner, &receipt).await,
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        store.store.inner.head(&path).await.unwrap().version,
+        replacement.version
+    );
+    for version in [
+        receipt.marker_version.unwrap(),
+        replacement.version.unwrap(),
+    ] {
+        cleaner.delete.delete(&p, &version).await.unwrap();
+    }
+}
+
 struct NoDelete;
 impl SourceVersionDelete for NoDelete {
     fn delete<'a>(&'a self, _: &'a SourcePlan, _: &'a str) -> BoxFuture<'a, Result<(), Error>> {
@@ -277,10 +475,26 @@ async fn output_minio_file_source_retirement_reclaims_exact_versions_and_recover
                 );
                 // Marker is durable, but old bytes remain: no success receipt.
                 assert!(matches!(
-                    cleaner.current(&p, Some(&r)).await.unwrap(),
+                    cleaner
+                        .store
+                        .current_retirement(&p, Some(&r))
+                        .await
+                        .unwrap(),
                     Current::Retired(_)
                 ));
                 assert_eq!(store.fetch(&p, Some(&r)).await.unwrap().1, bytes);
+                let Current::Retired(pending) = cleaner
+                    .store
+                    .current_retirement(&p, Some(&r))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("marker missing")
+                };
+                assert_eq!(
+                    store.verify_retirement(&p, &p.owner, &pending).await,
+                    Err(Error::Conflict)
+                );
                 let false_ack = SourceRetirer {
                     store: cleaner.store.clone(),
                     delete: Arc::new(IgnoreDelete),
@@ -310,6 +524,10 @@ async fn output_minio_file_source_retirement_reclaims_exact_versions_and_recover
                 ));
             }
             let receipt = cleaner.retire(&p, &p.owner, Some(&r), 3000).await.unwrap();
+            store
+                .verify_retirement(&p, &p.owner, &receipt)
+                .await
+                .unwrap();
             assert_eq!(
                 cleaner.retire(&p, &p.owner, Some(&r), 4000).await.unwrap(),
                 receipt

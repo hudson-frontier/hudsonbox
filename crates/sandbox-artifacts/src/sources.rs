@@ -133,7 +133,7 @@ impl SourceStore {
         .map_err(|_| Error::Unavailable)?
         .map(|(_, bytes)| SourceBytes { bytes })
     }
-    async fn fetch(
+    pub(crate) async fn fetch(
         &self,
         plan: &SourcePlan,
         pinned: Option<&SourceRef>,

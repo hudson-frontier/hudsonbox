@@ -4,6 +4,7 @@ mod config;
 pub mod sources;
 pub use config::S3Config;
 mod retirement;
+mod verification;
 pub use retirement::ArtifactRetirer;
 
 use futures_util::TryStreamExt;
