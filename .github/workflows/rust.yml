@@ -144,7 +144,7 @@ jobs:
         run: |
           # Explicit unprivileged packages: workspace-wide ignored tests would
           # also select real-host cases requiring a controlled KVM machine.
-          cargo test -p sandbox-artifacts -p sandbox-controller -p sandbox-api -p sandbox-store \
+          cargo test -p sandbox-artifacts -p sandbox-controller -p sandbox-api -p sandbox-store -p sandbox-cleanup \
             output_minio -- --ignored --test-threads=1
 
       - name: Remove test object storage

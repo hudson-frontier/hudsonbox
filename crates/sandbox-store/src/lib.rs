@@ -27,6 +27,7 @@ pub mod provision;
 pub mod reads;
 pub mod recovery;
 pub mod retention;
+pub mod storage_audit;
 pub mod stream;
 pub mod uploads;
 pub mod work;
