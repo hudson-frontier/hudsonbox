@@ -15,6 +15,23 @@ use uuid::Uuid;
 
 const PAGE_ROWS: i64 = 16;
 
+// Avoid a nullable-cursor OR in subsequent pages: a generic prepared plan must
+// retain the primary-key range as an index condition, not rescan old prefixes.
+fn page_query(sources: bool, after: bool) -> &'static str {
+    match (sources, after) {
+        (true, false) => "SELECT * FROM file_uploads WHERE $1::uuid IS NULL ORDER BY operation_id LIMIT $2",
+        (true, true) => "SELECT * FROM file_uploads WHERE operation_id>$1 ORDER BY operation_id LIMIT $2",
+        (false, false) =>
+            "SELECT o.*,c.manifest AS audit_manifest,c.receipt AS audit_receipt,c.completed_at AS audit_completed_at,c.eligible_at AS audit_eligible_at
+             FROM operations o LEFT JOIN output_cleanup c ON c.operation_id=o.id
+             WHERE $1::uuid IS NULL AND (o.output_status<>'none' OR c.operation_id IS NOT NULL) ORDER BY o.id LIMIT $2",
+        (false, true) =>
+            "SELECT o.*,c.manifest AS audit_manifest,c.receipt AS audit_receipt,c.completed_at AS audit_completed_at,c.eligible_at AS audit_eligible_at
+             FROM operations o LEFT JOIN output_cleanup c ON c.operation_id=o.id
+             WHERE o.id>$1 AND (o.output_status<>'none' OR c.operation_id IS NOT NULL) ORDER BY o.id LIMIT $2",
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("storage audit requires the matching complete migration ledger")]
@@ -118,15 +135,7 @@ impl Audit {
     }
     async fn page(&mut self) -> Result<Vec<Entry>, Error> {
         while !self.finished {
-            let query = if self.sources {
-                "SELECT * FROM file_uploads WHERE ($1::uuid IS NULL OR operation_id>$1) ORDER BY operation_id LIMIT $2"
-            } else {
-                "SELECT o.*,c.manifest AS audit_manifest,c.receipt AS audit_receipt,c.completed_at AS audit_completed_at,c.eligible_at AS audit_eligible_at
-                 FROM operations o LEFT JOIN output_cleanup c ON c.operation_id=o.id
-                 WHERE ($1::uuid IS NULL OR o.id>$1)
-                   AND (o.output_status<>'none' OR c.operation_id IS NOT NULL) ORDER BY o.id LIMIT $2"
-            };
-            let rows = sqlx::query(query)
+            let rows = sqlx::query(page_query(self.sources, self.cursor.is_some()))
                 .bind(self.cursor)
                 .bind(PAGE_ROWS)
                 .fetch_all(&mut *self.transaction)
@@ -156,6 +165,47 @@ impl Audit {
             }
         }
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use sandbox_protocol::Id;
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn storage_audit_generic_plans_bound_the_scan_by_the_cursor(pool: sqlx::PgPool) {
+        let mut transaction = pool.begin().await.unwrap();
+        for setting in [
+            "SET LOCAL plan_cache_mode=force_generic_plan",
+            "SET LOCAL enable_seqscan=off",
+            "SET LOCAL enable_bitmapscan=off",
+        ] {
+            sqlx::query(setting)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+        }
+        for sources in [false, true] {
+            let query = format!("EXPLAIN (COSTS OFF) {}", page_query(sources, true));
+            let rows = sqlx::query(&query)
+                .bind(sandbox_protocol::OperationId::generate().uuid())
+                .bind(PAGE_ROWS)
+                .fetch_all(&mut *transaction)
+                .await
+                .unwrap();
+            let condition = if sources {
+                "Index Cond: (operation_id >"
+            } else {
+                "Index Cond: (id >"
+            };
+            assert!(
+                rows.iter()
+                    .any(|row| row.get::<String, _>(0).contains(condition)),
+                "cursor must constrain the index scan"
+            );
+        }
     }
 }
 
