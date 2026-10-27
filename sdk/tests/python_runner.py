@@ -6,7 +6,7 @@ import dataclasses
 import json
 import re
 import sys
-from hudsonbox import Client, ClientError, RangeChunk, EventStream
+from hudsonbox import Client, ClientError, RangeChunk, EventStream, models
 
 
 def normalize(value):
@@ -23,6 +23,8 @@ async def run():
     if "body_base64" in args:
         args["body"] = base64.b64decode(args.pop("body_base64"))
     try:
+        if model := case.get("python_body_model"):
+            args["body"] = models.MODELS[model](**args["body"])
         async with Client(sys.argv[1]) as client:
             action = re.sub(r"(?<!^)(?=[A-Z])", "_", case["action"]).lower()
             result = await getattr(client, action)(**args)

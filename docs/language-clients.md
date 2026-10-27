@@ -71,6 +71,12 @@ try {
 
 To bind an execute request to the sandbox generation you inspected, include `expected_generation` in its saved command body: a positive Python `int`, TypeScript `bigint` (for example `1n`), or Rust `Some(1_i64)`. A new stale request returns HTTP `409` with code `sandbox_generation_mismatch`. Keep the precondition unchanged when reconciling a lost admission reply; an exact retry preserves its original operation. See the [generation contract](api-contract.md#execution-generation-precondition).
 
+Omit `expected_generation` for legacy admission. Explicit JSON `null` (Python
+`None`) is rejected before submission, including when constructing a Python
+command from saved JSON. The Python dataclass uses an internal omission marker
+for this field; use `to_wire()` to serialize it. Copying a model or passing
+`dataclasses.asdict(model)` back to the SDK preserves omission and explicit guards.
+
 ## Integer, streaming and file behavior
 
 The [executable Python recovery example](../sdk/python/examples/README.md) saves

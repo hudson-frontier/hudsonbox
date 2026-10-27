@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import dataclasses
+from enum import Enum
 import json
 import math
 import re
@@ -17,6 +18,13 @@ _MESSAGES = {
     "file": "local file operation failed; destination must not already exist",
     "integrity": "download integrity verification failed",
 }
+
+
+class _Omitted(Enum):
+    VALUE = 0
+
+
+_OMITTED = _Omitted.VALUE
 
 
 class ClientError(Exception):
@@ -177,12 +185,16 @@ def _model(name, value, decode, depth=0):
         _fail(error)
     result = {}
     for field, rule in spec["fields"].items():
-        if field not in value:
+        if field not in value or (rule.get("reject_null") and value[field] is _OMITTED):
             if rule["required"]:
                 _fail(error)
+            if rule.get("reject_null"):
+                continue
             item = rule.get("default")
         else:
             item = value[field]
+        if item is None and rule.get("reject_null"):
+            _fail(error)
         if item is None and not rule["required"] and "default" not in rule:
             result[field] = None
             continue

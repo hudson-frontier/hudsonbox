@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
-from ._wire import Model
+from ._wire import Model, _Omitted, _OMITTED
 
 @dataclass(kw_only=True, repr=False)
 class RequestedResources(Model):
@@ -24,7 +24,7 @@ class CommandInput(Model):
     cwd: str = '/'
     deadline_unix_ms: int
     output_limit: int = 1048576
-    expected_generation: int | None = None
+    expected_generation: int | _Omitted = _OMITTED
 
 @dataclass(kw_only=True, repr=False)
 class DestroyRequest(Model):
