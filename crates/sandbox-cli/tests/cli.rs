@@ -15,10 +15,19 @@ use std::{path::Path, sync::Arc, time::Duration};
 fn path(path: &Path) -> &str {
     path.to_str().unwrap()
 }
+fn command() -> tokio::process::Command {
+    if let Some(binary) = std::env::var_os("HUDSON_TEST_OPERATOR_CLI") {
+        let mut command = tokio::process::Command::new(binary);
+        command.arg("sandbox");
+        command
+    } else {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_sandbox-api-test-client"))
+    }
+}
 async fn cli(s: &Server, args: &[&str], expected: i32) -> Vec<u8> {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_hudsonbox"))
+        command()
             .args(["--config", path(&s.config), "--json"])
             .args(args)
             .output(),
@@ -379,7 +388,7 @@ async fn expired_retry_reports_original_operation_without_leaking_backend_text()
     }))).await;
     let request = s.directory.path().join("create.json");
     private(&request,&serde_json::to_vec(&json!({"image_digest":"sha256:fixture","resources":{"vcpu":1,"memory_mib":128,"disk_mib":64}})).unwrap());
-    let result = tokio::process::Command::new(env!("CARGO_BIN_EXE_hudsonbox"))
+    let result = command()
         .args([
             "--config",
             path(&s.config),

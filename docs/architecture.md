@@ -46,7 +46,7 @@ All clients share server-side permission, quota, and lifecycle enforcement. Back
 
 For a custom harness such as Hudson, implement a harness tool that calls the API directly or through an SDK. The harness holds the project credential and returns concise operation results to its agent. No Hudson-specific identity service or Temporal dependency is added here.
 
-For an agent with shell access, the integration is **agent shell tool → `hudsonbox` CLI → API**. Claude Code is one example: it can run commands and consume project instructions, as described in its [official overview](https://code.claude.com/docs/en/overview). Our planned integration installs the CLI in the agent's execution environment, configures the service URL and project credential, and provides short instructions for using it. The API and sandbox compute may be remote from that CLI.
+For an agent with shell access, the integration is **agent shell tool → `hudson sandbox` → API**. The standalone [Hudson CLI](https://github.com/hudson-frontier/hudson-cli) owns public terminal commands. Claude Code is one example: it can run commands and consume project instructions, as described in its [official overview](https://code.claude.com/docs/en/overview). Install Hudson CLI in the agent's execution environment, configure the service URL and project credential, and provide short instructions for using it. The API and sandbox compute may be remote from that CLI.
 
 Installing the CLI does not redirect the harness's built-in file edits or shell commands into our sandbox. The agent must explicitly use the CLI for remote execution and file transfers. Instructions help it choose the tool; they do not enforce isolation of other harness tools. A caller that needs all execution confined to our sandbox must enforce that through its harness configuration. A chat client with no custom-tool or shell integration cannot use the service merely because an HTTP endpoint exists.
 
@@ -236,7 +236,7 @@ crates/
   sandbox-guest/        # Commands, files, and bounded guest reporting
   sandbox-store/        # SQLx queries, PostgreSQL transactions, and object storage
   sandbox-client/       # Generated Project requests/models and bounded HTTPS client
-  sandbox-cli/          # HTTP API client for humans, scripts, and agent shell tools
+  sandbox-cli/          # Private API test client and SDK integration fixtures
 images/                 # Guest image and kernel build definitions
 deploy/                 # Kubernetes services and dedicated Linux host setup
 tests/                  # Integration, recovery, isolation, and protocol tests

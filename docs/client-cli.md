@@ -1,17 +1,26 @@
-# Rust client and project CLI
+# Rust client and Hudson CLI
 
-Status: the reusable [Rust client](../crates/sandbox-client/src/lib.rs) and `hudsonbox` CLI cover the 14 implemented Project API operations. They use HTTPS only and have no database, supervisor or Firecracker authority. [Python/TypeScript clients](language-clients.md) cover the same operations with shared conformance. Package publication, signed installers and supported-host release gates remain unfinished. This is a development client for an existing installation, not a production deployment quickstart.
+The reusable [Rust client](../crates/sandbox-client/src/lib.rs) and the standalone
+[Hudson CLI](https://github.com/hudson-frontier/hudson-cli) cover the 14 implemented
+Project API operations. Use `hudson sandbox` for terminal workflows. They use HTTPS
+and have no database, supervisor, or Firecracker authority.
+[Python/TypeScript clients](language-clients.md) cover the same operations with
+shared conformance. SDK package publication and supported-host release gates
+remain unfinished; client availability does not establish deployment readiness.
 
-## Build and configure
+## Install and configure
 
-From the repository, using the pinned Rust toolchain:
+Install the published Hudson CLI using its
+[installation guide](https://github.com/hudson-frontier/hudson-cli#installation),
+then inspect the sandbox commands:
 
 ```sh
-cargo build --locked -p sandbox-cli --bin hudsonbox
-./target/debug/hudsonbox --help
+hudson sandbox --help
 ```
 
-The binary is named `hudsonbox`; its Cargo package remains `sandbox-cli`. Private-file loading currently supports Unix (tested on macOS and Linux); other platforms fail closed. Ordinary client builds do not need Python, PostgreSQL, protoc or VM access. Workspace/API integration tests need the [development dependencies](implementation/dev-env.md).
+Private-file loading supports Unix (tested on macOS and Linux); other platforms
+fail closed. Use WSL on Windows for sandbox API commands. Client use does not
+require a Hudsonbox source checkout, PostgreSQL, protoc, or local VM access.
 
 An operator first provisions a project using [offline project provisioning](api-server.md#offline-project-provisioning). Retain the resulting JSON credential file unchanged. In a trusted directory owned by your user with mode `0700`, create a mode `0600` client configuration:
 
@@ -31,7 +40,7 @@ The endpoint must be an HTTPS origin without user information, query, fragment o
 
 ```sh
 export HUDSONBOX_CONFIG=/absolute/private/path/client.json
-./target/debug/hudsonbox --json list --limit 20
+hudson sandbox --json list --limit 20
 ```
 
 ## Stable mutations and operation handles
@@ -39,8 +48,8 @@ export HUDSONBOX_CONFIG=/absolute/private/path/client.json
 Every create, execute, destroy, cancel and upload requires either `--key` or `--key-file`. Generate one key **before** the first attempt and retain it with the exact request. The `key` command generates a random UUIDv4, writes a private file and refuses to overwrite an existing path. It does not call the API.
 
 ```sh
-hudsonbox key --to create.key
-hudsonbox --json create --request create.json --key-file create.key
+hudson sandbox key --to create.key
+hudson sandbox --json create --request create.json --key-file create.key
 ```
 
 Example `create.json` (replace the digest with an image allowlisted by your operator):
@@ -55,8 +64,8 @@ Example `create.json` (replace the digest with an image allowlisted by your oper
 Admission returns the original sandbox/operation handles and current status. It does not wait for readiness. Poll that operation explicitly:
 
 ```sh
-hudsonbox --json wait op_REPLACE_WITH_RETURNED_ID --seconds 60
-hudsonbox --json get sbx_REPLACE_WITH_RETURNED_ID
+hudson sandbox --json wait op_REPLACE_WITH_RETURNED_ID --seconds 60
+hudson sandbox --json get sbx_REPLACE_WITH_RETURNED_ID
 ```
 
 Execute uses a saved JSON request too, so a retry preserves the absolute command deadline and argument/environment values. Create this file once; do not regenerate its deadline during a retry. The API requires a future deadline within its admission window for a new command. Exact duplicate retries follow the [admission contract](api-contract.md#retries-and-admission).
@@ -69,8 +78,8 @@ with open('execute.json', 'x') as request:
                'deadline_unix_ms': int(time.time() * 1000) + 60000,
                'output_limit': 1048576}, request)
 PY
-hudsonbox key --to execute.key
-hudsonbox --json execute sbx_REPLACE_WITH_RETURNED_ID \
+hudson sandbox key --to execute.key
+hudson sandbox --json execute sbx_REPLACE_WITH_RETURNED_ID \
   --request execute.json --key-file execute.key
 ```
 
@@ -128,7 +137,32 @@ Use `sandbox_client::Client::from_config`, generated `models` and `requests`, an
 
 [OpenAPI generation](openapi.md) emits both client models and request methods. Model output is identical to the API's shared wire models, preserving command defaults/order and omission/null behavior. The finite generator rejects unsupported request media, parameter locations and ambiguous success shapes. Manual code owns trust, transport bounds, waits, stream decoding and file verification.
 
-[Transport tests](../crates/sandbox-client/tests/transport.rs) exercise real local TLS, credential file restrictions, redirects, lost replies, timeouts, binary framing, partial SSE frames, capture expiry and digest corruption. [CLI tests](../crates/sandbox-cli/tests/cli.rs) run the actual binary through TLS/API/PostgreSQL across all 14 routes, verify retry identity, preserve binary bytes and distinguish command outcomes. Their guest/file/output adapters are synthetic. These tests do not validate hostile workload isolation, installer behavior or supported production hosts. The [language client guide](language-clients.md) describes the shared three-language conformance corpus and additional API integration. Distribution remains unfinished.
+[Transport tests](../crates/sandbox-client/tests/transport.rs) exercise real local TLS, credential file restrictions, redirects, lost replies, timeouts, binary framing, partial SSE frames, capture expiry and digest corruption. [CLI tests](../crates/sandbox-cli/tests/cli.rs) run a private test client through TLS/API/PostgreSQL across all 14 routes, verify retry identity, preserve binary bytes and distinguish command outcomes. Their guest/file/output adapters are synthetic. These tests do not validate hostile workload isolation, installer behavior or supported production hosts. The [language client guide](language-clients.md) describes the shared three-language conformance corpus and additional API integration.
+
+### Backend development and cross-repository checks
+
+The unpublished `sandbox-cli` package retains `sandbox-api-test-client` as a
+backend test fixture. It is excluded from the native source installer and does
+not provide the public `hudson` or `hudsonbox` commands. Build it only when
+debugging the API or its integration tests:
+
+```sh
+cargo build --locked -p sandbox-cli --bin sandbox-api-test-client
+./target/debug/sandbox-api-test-client --help
+```
+
+With the [development dependencies](implementation/dev-env.md) available, run
+the same API integration suite against a trusted, locally built Hudson CLI:
+
+```sh
+HUDSON_TEST_OPERATOR_CLI=/absolute/path/to/hudson \
+  cargo test --locked -p sandbox-cli --test cli
+```
+
+The override invokes that executable with the `sandbox` subcommand. The default
+tests use the private fixture; they download no executable. This checks the
+standalone command adapter against the real TLS/API/PostgreSQL boundary without
+requiring a KVM host.
 
 ## Rust client identity for recovery
 

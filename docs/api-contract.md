@@ -23,7 +23,7 @@ The first release ships the CLI and three SDKs — Python, TypeScript, and Rust.
 For example, this is a proposed mapping, not a working command:
 
 ```text
-hudsonbox pause <sandbox-id>
+hudson sandbox pause <sandbox-id>
     → POST /v1/sandboxes/{sandbox_id}/pause
     → Authorization: Bearer <configured-project-token>
     → Idempotency-Key: <key-for-this-logical-request>

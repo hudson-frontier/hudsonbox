@@ -1,4 +1,4 @@
-//! Project API CLI. Configuration and credentials never come from workload flags.
+//! Private Project API test client. Public operator commands live in hudson-cli.
 use clap::{Args, Parser, Subcommand};
 use sandbox_client::{Client, Error, Event, models::*, requests::*};
 use serde::Serialize;
@@ -10,9 +10,9 @@ use std::{
 
 #[derive(Parser)]
 #[command(
-    name = "hudsonbox",
+    name = "sandbox-api-test-client",
     version,
-    about = "Project-scoped Hudsonbox HTTPS client"
+    about = "Private Hudsonbox API test client; operators should use `hudson sandbox`"
 )]
 struct Cli {
     /// Private client configuration; contains the origin and credential file path.
@@ -213,7 +213,7 @@ fn admitted(value: &AdmittedResponse, json: bool) -> Result<(), Error> {
     emit(
         value,
         &format!(
-            "Admitted {} for {} ({})\nPoll with: hudsonbox wait {}",
+            "Admitted {} for {} ({})\nPoll with: sandbox-api-test-client wait {}",
             escaped(&value.operation_id),
             escaped(&value.sandbox_id),
             escaped(&value.status),

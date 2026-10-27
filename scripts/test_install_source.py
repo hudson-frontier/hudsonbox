@@ -14,6 +14,47 @@ from unittest.mock import patch
 import install_source as installer
 
 
+class BuildProfileTests(unittest.TestCase):
+    def test_profiles_build_services_and_offline_tools_without_public_cli(self):
+        binaries = {
+            'sandbox-api': ('sandbox-api',),
+            'sandbox-controller': ('sandbox-controller', 'sandbox-host-manager', 'sandbox-local-pki'),
+            'sandbox-cleanup': ('sandbox-cleanup', 'sandbox-storage-audit'),
+            'sandbox-supervisor': ('sandbox-supervisor', 'sandbox-host'),
+            'sandbox-guest': ('sandbox-guest',),
+            'sandbox-cli': ('sandbox-api-test-client',),
+        }
+        expected = {
+            'control-plane': {'sandbox-api', 'sandbox-controller', 'sandbox-host-manager',
+                              'sandbox-local-pki', 'sandbox-cleanup', 'sandbox-storage-audit'},
+            'linux-runtime': {'sandbox-supervisor', 'sandbox-host', 'sandbox-guest'},
+        }
+        metadata = {'packages': [
+            {'id': name, 'name': name,
+             'targets': [{'name': binary, 'kind': ['bin']} for binary in names]}
+            for name, names in binaries.items()
+        ]}
+        for profile, names in expected.items():
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                work = Path(temporary)
+                target = work / 'target'
+
+                def build(command, **kwargs):
+                    packages = [command[index + 1] for index, arg in enumerate(command) if arg == '-p']
+                    self.assertNotIn('sandbox-cli', packages)
+                    self.assertIn('--locked', command)
+                    for package in packages:
+                        for binary in binaries[package]:
+                            event = {'reason': 'compiler-artifact', 'package_id': package,
+                                     'target': {'name': binary}, 'executable': str(target / binary)}
+                            kwargs['stdout'].write((json.dumps(event) + '\n').encode())
+
+                with patch.object(installer.subprocess, 'check_output', return_value=json.dumps(metadata)), \
+                     patch.object(installer.subprocess, 'run', side_effect=build):
+                    result = installer.build_binaries(work, profile, target, '1.92.0', work)
+                self.assertEqual(set(result), names)
+
+
 @unittest.skipUnless(os.name == 'posix', 'native Unix installer')
 class InstallTests(unittest.TestCase):
     def setUp(self):
