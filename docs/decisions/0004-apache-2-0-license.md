@@ -11,7 +11,7 @@ The project intends an open-source release and self-hosting by its users, so the
 
 ## Decision
 
-Apache-2.0. The full text is in `LICENSE` at the repository root, copyright Hudson Labs.
+Apache-2.0. The full text is in `LICENSE` at the repository root, copyright Hudson Frontier.
 
 ## Consequences
 

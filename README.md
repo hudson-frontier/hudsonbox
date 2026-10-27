@@ -1,4 +1,4 @@
-# Hudsonbox
+<h1 align="center">Hudsonbox</h1>
 
 <p align="center">
   A Linux workload runtime with an authenticated API and an explicit lifecycle.
@@ -19,7 +19,7 @@
 
 ---
 
-Hudsonbox is a Hudson Labs project building a runtime for untrusted Linux
+Hudsonbox is a Hudson Frontier project building a runtime for untrusted Linux
 workloads. Applications use its API to create sandboxes, execute commands,
 transfer files, observe output, and destroy environments with tracked cleanup.
 

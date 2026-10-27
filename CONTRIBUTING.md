@@ -1,6 +1,6 @@
 # Contributing to Hudsonbox
 
-Hudsonbox is being designed in public by Hudson Labs. Start with the [README](README.md) and [documentation guide](docs/README.md). The runtime is partially implemented; the [development guide](docs/implementation/dev-env.md) distinguishes local checks, controlled VM evidence and unfinished release gates.
+Hudsonbox is being designed in public by Hudson Frontier. Start with the [README](README.md) and [documentation guide](docs/README.md). The runtime is partially implemented; the [development guide](docs/implementation/dev-env.md) distinguishes local checks, controlled VM evidence and unfinished release gates.
 
 The project is released under [Apache-2.0](LICENSE); contributions are accepted under the same terms, as its section 5 provides. No CLA or commit-signoff requirement is currently configured.
 
