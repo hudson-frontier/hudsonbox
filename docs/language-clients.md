@@ -93,6 +93,8 @@ Both clients use the [same byte bounds](client-cli.md#results-bounds-and-exit-st
 
 `upload` calculates the digest and size for caller-supplied bytes and still requires an explicit mutation key. `download` captures once, verifies every range against the capture, hashes all bytes and checks the final size/digest before publishing a private destination file. It refuses overwrite, removes temporary files on ordinary failure, and never recaptures silently. Release is best effort within two seconds; `release_confirmed: false` reports uncertainty while preserving verified bytes. Cancellation or process death can leave a remote capture until its bounded expiry. Filesystem crash durability and cleanup after uncatchable process termination are not claimed.
 
+The download destination must name a file. Python rejects directory-shaped strings such as `result/` and `result/.` before creating a remote capture; pass a file name such as `result/output.bin` instead.
+
 TypeScript generated methods accept optional `{ signal: AbortSignal }` as their second argument. Aborting an HTTP call stops client I/O; it does not cancel the server operation. Python supports ordinary task cancellation. On either language, cancelling a sent mutation leaves its admission outcome uncertain.
 
 ## Validation boundaries
