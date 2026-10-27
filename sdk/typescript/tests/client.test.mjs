@@ -28,6 +28,13 @@ test('defaults, explicit null, closed models and prototype names',()=>{
 test('malformed and unbounded JSON fails',()=>{
   for(const raw of [Uint8Array.of(255),'{"x":1,"x":2}','NaN','1e999','"\\ud800"','['.repeat(130)+'0'+']'.repeat(130)]) assert.throws(()=>parseJson(raw),ClientError);
 });
+test('optional generation rejects explicit null while omission and a guard remain distinct',()=>{
+  const body={argv:['true'],deadline_unix_ms:1,expected_generation:null};
+  for (const decode of [false,true]) assert.throws(()=>model('CommandInput',body,decode),error=>error instanceof ClientError && error.kind===(decode?'protocol':'request'));
+  assert.equal(Object.hasOwn(model('CommandInput',{argv:['true'],deadline_unix_ms:1},false),'expected_generation'),false);
+  for (const generation of [0n,3n]) assert.equal(model('CommandInput',{argv:['true'],deadline_unix_ms:1,expected_generation:generation},false).expected_generation,generation);
+  assert.equal(Object.hasOwn(model('ProblemBody',{title:'fixture',status:409,code:'conflict',operation_id:null}),'operation_id'),false);
+});
 test('keys are fresh and error diagnostics redact backend data',()=>{
   assert.notEqual(newIdempotencyKey(),newIdempotencyKey());
   const e=new ClientError('http',503,'private-backend-text','private-backend-text');

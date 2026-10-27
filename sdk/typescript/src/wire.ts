@@ -2,7 +2,7 @@ import { inspect } from 'node:util';
 import { schema } from './schema.js';
 export type JsonValue = null | boolean | string | number | bigint | JsonValue[] | { [key: string]: JsonValue };
 export interface Profile { kind: string; inner?: Profile; name?: string; wide?: boolean; min?: string; max?: string }
-export interface Rule { type: Profile; required: boolean; nullable: boolean; omit_false: boolean; default?: JsonValue }
+export interface Rule { type: Profile; required: boolean; nullable: boolean; omit_false: boolean; default?: JsonValue; reject_null?: boolean }
 export interface Schema { models: Record<string, { fields: Record<string, Rule>; closed: boolean }>; codes: string[]; version: string }
 export type ErrorKind = 'configuration' | 'request' | 'transport' | 'protocol' | 'http' | 'wait_timeout' | 'file' | 'integrity';
 const messages: Record<ErrorKind, string> = {
@@ -114,6 +114,7 @@ export function model(name: string, input: unknown, decode = true, depth = 0): R
     const present = Object.hasOwn(input, key) && input[key] !== undefined;
     if (!present && rule.required) fail(kind);
     const item = present ? input[key] : Object.hasOwn(rule, 'default') ? rule.default : null;
+    if (present && item === null && rule.reject_null) fail(kind);
     if (item === null && !rule.required && !Object.hasOwn(rule, 'default')) {
       if (rule.nullable) result[key] = null;
       continue;
