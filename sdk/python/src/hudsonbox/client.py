@@ -67,7 +67,22 @@ class Client(Requests):
 
     async def download(self, *, sandbox_id: str, path: str, destination: str | Path):
         try:
-            destination = Path(destination)
+            raw_destination = os.fspath(destination)
+            if (
+                not isinstance(raw_destination, str)
+                or not raw_destination
+                or "\x00" in raw_destination
+            ):
+                raise ClientError("request")
+            os.fsencode(raw_destination)
+        except (TypeError, ValueError):
+            raise ClientError("request") from None
+        # Path normalizes away trailing separators and '.', changing a directory
+        # request into a file name. Validate that syntax before normalization.
+        if os.path.basename(raw_destination) in ("", ".", ".."):
+            raise ClientError("file")
+        try:
+            destination = Path(raw_destination)
             with tempfile.NamedTemporaryFile(dir=destination.parent) as file:
                 capture = await self.capture_file(
                     sandbox_id=sandbox_id, body=FileCaptureRequest(path=path)
