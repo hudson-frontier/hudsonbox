@@ -19,7 +19,7 @@
 
 ---
 
-Hudsonbox is a Hudson Labs project building a runtime for untrusted Linux
+Hudsonbox is a Hudson Frontier project building a runtime for untrusted Linux
 workloads. Applications use its API to create sandboxes, execute commands,
 transfer files, observe output, and destroy environments with tracked cleanup.
 
