@@ -19,14 +19,14 @@ class BuildProfileTests(unittest.TestCase):
         binaries = {
             'sandbox-api': ('sandbox-api',),
             'sandbox-controller': ('sandbox-controller', 'sandbox-host-manager', 'sandbox-local-pki'),
-            'sandbox-cleanup': ('sandbox-cleanup',),
+            'sandbox-cleanup': ('sandbox-cleanup', 'sandbox-storage-audit'),
             'sandbox-supervisor': ('sandbox-supervisor', 'sandbox-host'),
             'sandbox-guest': ('sandbox-guest',),
             'sandbox-cli': ('sandbox-api-test-client',),
         }
         expected = {
             'control-plane': {'sandbox-api', 'sandbox-controller', 'sandbox-host-manager',
-                              'sandbox-local-pki', 'sandbox-cleanup'},
+                              'sandbox-local-pki', 'sandbox-cleanup', 'sandbox-storage-audit'},
             'linux-runtime': {'sandbox-supervisor', 'sandbox-host', 'sandbox-guest'},
         }
         metadata = {'packages': [
