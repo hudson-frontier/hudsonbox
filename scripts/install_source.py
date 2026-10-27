@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATHS = ('Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates', 'proto',
                 'migrations', 'dev/runtime-artifacts.json')
 PACKAGES = {
-    'control-plane': ('sandbox-api', 'sandbox-controller', 'sandbox-cli', 'sandbox-cleanup'),
+    'control-plane': ('sandbox-api', 'sandbox-controller', 'sandbox-cleanup'),
     'linux-runtime': ('sandbox-supervisor', 'sandbox-guest'),
 }
 

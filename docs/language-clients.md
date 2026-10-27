@@ -4,7 +4,7 @@ Status: development clients cover the 14 implemented Project API operations. Mod
 
 ## Build and configure
 
-Use Python 3.11 or newer, Node 24.9.0 or newer, and a Unix account. These are server-side clients: do not embed project credentials in a browser bundle. The clients require an existing HTTPS API installation and a provisioned project credential. Use the same [private configuration file](client-cli.md#build-and-configure) as the Rust client. Pass its trusted path directly to the constructor; credentials and endpoint selection belong outside workload/model arguments.
+Use Python 3.11 or newer, Node 24.9.0 or newer, and a Unix account. These are server-side clients: do not embed project credentials in a browser bundle. The clients require an existing HTTPS API installation and a provisioned project credential. Use the same [private configuration file](client-cli.md#install-and-configure) as the Rust client. Pass its trusted path directly to the constructor; credentials and endpoint selection belong outside workload/model arguments.
 
 From the repository root:
 

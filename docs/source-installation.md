@@ -17,7 +17,7 @@ download locked public dependencies; toolchain auto-installation is disabled.
 
 | Profile | Native application packages |
 | --- | --- |
-| `control-plane` | Authenticated API, controller/operator tools, project CLI and cleanup worker |
+| `control-plane` | Authenticated API, controller/offline operator tools and cleanup worker |
 | `linux-runtime` | Linux supervisor, host service and guest init/runner |
 
 Both profiles compile native binaries. The runtime profile requires Linux,
@@ -25,6 +25,12 @@ but building it does not use KVM or execute guest init. It does not build a
 guest image or fetch Firecracker/jailer. Follow
 [verified host startup](verified-host-startup.md) and
 [Linux development](linux-development.md) for those artifacts and runtime gates.
+
+Install [Hudson CLI](https://github.com/hudson-frontier/hudson-cli#installation)
+separately for public `hudson sandbox` commands. Backend installation excludes the
+private API test client and never installs a competing `hudson` or `hudsonbox`
+binary. Offline database provisioning, host maintenance, and service startup
+retain their existing binaries and authority boundaries.
 
 ## Build and install
 

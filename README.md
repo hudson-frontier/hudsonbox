@@ -74,9 +74,9 @@ Copy the returned operation ID into `wait`. Admission returns before completion.
 Keep the exact request and key for retries of the same logical mutation.
 Stopping observation leaves the operation running.
 
-The repository also builds the development `hudsonbox` client with
-`cargo build --locked -p sandbox-cli --bin hudsonbox`. Both clients require
-private Unix credential files for sandbox API access; use Linux, macOS, or WSL.
+Hudson CLI owns the public terminal commands. Sandbox API access requires private
+Unix credential files; use Linux, macOS, or WSL. This repository provides the API,
+SDKs, service binaries, and a private API test client for backend development.
 
 ## Integrate with your application
 

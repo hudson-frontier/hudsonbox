@@ -1,6 +1,6 @@
 [package]
 name = "sandbox-cli"
-description = "HTTP API client for humans, scripts, and agent shell tools."
+description = "Private Project API test client and SDK integration fixtures."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ publish.workspace = true
 workspace = true
 
 [[bin]]
-name = "hudsonbox"
+name = "sandbox-api-test-client"
 path = "src/main.rs"
 
 [dependencies]
