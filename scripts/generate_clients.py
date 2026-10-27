@@ -60,6 +60,8 @@ def profiles(doc):
             }
             if prop.get("x-rust-default"):
                 entry["default"] = prop["default"]
+            if prop.get("x-rust-nonnull-option"):
+                entry["reject_null"] = True
             fields[field] = entry
         result[name] = {
             "fields": fields,
@@ -154,7 +156,7 @@ def render_python(doc, ps):
         "from __future__ import annotations",
         "from dataclasses import dataclass, field",
         "from typing import Any",
-        "from ._wire import Model",
+        "from ._wire import Model, _Omitted, _OMITTED",
         "",
     ]
     for name, model in ps.items():
@@ -170,9 +172,14 @@ def render_python(doc, ps):
                     else " = " + repr(value)
                 )
             elif not field_data["required"]:
-                if not field_data["nullable"]:
+                if field_data.get("reject_null"):
+                    ty += " | _Omitted"
+                    default = " = _OMITTED"
+                elif not field_data["nullable"]:
                     ty += " | None"
-                default = " = None"
+                    default = " = None"
+                else:
+                    default = " = None"
             lines.append(f"    {field_name}: {ty}{default}")
         if not model["fields"]:
             lines.append("    pass")

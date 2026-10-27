@@ -2022,5 +2022,40 @@
       "code": "sandbox_generation_mismatch",
       "operation_id": null
     }
+  },
+  {
+    "name": "null generation is rejected without submitting an unguarded command",
+    "action": "executeCommand",
+    "args": {
+      "sandbox_id": "sbx_019a9fad-3000-7000-8000-000000000001",
+      "idempotency_key": "persisted-mutation-key",
+      "body": {
+        "argv": ["true"],
+        "deadline_unix_ms": 4102444800000,
+        "expected_generation": null
+      }
+    },
+    "requests": [],
+    "expected": {
+      "error": "request"
+    }
+  },
+  {
+    "name": "null generation from a Python command dataclass is not omitted",
+    "action": "executeCommand",
+    "python_body_model": "CommandInput",
+    "args": {
+      "sandbox_id": "sbx_019a9fad-3000-7000-8000-000000000001",
+      "idempotency_key": "persisted-mutation-key",
+      "body": {
+        "argv": ["true"],
+        "deadline_unix_ms": 4102444800000,
+        "expected_generation": null
+      }
+    },
+    "requests": [],
+    "expected": {
+      "error": "request"
+    }
   }
 ]

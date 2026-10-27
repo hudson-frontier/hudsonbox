@@ -150,7 +150,8 @@ export const schema: Schema = {
           },
           "required": false,
           "nullable": false,
-          "omit_false": false
+          "omit_false": false,
+          "reject_null": true
         }
       },
       "closed": true
