@@ -1,8 +1,8 @@
 name: Documentation
 
 on:
+  # Every PR, including stacked PRs whose base is another feature branch.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:

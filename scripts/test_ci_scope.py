@@ -66,10 +66,17 @@ class RequiredGateTests(unittest.TestCase):
             ("success", "", "success", False),
             ("success", "false", "failure", False),
         ]
+        jobs = ("CLIENTS_RESULT", "LINT_RESULT", "TESTS_RESULT")
         for scope, required, result, expected in cases:
-            with self.subTest(scope=scope, required=required, result=result):
-                env = dict(os.environ, SCOPE_RESULT=scope,
-                           RUNTIME_REQUIRED=required, RUNTIME_RESULT=result)
-                run = subprocess.run(["bash", "-e", "-c", script], env=env,
-                                     capture_output=True, check=False)
-                self.assertEqual(run.returncode == 0, expected)
+            # Every runtime job alone carrying the result, the others passing
+            # (or skipped for documentation-only scope), plus all three at once.
+            ok = "skipped" if required == "false" else "success"
+            variants = [{job: result if job == bad else ok for job in jobs} for bad in jobs]
+            variants.append(dict.fromkeys(jobs, result))
+            for results in variants:
+                with self.subTest(scope=scope, required=required, results=results):
+                    env = dict(os.environ, SCOPE_RESULT=scope,
+                               RUNTIME_REQUIRED=required, **results)
+                    run = subprocess.run(["bash", "-e", "-c", script], env=env,
+                                         capture_output=True, check=False)
+                    self.assertEqual(run.returncode == 0, expected)
