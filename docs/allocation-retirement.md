@@ -24,7 +24,7 @@ A retained root `Complete` entry now also requires the canonical SHA-256 digest 
 
 Compatibility: existing active and fenced entries remain readable. A completed entry without the required digest is rejected rather than upgraded from incomplete evidence. Older strict readers reject the new completion field. The authenticated forgetting RPC now uses these transitions. Do not manually manufacture completion records or use this as a rolling-upgrade procedure.
 
-Controlled development-VM validation is recorded in [guardian authority evidence](implementation/guardian-authority-evidence.md). This component does not complete the whole-allocation retirement protocol or authorize production tombstone deletion.
+Controlled development-VM validation is recorded in [guardian authority evidence](evidence/guardian-authority-evidence.md). This component does not complete the whole-allocation retirement protocol or authorize production tombstone deletion.
 
 ## Required replacement authority
 

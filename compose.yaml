@@ -1,5 +1,5 @@
 # Local development dependencies. Not a deployment topology — see
-# docs/implementation/dev-env.md.
+# docs/local-development.md.
 #
 # Ports are deliberately off the defaults. A developer with PostgreSQL already
 # installed will otherwise have the container bind :: while 127.0.0.1 stays

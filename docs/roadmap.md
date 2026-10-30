@@ -55,7 +55,7 @@ Complete the remaining experiments on the selected supported Linux/KVM configura
 | What do a pause and a cold cross-host restore actually cost in seconds and bytes? | Phase 3 | Sets whether the [performance](performance.md) resume budgets are reachable |
 | How well can the guest agent be shielded from a root customer in the same VM? | Phases 1 and 3 | [Decision 0003](decisions/0003-guest-root-with-our-kernel.md) grants root deliberately. Measure what a hostile root can actually do to the agent: kill sweeps, reaching its control socket, forging a handshake |
 
-The [spike sheet](implementation/phase-0-spikes.md) carries the method for each one. Exit gate: a written findings document per question, with the commands run and the host configuration recorded. A negative answer is a successful spike; it redirects the design before the dependent phase rather than during it. If process-continuous resume proves unreachable on this stack, reopen [alternatives](alternatives.md#revisit-triggers).
+For each experiment record CPU, RAM, disk, kernel, Firecracker/jailer versions and exact commands. Test resource exhaustion and denied metadata/host/unapproved egress. Measure warm and cold create-to-ready over at least twenty runs (p50/p95). For snapshot qualification, use a timestamp-writing process to detect execution before explicit thaw on same-host and cross-host restore; test vsock reconnection, clocks/timers/TCP after an hour paused, and terminating expired process groups before thaw. Measure capture, upload, confirmed release, fetch, memory/disk restore and handshake separately at 1 GiB and 8 GiB. Probe hostile-root access to agent processes, sockets, cgroups, kernel modules and resume handshakes; record successful attacks as limitations or mitigations. Exit gate: a written findings document per question, with the commands run and the host configuration recorded. A negative answer is a successful spike; it redirects the design before the dependent phase rather than during it. If process-continuous resume proves unreachable on this stack, reopen [alternatives](alternatives.md#revisit-triggers).
 
 ## Scope discipline for Phase 1
 
@@ -63,7 +63,7 @@ Execution and recovery were previously separate phases. They are merged because 
 
 The merge does not mean one undifferentiated push. The phase has **two gates, passed in order**, so there is still a moment where the system is demonstrably working before it is asked to prove it does not lie.
 
-**Gate 1a — it works.** One authenticated path end to end: an authorized caller creates a sandbox, runs a command and a long-running process in a real VM, transfers a file, reads output, destroys the sandbox, and the allocation's release is confirmed in the database. Resource and connectivity limits are enforced by the host, not requested politely. Stop here and tag it; this is the first thing worth showing anyone.
+**Gate 1a — it works.** One authenticated path end to end: an authorized caller creates a sandbox, runs a command and a long-running process in a real VM, transfers a file, reads output, destroys the sandbox, and the allocation's release is confirmed in the database. Resource and connectivity limits are enforced by the host, not requested politely. Record evidence for maintainer review; tagging and release require the contribution-process approval and remaining release gates.
 
 **Gate 1b — it does not lie.** Every row of the [lifecycle recovery table](lifecycle.md#destroy-and-recovery) that applies to create, execute, cancel and destroy reconciles correctly under injected failure. Stale controller claims, stale supervisor epochs and stale allocation generations are all rejected. Uncertain outcomes are recorded as `unknown` and reconciled rather than guessed. The [threat model's adversarial set](threat-model.md#required-validation) passes for the surfaces that exist. No leaked allocations, disk, or VMs after any of it.
 
@@ -86,27 +86,6 @@ Scope discipline still applies to both. Migrations cover the records those opera
 
 Add links to actual test files, CI runs, supported-host evidence, and releases as each gate is demonstrated. A document, successful process start, or passing unit test alone does not establish snapshot or isolation correctness.
 
-## Settled decisions
-
-The pre-implementation decisions were worked through on 2026-09-21 and now live in their owning documents. Summarised here so the delivery picture is readable in one place:
-
-| Area | Settled | Owning document |
-| --- | --- | --- |
-| Customer privilege | Root in guest userspace; our kernel, init and guest agent | [Decision 0003](decisions/0003-guest-root-with-our-kernel.md) |
-| Freeze boundary | In-guest agent, outside the frozen workload cgroup | [Lifecycle](lifecycle.md#resume) |
-| Snapshot encryption | One installation-wide key from the operator's KMS, key ID in the manifest | [Threat model](threat-model.md#open-decisions) |
-| Host and guest envelope | x86_64, Ubuntu 24.04 host, Debian userland, 4 vCPU / 8 GiB ceiling, services supported | [Supported configuration](compatibility.md) |
-| Networking | Deny-by-default egress on CIDR and port, host-side resolver, no ingress in v1, per-sandbox bandwidth cap | [Networking](networking.md) |
-| Images | Operator allowlist only; per-project images named as the next capability | [Data models](data-models.md#what-we-keep-inside-these-models) |
-| Clients | CLI plus Python, TypeScript and Rust SDKs, generated from one OpenAPI document with a shared conformance suite | [API contract](api-contract.md#sdk-and-cli-behavior) |
-| API shape | RFC 9457 problem+json, server-sent events, opaque cursors, single-PUT file upload | [API contract](api-contract.md) |
-| Storage | PostgreSQL 16, `sqlx migrate`, MinIO in development and CI, 7-day snapshot retention, tombstones for the project's lifetime | [Data models](data-models.md) |
-| Internal protocols | gRPC over mTLS to the supervisor, vsock with length-prefixed protobuf to the guest | [Architecture](architecture.md#selected-stack) |
-| Policy numbers | 15-minute default and 6-hour maximum deadline, 1-hour idle, 10 MiB retained output, 25 sandboxes per project | [Lifecycle](lifecycle.md#deadlines-and-cancellation) |
-| Observability | OpenTelemetry into Prometheus and Tempo; JSON logs everywhere | [Architecture](architecture.md#selected-stack) |
-| License | Apache-2.0 | [Decision 0004](decisions/0004-apache-2-0-license.md) |
-| Delivery | Self-host first, hosted possible later; usage derived rather than metered; public 0.1 once Phase 3 passes | [Alternatives](alternatives.md) |
-
 ## Still blocking
 
 Supported-host evidence and delivery infrastructure remain external prerequisites. They do not block native control-plane development or the existing nested-aarch64 tests. Implementation gaps in networking, production images, operational packaging and full lifecycle reclamation also remain; hardware alone will not complete those gates.
@@ -118,13 +97,28 @@ Supported-host evidence and delivery infrastructure remain external prerequisite
 
 ## Work breakdown
 
-The [implementation notes](implementation/README.md) retain the unanswered [spike questions](implementation/phase-0-spikes.md) and remaining [Phase 1 acceptance work](implementation/phase-1-tasks.md). Completed implementation belongs in the owning contract and its evidence, not in an accumulating checklist.
+Use [release tracker #177](https://github.com/hudson-frontier/hudsonbox/issues/177)
+and its subissues for implementation tasks, including [multi-host #187](https://github.com/hudson-frontier/hudsonbox/issues/187).
+The [accepted fleet and warm-pool models](data-models.md#accepted-v1-fleet-and-warm-pool-model)
+and [deployment architecture](arch-v1.md) define the agreed direction. Accepted design does not close release gates.
 
-Those notes are deliberately temporary and are deleted as the work lands. This document, the contracts, and the decision records are not — the reasoning outlives the build order.
+Remaining foundation acceptance covers production guest images, host-enforced networking,
+authenticated host registration, certificate rotation, whole-allocation/storage-marker
+reclamation, and another operator reproducing the workload on supported hardware.
+Existing operator provisioning, epoch issuance, capability checks and native installation
+are documented in their owning guides; qualify the complete path rather than rebuilding them.
+
+For gate 1b inject controller loss between dispatch and confirmation, supervisor loss
+mid-command, teardown interruption, dropped acknowledgements and host partitions.
+Verify stale claims/epochs/generations cannot act, identical retries deduplicate,
+changed requests conflict, and missing outcomes stay unknown until original evidence
+resolves them. Cover guest-agent loss, combined host/process/storage failures,
+concurrent hostile sandboxes, and repeated cleanup/reuse without prematurely releasing
+capacity or deleting replay fences. Link evidence from the owning contract.
 
 ## Development and operational prerequisites
 
-Begin with one Linux compute host matching [supported configuration](compatibility.md#host): x86_64, Ubuntu 24.04, KVM available. A standalone development setup needs the API/controller, PostgreSQL, object storage, and that host. It must run without the Hudson harness or a Temporal service. Kubernetes is the intended platform deployment, not a requirement for every developer unit test.
+Begin with one Linux compute host matching [supported configuration](compatibility.md#host): x86_64, Ubuntu 24.04, KVM available. A standalone development setup needs the API/controller, PostgreSQL, object storage, and that host. It must run without the Hudson harness or a Temporal service. Standalone and Kubernetes are alternative deployment paths; Kubernetes is optional.
 
 The implemented [offline provisioning command](api-server.md#offline-project-provisioning) requires operator database access, writes a private credential file and stores only hashed project token metadata in PostgreSQL. Project API authentication remains mandatory. Admin credentials, the management API/UI and their broader setup workflow remain planned; offline provisioning does not claim to implement them. No unprotected public bootstrap endpoint exists.
 
@@ -144,7 +138,7 @@ Differential snapshots, lazy loading, and warm pools are deferred to Phase 5, bu
 
 ## Documentation to add when supported by implementation
 
-- `development.md`: reproducible contributor build/run/test instructions.
+- Extend [local development](local-development.md) as contributor build/run/test instructions change.
 - `self-hosting.md`: actual installation, first Admin credential, TLS, storage, upgrades, and rollback.
 - `operations.md`: backup recovery, monitoring, host drains, and incident procedures.
 

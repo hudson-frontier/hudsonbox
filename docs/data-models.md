@@ -6,7 +6,7 @@ Implementation evidence: [the initial migration](../migrations/0001_initial.sql)
 
 [Execution ownership](controller.md#command-admission-and-dispatch-ownership) adds a nullable `operations.execution_allocation_id`, a same-sandbox allocation foreign key, and a unique active pinned command per sandbox. New store admission always pins an allocation; legacy rows retain unknown ownership and cannot dispatch.
 
-There are **six sandbox resource tables** plus **two supporting UI security tables**, not a user/role directory. The schemas below define the target design; the migration implements the current subset.
+The original target design defines six sandbox resource tables plus two supporting UI security tables, not a user/role directory. Supporting migrations and the [accepted v1 fleet and warm-pool model](#accepted-v1-fleet-and-warm-pool-model) extend that baseline. The schemas below include planned records; migrations determine the implemented subset.
 
 ## ID format and identity
 
@@ -314,3 +314,67 @@ Each record holds the initiating token hash, normalized source plan/reference, d
 [Migration 0021](../migrations/0021_allocation_forgetting.sql) adds `forget_revision`, `forget_epoch` and `forget_lease_expires_at` to `allocation_retirements`, independently of the immutable metadata-completion claim. `forget_completion`, `forgotten_at` and `forget_claim_expires_at` retain the exact accepted forgetting response after its lease clears. Paired constraints bind it to the original metadata request and fresh forgetting claim. Application validators additionally check the historical clock window and current release/scope evidence. See the [forgetting handoff](allocation-retirement.md#database-and-host-forgetting-handoff).
 
 [Migration 0022](../migrations/0022_allocation_retirement_scan.sql) adds `allocations.retirement_scan_at` and a partial released-allocation index for fair controller scanning. This timestamp is a retry scheduling hint, independent of immutable retirement intent, delivery claim leases and retained completion. See [automatic allocation retirement](allocation-retirement.md#automatic-controller-worker).
+
+## Accepted v1 fleet and warm-pool model
+
+Decision locked on 2026-10-30: the following logical models and ownership rules are the implementation baseline for multi-host and warm-pool work. **Accepted design does not mean implemented schema.** No migrations or runtime behavior are added by this decision. Changes to these boundaries need an explicit design revision; SQL types, indexes, protocol messages and migration/backfill mechanics are specified and tested in implementation PRs.
+
+The existing `projects`, `sandboxes`, `allocations` and `operations` relationships remain. A sandbox is the stable customer identity; an allocation is one execution incarnation on a particular supervisor. Customer operations retain the existing durable operation model. Existing supporting upload, output cleanup, permit and history-retirement records remain necessary.
+
+### Models and fields
+
+New records use internal UUID identities and explicit creation/update timestamps. `?` denotes a nullable field. New public ID prefixes are not introduced by this decision.
+
+| Model | Status | Accepted fields and purpose |
+| --- | --- | --- |
+| `host_pools` | New | `id`, `name`, `type`, `min_ready_hosts`, `max_hosts`, `placement_policy`, `provider_config`, `credential_secret_ref?`. Groups supervisor capacity under one deployment adapter. **`type` is exactly `k8s` or `standalone`.** |
+| `hosts` | Extend | Existing identity, heartbeat, health, capacity, capabilities and supervisor epoch; add `host_pool_id`, `endpoint`, authenticated transport identity metadata and `provider_ref`. A host is the supervisor capacity boundary. |
+| `project_host_pool_access` | New | `project_id`, `host_pool_id`, with a unique pair. Explicitly permits a project to place work in a pool; pool policy can restrict it to dedicated use. |
+| `sandbox_templates` | New | `id`, `version`, `owner_project_id?`, `image_digest`, `resources`, `boot_config`, `compatibility`, `snapshot_id?`. An immutable template version describes an image plus runtime defaults, such as Linux with Node.js/npm and CPU/RAM/disk defaults. |
+| `warm_pool_policies` | New | `id`, `template_id`, `host_pool_id`, `owner_project_id?`, `min_ready`, `max_total`, `idle_ttl`, `enabled`. Defines a target stock of unused VMs for one immutable template version and host pool. |
+| `warm_pool_members` | New | `id`, `pool_id`, `host_id`, `supervisor_epoch`, `vm_ref`, reserved CPU/memory/disk, `state`, `lease_expires_at`, `claim_revision`, `claimed_allocation_id?`, `cleanup_evidence`. One prepared VM and its resource reservation. |
+| `capacity_operations` | New | `id`, `host_pool_id`, `warm_pool_id?`, `kind`, `target_ref`, `idempotency_key`, `status`, `claim_revision`, `lease_expires_at`, `provider_receipt`, `error`. Durable provisioning, prewarming, draining and retiring work, separate from project/sandbox operations. |
+
+`min_ready_hosts` and `max_hosts` count supervisor workers: standalone host services or Kubernetes worker Pods. They do not count physical Kubernetes nodes. Enforce nonnegative minimums, maximums at least their minimums, positive resource amounts and bounded retention/retry policy. `max_total` includes preparing, ready, claiming and retiring members whose reservations remain held; assigned members transfer to allocation accounting.
+
+An immutable template version has its own `id`; pools pin that exact version. Changes create a new version rather than silently changing existing prepared members. Optional snapshot references must resolve to compatible, authorized, durably published snapshots under the existing snapshot contract. Ordinary boots are supported without snapshots. A template's owner must be authorized to use its image and any snapshot; public/shared templates require explicit publication policy. A null owner is not an access-control bypass.
+
+### Provider routing
+
+The **provider router is application code, not a table**. It resolves `hosts.host_pool_id` to `host_pools.type`:
+
+- `k8s`: the Kubernetes adapter discovers/manages supervisor worker Pods, their resource envelopes and capacity demand. A separately configured node autoscaler may supply eligible nodes.
+- `standalone`: the standalone adapter discovers/manages operator-registered Linux/KVM hosts. Automatic infrastructure provisioning requires a concrete provider implementation; it is not implied by the enum.
+
+Both adapters preserve the same controller-to-supervisor gRPC/mTLS protocol. Existing allocations route directly to their persisted owner and epoch, never to an arbitrary worker behind a shared load balancer. Sandbox execution is independent of provider type.
+
+Do not duplicate `type` on hosts, allocations or sandboxes. Validate `provider_config` against the selected type and store credential references, never secret values. Block pool type changes while workers, resource reservations or unfinished capacity operations exist. Provider references identify external resources; they never replace Hudsonbox ownership or authorization.
+
+For Kubernetes, the existing host-as-machine terminology becomes host-as-supervisor-worker at this extension boundary. If multiple workers share a physical node, add `compute_nodes` and `hosts.node_id` with node identity, provider reference and physical capacity. Explicit worker budgets prevent spending the same physical capacity twice. Standalone deployments can map one worker to one machine. Replacing a worker creates a new identity; restarting the same provisioned worker requires a new epoch and ownership reconciliation. A Pod name/IP is not sufficient stable identity.
+
+### Relationships and tenant boundaries
+
+- A project owns many sandboxes; a sandbox has many historical allocations and at most one unreleased allocation.
+- A host pool contains many hosts; each host supports many allocations and unused warm members within its capacity.
+- A template version can serve multiple warm-pool policies. Each policy targets one host pool; each member belongs to that policy and one host in that same pool.
+- A warm member may be claimed once and links to at most one allocation; an allocation claims at most one member. Enforce uniqueness and matching host/epoch/resources, in addition to normal sandbox/project ownership constraints.
+- A dedicated warm pool belongs to one project. A shared pool has an explicit shared policy and only unused VMs without customer secrets. Claims require project-to-host-pool access and template authorization, even for shared pools.
+- No placement fallback may escape a project's allowed pools. Project quota checks still apply when claiming an already prepared VM. Platform warm reservations consume host capacity before customer allocation and must have bounded operator budgets.
+
+### Warm-member lifecycle and handoff
+
+Normal progression is `preparing` → `ready` → `claiming` → `assigned`; unused or failed members progress to `retiring` → `retired` only after verified cleanup. Failed/unknown actions retain reservations until reconciled. An uncertain claim cannot make a VM ready for another customer. Assigned VMs are destroyed through their allocation lifecycle and **never returned to a shared warm pool**.
+
+1. Persist the customer's sandbox and create operation under existing idempotency and quota rules.
+2. Atomically claim one ready, compatible, authorized member using a claim revision and persist handoff intent tied to the target allocation identity. No ready member means bounded waiting or ordinary cold-start placement under the same capacity limits.
+3. Obtain supervisor evidence for the ownership handoff, bound to member, allocation, project, host, epoch and claim identity. Persist the allocation and reservation transfer with retry-safe fencing. Database and supervisor state are not one transaction: recovery must inspect durable intent and receipts instead of assuming a timeout means nothing happened.
+4. Mark the sandbox running only after verified allocation readiness. A claim or existing Firecracker process is not readiness evidence.
+5. Replenish toward `min_ready` through bounded, durable capacity work; respect `max_total`, host capacity and provisioning limits.
+
+Capacity accounting includes unreleased customer allocations **and** unassigned warm-member reservations. During handoff, count the reservation exactly once without an unreserved gap. The exact transactional transfer and supervisor protocol are implementation gates, not a claim that existing allocation launch permits already support VM adoption. Neither heartbeat expiry nor missing local records prove that a VM stopped. Safe drain, ownership fencing and cleanup evidence apply equally to warm members and assigned allocations.
+
+### Delivery boundaries
+
+Multi-host implementation is tracked by [#187](https://github.com/hudson-frontier/hudsonbox/issues/187) and its subissues. Host discovery/routing and atomic placement precede deployment adapters; warm pools extend the fast-startup scope in [#188](https://github.com/hudson-frontier/hudsonbox/issues/188). Checkpoints remain separately tracked in [#178](https://github.com/hudson-frontier/hudsonbox/issues/178).
+
+Before shipping, test double claims, quota and tenant-pool denial, capacity transfer races, lost acknowledgements, worker replacement, stale epochs, controller restart, drain and failed cleanup. Fake/PostgreSQL tests and real Linux/KVM evidence must be reported separately. This baseline changes no deployment, release or infrastructure-purchase authorization.

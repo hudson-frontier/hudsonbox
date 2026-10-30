@@ -139,3 +139,7 @@ Open-source and proprietary offerings need the same isolation baseline. Self-hos
 - **Proposed extensions:** durable checkpoints/full pause-resume, network enforcement and guest ingress, multi-host placement, Kubernetes worker packaging/capacity integration, cloud host provisioning, complete tenant administration and dedicated placement.
 
 The API/controller themselves can run as ordinary services or Kubernetes Deployments; their packaging does not determine the sandbox isolation boundary. Detailed delivery is tracked in [#177](https://github.com/hudson-frontier/hudsonbox/issues/177) and its sub-issues. This document supplies no deployment, infrastructure-purchase or release authorization.
+
+## Accepted fleet and warm-pool models
+
+The [accepted v1 data model](data-models.md#accepted-v1-fleet-and-warm-pool-model) locks host pools, immutable sandbox templates, warm-pool policies/members and durable capacity operations as the implementation baseline. `host_pools.type` is exactly `k8s` or `standalone`; the provider router selects the corresponding capacity/discovery adapter. Controller-to-supervisor communication remains gRPC/mTLS in both paths. These are accepted design decisions, not implemented migrations or warm-pool runtime support.

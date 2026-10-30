@@ -1,5 +1,5 @@
 # Development entry points. Everything here runs on macOS except `supervisor`,
-# which needs Linux with KVM — see docs/implementation/dev-env.md.
+# which needs Linux with KVM — see docs/local-development.md.
 
 .DEFAULT_GOAL := help
 .PHONY: help up down logs fmt lint test check docs doctor doctor-check api api-setup api-generate sdk-setup sdk-check reset-db clean
