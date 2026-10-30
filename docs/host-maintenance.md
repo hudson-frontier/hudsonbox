@@ -318,3 +318,68 @@ requirements, duplicate requests, stale and overflowing epochs, unhealthy
 recovery, fresh-observation gating, exact retries and retained old-epoch
 allocation/operation records. They exercise database authority with no physical
 host restart.
+
+## Standalone durable capacity operations
+
+The standalone adapter (#196) enrolls **existing operator-supplied** machines;
+it does not purchase, boot, stop or terminate infrastructure. The application
+capacity router dispatches exactly `host_pools.type` (`standalone` or `k8s`);
+an unconfigured Kubernetes adapter fails closed. Sandbox operations, project
+access, placement reservations and supervisor gRPC/mTLS remain unchanged.
+
+Migration 0027 adds `capacity_operations`: pool, optional warm-pool seam (NULL
+only until warm pools ship), kind, target, idempotency key, retained request,
+status, claim revision, database-clock lease, provider receipt and fixed error.
+Pool-scoped exact retries preserve the ID and receipt; changed input conflicts.
+Only one live claim can apply an intent. Expired/replaced claims cannot commit
+host effects or receipts. Static effects and completion commit in one database
+transaction; future external providers must reconcile external receipts and
+fencing before replaying uncertain calls. The trait alone does not supply that
+protocol. Pending operations prevent pool type changes even with zero hosts.
+
+Use the existing private database configuration and `0600` input-file rules:
+
+```sh
+sandbox-host-manager --database-config /private/database.json capacity-enqueue \
+  --pool-id POOL_UUID --idempotency-key UNIQUE_RETAINED_KEY \
+  --request-config /private/capacity-request.json
+sandbox-host-manager --database-config /private/database.json capacity-tick --pool-id POOL_UUID
+sandbox-host-manager --database-config /private/database.json capacity-status --operation-id OPERATION_UUID
+sandbox-host-manager --database-config /private/database.json capacity-plan \
+  --pool-id POOL_UUID --waiting-sandboxes 4 --sandboxes-per-host 2 --max-additional-hosts 1
+```
+
+The request is `{"host":"hst_...","epoch":1,"action":{"kind":"status"}}`.
+Kinds are `status`, `drain`, `retire`, or `provision`; provision additionally
+carries `config` with the existing `HostProvision` document and an explicit
+matching `host_pool_id`. Provision reuses ordinary bounded enrollment and starts
+draining with no observation. Set transport identity, authenticate health and
+explicitly finish drain through the existing manager commands. Drain blocks new
+placement and retains running work. Status receipts describe their completion
+snapshot; use registry/status again for current health.
+
+Retire requires draining, zero unreleased allocations and fresh authenticated
+health. Occupied, unhealthy, stale and uncertain hosts fail closed. Recovery must
+first complete the existing verified allocation cleanup/fencing path; a lease
+expiry, provider disappearance or operator assertion never releases capacity.
+Retire records a permanent tombstone while preserving the host, transport,
+histories and foreign keys. It cannot reopen through finish-drain, enrollment
+retry or epoch advancement. It does not authorize physical machine termination.
+Tombstones conservatively still count against `max_hosts`; reclamation of that
+inventory slot is outside this adapter.
+
+Each tick claims at most one intent, with a 30-second lease and no background
+retry loop. On refusal or a lost response, inspect `capacity-status`, resolve the
+host condition and rerun after the lease expires. Claims accept 1–300 seconds;
+the store exposes fenced explicit retry. Outstanding intents are bounded to
+1000 per pool; completed idempotency records are retained, never automatically
+deleted. Inventory reads retain the registry's 10000-host bound. Demand is an
+explicit advisory input (at most 100000 waiting sandboxes, 1–100000 sandboxes per
+host, at most 1000 additional hosts); the plan caps additions by `max_hosts`,
+existing inventory, minimum ready workers and the operator's request budget.
+It cannot infer compatibility, actual packing or resource guarantees from a
+sandbox count and makes no automatic provision or scale-down decision.
+
+Portable PostgreSQL tests are in `sandbox-store/tests/capacity.rs`. Their execution
+is pending the shared build slot; no new portable pass or real Linux/KVM drain,
+retirement, performance or isolation evidence is claimed here.

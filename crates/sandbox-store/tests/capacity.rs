@@ -1,0 +1,220 @@
+//! Portable PostgreSQL identities; no Linux/KVM or paid provider effects.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+use sandbox_protocol::{
+    HostId, Id,
+    host_capabilities::{Capabilities, Image, Limits},
+};
+use sandbox_store::{
+    Store,
+    capacity::{Action, Error, Request},
+    host_maintenance::{HostCapacity, HostProvision},
+    host_registry::{HostPoolSpec, PlacementPolicy, PoolType, Tenancy},
+};
+use serde_json::json;
+use sqlx::PgPool;
+use uuid::Uuid;
+fn capabilities() -> Capabilities {
+    Capabilities {
+        version: 1,
+        simulated: true,
+        architecture: "x86_64".into(),
+        host_kernel_release: "6.8.0-fixture".into(),
+        kvm_api_version: 12,
+        cgroup_version: 2,
+        supervisor_version: env!("CARGO_PKG_VERSION").into(),
+        firecracker_version: "1.17.0".into(),
+        firecracker_digest: format!("sha256:{}", "c".repeat(64)),
+        jailer_digest: format!("sha256:{}", "d".repeat(64)),
+        limits: Limits {
+            vcpu: 4,
+            memory_mib: 8192,
+            disk_mib: 65536,
+        },
+        images: vec![Image {
+            rootfs_digest: format!("sha256:{}", "a".repeat(64)),
+            kernel_digest: format!("sha256:{}", "b".repeat(64)),
+            minimum_disk_mib: 256,
+            guest_version: env!("CARGO_PKG_VERSION").into(),
+            bootstrap_version: 1,
+            guest_protocol_version: 1,
+        }],
+    }
+}
+
+fn provision(pool: Option<Uuid>) -> HostProvision {
+    HostProvision {
+        version: 1,
+        capacity: HostCapacity {
+            vcpu: 4,
+            memory_mib: 8192,
+            disk_mib: 65536,
+        },
+        capabilities: capabilities(),
+        host_pool_id: pool,
+    }
+}
+
+fn spec(id: Uuid, name: &str) -> HostPoolSpec {
+    HostPoolSpec {
+        version: 1,
+        id,
+        name: name.into(),
+        pool_type: PoolType::Standalone,
+        min_ready_hosts: 0,
+        max_hosts: 2,
+        placement_policy: PlacementPolicy {
+            version: 1,
+            tenancy: Tenancy::Shared,
+        },
+        provider_config: json!({"version": 1}),
+        credential_secret_ref: None,
+    }
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn duplicate_intents_claim_races_and_stale_retry(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "capacity")).await.unwrap();
+    let request = Request {
+        host: HostId::generate(),
+        epoch: 1,
+        action: Action::Provision {
+            config: provision(Some(p)),
+        },
+    };
+    let (a, b) = tokio::join!(
+        store.enqueue_capacity(p, "same", &request),
+        store.enqueue_capacity(p, "same", &request)
+    );
+    let id = a.unwrap();
+    assert_eq!(id, b.unwrap());
+    let mut changed = request.clone();
+    changed.epoch = 2;
+    assert!(matches!(
+        store.enqueue_capacity(p, "same", &changed).await,
+        Err(Error::Conflict)
+    ));
+    let (a, b) = tokio::join!(store.claim_capacity(p, 30), store.claim_capacity(p, 30));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.is_some(), b.is_some());
+    let old = a.or(b).unwrap();
+    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(id).execute(&pool).await.unwrap();
+    let new = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert!(new.revision > old.revision);
+    assert!(matches!(
+        store.apply_static_capacity(&old).await,
+        Err(Error::LostClaim)
+    ));
+    assert!(matches!(
+        store.retry_capacity(&old).await,
+        Err(Error::LostClaim)
+    ));
+    store.retry_capacity(&new).await.unwrap();
+    let latest = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    store.apply_static_capacity(&latest).await.unwrap();
+    assert_eq!(
+        store.enqueue_capacity(p, "same", &request).await.unwrap(),
+        id
+    );
+    assert!(store.claim_capacity(p, 30).await.unwrap().is_none());
+    assert_eq!(
+        store.capacity_operation(id).await.unwrap().unwrap()["status"],
+        "succeeded"
+    );
+    assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 1);
+    assert!(matches!(
+        store.apply_static_capacity(&latest).await,
+        Err(Error::LostClaim)
+    ));
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn retire_requires_fresh_empty_draining_and_retains_tombstone(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "retire")).await.unwrap();
+    let host = HostId::generate();
+    store
+        .provision_host(host, 1, &provision(Some(p)))
+        .await
+        .unwrap();
+    let request = Request {
+        host,
+        epoch: 1,
+        action: Action::Retire,
+    };
+    let id = store.enqueue_capacity(p, "retire", &request).await.unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert!(matches!(
+        store.apply_static_capacity(&claim).await,
+        Err(Error::Conflict)
+    ));
+    // Fixture-only authenticated observation; no supervisor is contacted.
+    store
+        .observe_configured_host_with_capabilities(
+            host,
+            1,
+            &capabilities().to_json().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    store.apply_static_capacity(&claim).await.unwrap();
+    assert!(store.registered_host(host).await.unwrap().is_some());
+    assert!(store.finish_host_drain(host, 1).await.is_err());
+    assert!(
+        store
+            .provision_host(host, 1, &provision(Some(p)))
+            .await
+            .is_err()
+    );
+    assert!(store.advance_host_epoch(host, 1).await.is_err());
+    assert!(store.capacity_operation(id).await.unwrap().unwrap()["provider_receipt"].is_object());
+    let again = store
+        .enqueue_capacity(p, "retire-again", &request)
+        .await
+        .unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert_eq!(claim.id, again);
+    assert_eq!(
+        store.apply_static_capacity(&claim).await.unwrap()["retired"],
+        true
+    );
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn pending_operations_block_type_change_and_pool_mismatch(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let p = Uuid::now_v7();
+    let other = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "pending")).await.unwrap();
+    store.put_host_pool(&spec(other, "other")).await.unwrap();
+    let request = Request {
+        host: HostId::generate(),
+        epoch: 1,
+        action: Action::Status,
+    };
+    store.enqueue_capacity(p, "status", &request).await.unwrap();
+    let mut k8s = spec(p, "pending");
+    k8s.pool_type = PoolType::K8s;
+    k8s.provider_config =
+        json!({"version":1,"namespace":"workers","worker_label_selector":"app=supervisor"});
+    assert!(store.put_host_pool(&k8s).await.is_err());
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert!(matches!(
+        store.apply_static_capacity(&claim).await,
+        Err(Error::Conflict)
+    ));
+    assert!(store.claim_capacity(p, 0).await.is_err());
+    let bad = Request {
+        action: Action::Provision {
+            config: provision(Some(other)),
+        },
+        ..request
+    };
+    assert!(matches!(
+        store.enqueue_capacity(p, "bad", &bad).await,
+        Err(Error::Invalid)
+    ));
+}
