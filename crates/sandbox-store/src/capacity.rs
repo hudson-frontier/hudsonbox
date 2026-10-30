@@ -95,14 +95,12 @@ impl Store {
         }
         let value = serde_json::to_value(request).map_err(|_| Error::Invalid)?;
         let mut tx = self.pool().begin().await?;
-        let kind: String = sqlx::query_scalar("SELECT type FROM host_pools WHERE id=$1 FOR UPDATE")
-            .bind(pool)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(Error::Conflict)?;
-        if kind != "standalone" {
-            return Err(Error::Conflict);
-        }
+        let _kind: String =
+            sqlx::query_scalar("SELECT type FROM host_pools WHERE id=$1 FOR UPDATE")
+                .bind(pool)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(Error::Conflict)?;
         if let Some(row) = sqlx::query("SELECT id,request FROM capacity_operations WHERE host_pool_id=$1 AND idempotency_key=$2")
             .bind(pool).bind(key).fetch_optional(&mut *tx).await? {
             if row.try_get::<Value,_>("request")? != value { return Err(Error::Conflict); }
@@ -193,13 +191,15 @@ impl Store {
         let receipt = if retired == Some(true) {
             serde_json::json!({"version":1,"host":request.host,"epoch":request.epoch,"retired":true})
         } else {
-            let report = host_maintenance::report(&mut tx, request.host, request.epoch).await?;
+            let mut report = host_maintenance::report(&mut tx, request.host, request.epoch).await?;
+            let retiring = matches!(request.action, Action::Retire);
             match request.action {
                 Action::Drain => {
                     if !matches!(report.status.as_str(), "ready" | "draining") {
                         return Err(Error::Conflict);
                     }
                     sqlx::query("UPDATE hosts SET status='draining',updated_at=clock_timestamp() WHERE id=$1").bind(request.host.uuid()).execute(&mut *tx).await?;
+                    report.status = "draining".into();
                 }
                 Action::Retire => {
                     let fresh: bool=sqlx::query_scalar("SELECT COALESCE(last_seen_at>clock_timestamp()-interval '30 seconds',false) FROM hosts WHERE id=$1")
@@ -212,7 +212,7 @@ impl Store {
                 }
                 _ => {}
             }
-            serde_json::json!({"version":1,"host":request.host,"epoch":request.epoch,"action":request.action.kind(),"report":report})
+            serde_json::json!({"version":1,"host":request.host,"epoch":request.epoch,"action":request.action.kind(),"retired":retiring,"report":report})
         };
         let n=sqlx::query("UPDATE capacity_operations SET status='succeeded',lease_expires_at=NULL,provider_receipt=$4,error=NULL,updated_at=clock_timestamp() WHERE id=$1 AND host_pool_id=$2 AND claim_revision=$3 AND lease_expires_at>clock_timestamp()")
             .bind(claim.id).bind(claim.pool).bind(claim.revision).bind(&receipt).execute(&mut *tx).await?.rows_affected();
