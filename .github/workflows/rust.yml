@@ -1,8 +1,8 @@
 name: Rust
 
 on:
+  # Every PR, including stacked PRs whose base is another feature branch.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
   workflow_dispatch:
@@ -17,6 +17,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   changes:
@@ -44,12 +46,111 @@ jobs:
             echo "runtime=true" >> "$GITHUB_OUTPUT"
           fi
 
+  clients:
+    name: Client, contract and image checks
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out proposed changes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # Generated Rust models are checked with the pinned rustfmt.
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          rustfmt --version
+
+      - name: Cache Python package downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*requirements.txt') }}
+
+      - name: Install filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends e2fsprogs
+
+      - name: Set up contract validation
+        run: make api-setup
+
+      - name: Validate OpenAPI and generated models
+        run: make api
+
+      - name: Set up Node for client conformance
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.9.0'
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+
+      - name: Set up Python and TypeScript clients
+        run: make sdk-setup
+
+      - name: Validate client packages
+        run: make sdk-check
+
+      - name: Validate optional local MCP adapter
+        run: |
+          make mcp-setup
+          make mcp-check
+
+      - name: Validate guest image integrity and deterministic filesystem assembly
+        run: make guest-image-check host-image-check
+
+  rust-lint:
+    name: Rust format and Clippy
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out proposed changes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the version; this only reports what it
+      # resolved to, so a failure is legible in the log.
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          prefix-key: ubuntu-24.04-v2
+          shared-key: lint
+          cache-bin: false
+          # PR caches would evict main's within the repository quota; PRs
+          # restore main's cache and never save their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   rust-tests:
     name: Rust and integration tests
     needs: changes
     if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     # The schema tests skip when DATABASE_URL is unset, so CI must provide one
     # or the constraints this repository relies on would go unverified.
@@ -87,56 +188,18 @@ jobs:
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
-          prefix-key: ubuntu-24.04-v1
+          prefix-key: ubuntu-24.04-v2
+          shared-key: test
           cache-bin: false
+          # PR caches would evict main's within the repository quota; PRs
+          # restore main's cache and never save their own.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Cache Python package downloads
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*requirements.txt') }}
-
-      - name: Install protobuf compiler
+      - name: Install protobuf compiler and PostgreSQL client
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler e2fsprogs postgresql-client-16
+          sudo apt-get install -y --no-install-recommends protobuf-compiler e2fsprogs postgresql-client-16
           protoc --version
-
-      - name: Set up contract validation
-        run: make api-setup
-
-      - name: Validate OpenAPI and generated models
-        run: make api
-
-      - name: Set up Node for client conformance
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '24.9.0'
-          cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
-
-      - name: Set up Python and TypeScript clients
-        run: make sdk-setup
-
-      - name: Validate client packages
-        run: make sdk-check
-
-      - name: Validate optional local MCP adapter
-        run: |
-          make mcp-setup
-          make mcp-check
-
-      - name: Validate guest image integrity and deterministic filesystem assembly
-        run: make guest-image-check host-image-check
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
 
       # Ordinary unprivileged object storage, never a KVM/host integration test.
       # Compose and CI share the same verified official source build recipe.
@@ -170,7 +233,7 @@ jobs:
           [[ "$storage_port" =~ ^[0-9]+$ ]]
           storage_endpoint="http://127.0.0.1:$storage_port"
           echo "endpoint=$storage_endpoint" >> "$GITHUB_OUTPUT"
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             if curl -fsS "$storage_endpoint/minio/health/live" > /dev/null; then break; fi
             sleep 1
           done
@@ -181,6 +244,12 @@ jobs:
             'MC_HOST_hudson="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:9000" mc mb hudson/hudson-output-version-test'
           docker exec "$container" sh -c \
             'MC_HOST_hudson="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:9000" mc version enable hudson/hudson-output-version-test'
+
+      - name: Build tests
+        run: cargo test --workspace --no-run
+
+      - name: Test
+        run: cargo test --workspace
 
       - name: Verify private object storage semantics
         env:
@@ -199,10 +268,10 @@ jobs:
           HUDSON_TEST_S3_ACCESS_KEY: sandbox
           HUDSON_TEST_S3_SECRET_KEY: sandbox-dev-secret
         run: |
-          # Explicit unprivileged packages: workspace-wide ignored tests would
-          # also select real-host cases requiring a controlled KVM machine.
-          cargo test -p sandbox-artifacts -p sandbox-controller -p sandbox-api -p sandbox-store -p sandbox-cleanup \
-            output_minio -- --ignored --test-threads=1
+          # Same package selection as the main test step, so this reuses its
+          # build instead of re-resolving features and recompiling. `--skip
+          # real_` excludes ignored real-host cases that need a KVM machine.
+          cargo test --workspace output_minio -- --ignored --skip real_ --test-threads=1
 
       - name: Remove test object storage
         if: always()
@@ -215,7 +284,7 @@ jobs:
   # must not accidentally satisfy branch protection.
   rust-check:
     name: rust-check
-    needs: [changes, rust-tests]
+    needs: [changes, clients, rust-lint, rust-tests]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 2
@@ -224,12 +293,18 @@ jobs:
         env:
           SCOPE_RESULT: ${{ needs.changes.result }}
           RUNTIME_REQUIRED: ${{ needs.changes.outputs.runtime }}
-          RUNTIME_RESULT: ${{ needs.rust-tests.result }}
+          CLIENTS_RESULT: ${{ needs.clients.result }}
+          LINT_RESULT: ${{ needs.rust-lint.result }}
+          TESTS_RESULT: ${{ needs.rust-tests.result }}
         run: |
           [[ "$SCOPE_RESULT" == "success" ]] || exit 1
+          for result in "$CLIENTS_RESULT" "$LINT_RESULT" "$TESTS_RESULT"; do
+            if [[ "$RUNTIME_REQUIRED" == "false" ]]; then
+              [[ "$result" == "skipped" ]] || exit 1
+            else
+              [[ "$RUNTIME_REQUIRED" == "true" && "$result" == "success" ]] || exit 1
+            fi
+          done
           if [[ "$RUNTIME_REQUIRED" == "false" ]]; then
-            [[ "$RUNTIME_RESULT" == "skipped" ]] || exit 1
             echo "Documentation-only PR; documentation checks run separately."
-          else
-            [[ "$RUNTIME_REQUIRED" == "true" && "$RUNTIME_RESULT" == "success" ]] || exit 1
           fi
