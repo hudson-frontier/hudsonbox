@@ -23,6 +23,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Operator-only fleet snapshot; no public administration route.
+    FleetStatus {
+        #[arg(long)]
+        prometheus: bool,
+    },
     /// Retain a durable static capacity intent from a private Request JSON file.
     CapacityEnqueue {
         #[arg(long)]
@@ -161,7 +166,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
     let pool_action = matches!(
         args.action,
-        Action::PutPool { .. }
+        Action::FleetStatus { .. }
+            | Action::PutPool { .. }
             | Action::GrantPoolAccess { .. }
             | Action::Registry { .. }
             | Action::Discover { .. }
@@ -175,6 +181,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         "pool action takes no host"
     );
     let value = match args.action {
+        Action::FleetStatus { prometheus } => {
+            let status = store.fleet_status().await?;
+            if prometheus {
+                print!("{}", sandbox_store::fleet::prometheus(&status));
+                return Ok(());
+            }
+            status
+        }
         Action::CapacityEnqueue {
             pool_id,
             idempotency_key,
