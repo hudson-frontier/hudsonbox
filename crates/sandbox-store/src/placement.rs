@@ -405,6 +405,16 @@ impl Store {
                 continue;
             }
             ready += 1;
+            // The legacy compatibility exception belongs only to an explicitly
+            // configured host. Fleet selection must establish image/architecture
+            // support rather than treating a registered address as evidence.
+            if matches!(scope, HostScope::Fleet)
+                && host
+                    .try_get::<Option<Value>, _>("runtime_capabilities")?
+                    .is_none()
+            {
+                continue;
+            }
             if crate::host_capabilities::compatible(
                 host,
                 &image,

@@ -77,6 +77,7 @@ async fn host(pool: &PgPool, host_pool: Uuid, slots: i64) -> HostId {
         .bind(format!("host-{}.sandbox.internal", id.uuid()))
         .bind(hex::encode(sha2::Sha256::digest(id.uuid().as_bytes())))
         .execute(pool).await.unwrap();
+    enroll(pool, id, &capabilities()).await;
     id
 }
 
@@ -148,6 +149,39 @@ async fn assert_within_capacity(pool: &PgPool) {
     .await
     .unwrap();
     assert_eq!(duplicates, 0, "a sandbox has more than one owner");
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_requires_capability_evidence_but_configured_legacy_still_works(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let shared = host_pool(&store, "shared", Tenancy::Shared).await;
+    let legacy = host(&pool, shared, 1).await;
+    sqlx::query("UPDATE hosts SET compatibility='{}',runtime_capabilities=NULL,runtime_capabilities_epoch=NULL WHERE id=$1")
+        .bind(legacy.uuid()).execute(&pool).await.unwrap();
+    let (id, token) = project(&pool).await;
+    store.grant_host_pool_access(id, shared).await.unwrap();
+    let claim = create(&store, id, &token).await;
+    assert!(matches!(
+        store.place_create(&claim, HostScope::Fleet).await,
+        Err(PlacementError::HostCompatibility)
+    ));
+    let (allocations, permits): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM allocations),(SELECT count(*) FROM allocation_permits)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((allocations, permits), (0, 0));
+    assert_eq!(
+        placed(store.reserve_create(&claim, legacy, 1).await),
+        legacy
+    );
+    // Already-reserved work still returns its original owner in fleet mode;
+    // qualification cannot strand reconciliation or create a replacement.
+    assert!(matches!(
+        store.place_create(&claim, HostScope::Fleet).await.unwrap(),
+        Reservation::Existing(a) if a.host_id == legacy
+    ));
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
