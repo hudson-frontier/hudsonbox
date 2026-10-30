@@ -150,6 +150,20 @@ async fn epoch_change_is_unknown_without_fencing_or_checkpoint_recovery(pool: Pg
         .await
         .unwrap();
     assert_eq!(f.store.reconcile_unavailable_hosts().await.unwrap(), 1);
+    f.store
+        .mark_host_runtime_unknown(f.config.host, 1)
+        .await
+        .unwrap();
+    let (epoch, fresh): (i64, bool) =
+        sqlx::query_as("SELECT supervisor_epoch,last_seen_at IS NOT NULL FROM hosts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (epoch, fresh),
+        (2, true),
+        "late old-epoch health failure cannot erase new health"
+    );
     assert!(matches!(
         f.store
             .record_create_observation(&claim, &reply, true)
