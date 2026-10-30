@@ -3,6 +3,7 @@
 //! supervisor is trusted only after its certificate, host ID, and epoch match.
 mod allocation_authority;
 pub mod archive;
+pub mod capacity;
 pub mod history;
 pub mod host_discovery;
 mod hosts;

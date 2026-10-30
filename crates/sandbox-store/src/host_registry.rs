@@ -488,7 +488,9 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         let current = pool_from_row(&row)?;
-        if current.pool_type != spec.pool_type && current.enrolled_hosts != 0 {
+        let unfinished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM capacity_operations WHERE host_pool_id=$1 AND status<>'succeeded')")
+            .bind(spec.id).fetch_one(&mut *tx).await?;
+        if current.pool_type != spec.pool_type && (current.enrolled_hosts != 0 || unfinished) {
             return Err(RegistryError::InUse);
         }
         if i64::from(max) < current.enrolled_hosts {

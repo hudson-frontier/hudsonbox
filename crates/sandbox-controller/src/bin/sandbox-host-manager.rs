@@ -23,6 +23,36 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Retain a durable static capacity intent from a private Request JSON file.
+    CapacityEnqueue {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        request_config: PathBuf,
+    },
+    /// Claim and apply at most one durable intent. Retry after uncertainty.
+    CapacityTick {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+    },
+    /// Read a durable intent, status, lease and receipt by ID.
+    CapacityStatus {
+        #[arg(long)]
+        operation_id: uuid::Uuid,
+    },
+    /// Advisory worker demand bounded by pool inventory and operator limits.
+    CapacityPlan {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+        #[arg(long)]
+        waiting_sandboxes: u32,
+        #[arg(long)]
+        sandboxes_per_host: u32,
+        #[arg(long)]
+        max_additional_hosts: u32,
+    },
     /// Provision a new draining host or inspect an exact retry; never refresh or reopen it.
     Provision {
         /// Private owned JSON containing version, total capacity and approved capabilities.
@@ -135,12 +165,60 @@ async fn run(args: Args) -> anyhow::Result<()> {
             | Action::GrantPoolAccess { .. }
             | Action::Registry { .. }
             | Action::Discover { .. }
+            | Action::CapacityEnqueue { .. }
+            | Action::CapacityTick { .. }
+            | Action::CapacityStatus { .. }
+            | Action::CapacityPlan { .. }
     );
     anyhow::ensure!(
         !pool_action || (args.host_id.is_none() && args.host_epoch.is_none()),
         "pool action takes no host"
     );
     let value = match args.action {
+        Action::CapacityEnqueue {
+            pool_id,
+            idempotency_key,
+            request_config,
+        } => {
+            let request = serde_json::from_slice(&private_bytes(&request_config)?)?;
+            serde_json::json!({"operation_id": store.enqueue_capacity(pool_id, &idempotency_key, &request).await?})
+        }
+        Action::CapacityTick { pool_id } => {
+            let router = sandbox_controller::capacity::ProviderRouter::default().with(
+                std::sync::Arc::new(sandbox_controller::capacity::StandaloneStaticProvider),
+            );
+            match store.claim_capacity(pool_id, 30).await? {
+                Some(claim) => router.apply(&store, &claim).await?,
+                None => serde_json::json!({"idle":true}),
+            }
+        }
+        Action::CapacityStatus { operation_id } => store
+            .capacity_operation(operation_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capacity operation missing"))?,
+        Action::CapacityPlan {
+            pool_id,
+            waiting_sandboxes,
+            sandboxes_per_host,
+            max_additional_hosts,
+        } => {
+            let pool = store
+                .host_pool(pool_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("pool missing"))?;
+            serde_json::to_value(
+                sandbox_controller::capacity::plan(
+                    &store,
+                    &pool,
+                    sandbox_controller::capacity::Demand {
+                        waiting_sandboxes,
+                        sandboxes_per_host,
+                        max_additional_hosts,
+                    },
+                )
+                .await?,
+            )?
+        }
         Action::PutPool { pool_config } => serde_json::to_value(
             store
                 .put_host_pool(&HostPoolSpec::from_json(&private_bytes(&pool_config)?)?)
