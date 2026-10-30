@@ -777,3 +777,73 @@ async fn api_file_reads_route_to_the_owner_and_deny_other_projects(pool: PgPool)
     let (status, _) = fleet.send("POST", &path, capture).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn partitioned_dispatched_owner_is_unknown_then_returning_host_is_inspected(pool: PgPool) {
+    use sandbox_protocol::supervisor::{CommandRequest, supervisor_server::Supervisor as _};
+    use sandbox_store::{claims::OperationKind, execute::ExecuteAction};
+    let fleet = Fleet::new(&pool).await;
+    let mut controller = fleet.controller(0).await;
+    let uncertain = fleet.execute(1).await;
+    let old = fleet
+        .store
+        .claim_next(OperationKind::Execute, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.operation_id, uncertain);
+    let ExecuteAction::Dispatch { owner, command } = fleet
+        .store
+        .prepare_execute(&old, fleet.hosts[1], 1)
+        .await
+        .unwrap()
+    else {
+        panic!("initial dispatch");
+    };
+    // The effect occurred on B; its reply never reached durable completion.
+    fleet.fakes[1]
+        .execute_command(tonic::Request::new(CommandRequest {
+            ownership: Some(owner),
+            command: Some((&command).into()),
+        }))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE operations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+    )
+    .bind(uncertain.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    fleet.fakes[1].fail_next_health_check().await;
+    assert_eq!(controller.tick().await.unwrap(), Tick::Deferred);
+    assert_eq!(fleet.status(uncertain).await, "unknown");
+    assert_eq!(fleet.observed(1).await, "unknown");
+    let (fresh, held): (bool, i64) = sqlx::query_as(
+        "SELECT last_seen_at IS NOT NULL,
+        (SELECT count(*) FROM allocations WHERE released_at IS NULL) FROM hosts WHERE id=$1",
+    )
+    .bind(fleet.hosts[1].uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!fresh);
+    assert_eq!(held, 2);
+    // Another host still completes work under the same controller.
+    let healthy = fleet.execute(0).await;
+    assert_eq!(fleet.drive(&mut controller, healthy).await, "succeeded");
+    // A replacement controller has no in-memory routing/backoff state. It must
+    // inspect the persisted uncertain operation on B, not execute it on A.
+    let mut restarted = fleet.controller(0).await;
+    fleet.retry_now(uncertain).await;
+    assert_eq!(fleet.drive(&mut restarted, uncertain).await, "succeeded");
+    assert_eq!(fleet.fakes[0].total_commands().await, 1);
+    assert_eq!(fleet.fakes[1].total_commands().await, 1);
+    let owners: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT host_id,generation,supervisor_epoch FROM allocations WHERE released_at IS NULL ORDER BY host_id")
+        .fetch_all(&pool).await.unwrap();
+    assert_eq!(
+        owners,
+        vec![(fleet.hosts[0].uuid(), 1, 1), (fleet.hosts[1].uuid(), 1, 1)]
+    );
+}

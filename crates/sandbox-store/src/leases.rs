@@ -352,18 +352,34 @@ impl Store {
         tx.commit().await?;
         Ok(result)
     }
-    /// A failed authenticated health check supplies no current readiness evidence.
-    /// This changes observation certainty only; it never frees a reservation.
+    /// A failed authenticated health check closes placement freshness, then
+    /// reconciles a bounded batch of unknown runtime observations. Neither write
+    /// frees reservations or changes operation/allocation ownership.
     pub async fn mark_host_runtime_unknown(
         &self,
         host: HostId,
         epoch: i64,
     ) -> Result<(), DispatchError> {
-        sqlx::query("UPDATE sandboxes s SET observed_state='unknown',state_revision=state_revision+1,updated_at=clock_timestamp()
-            FROM allocations a WHERE s.current_allocation_id=a.id AND a.host_id=$1 AND a.supervisor_epoch=$2
-            AND a.status='running' AND a.released_at IS NULL AND s.desired_state='running'
-            AND s.active_transition_operation_id IS NULL AND s.observed_state='running'")
-            .bind(host.uuid()).bind(epoch).execute(self.pool()).await?;
+        // Commit before touching sandboxes: lifecycle writers lock sandbox ->
+        // host, so holding host here would invert them. A concurrent epoch
+        // advance is preserved; failure supplies no stop proof.
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET LOCAL statement_timeout='2s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout='1s'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE hosts SET last_seen_at=NULL,updated_at=clock_timestamp()
+            WHERE id=$1 AND supervisor_epoch=$2",
+        )
+        .bind(host.uuid())
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.reconcile_unavailable_hosts().await?;
         Ok(())
     }
 }

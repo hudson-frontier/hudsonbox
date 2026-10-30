@@ -3,6 +3,14 @@ use sandbox_protocol::supervisor::PreviousAllocationRequest;
 use sandbox_store::recovery::PreviousAction;
 
 impl Controller {
+    pub(super) async fn owner_unavailable(&self, claim: &Claim) -> Result<Tick, ControllerError> {
+        match self.store.record_owner_unavailable(claim).await {
+            Ok(()) => self.defer(claim).await,
+            Err(DispatchError::LostClaim) => Ok(Tick::LostOwnership),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn previous_unknown(
         &self,
         claim: &Claim,
@@ -38,7 +46,7 @@ impl Controller {
         let mut route = match self.owner(claim).await? {
             hosts::Owner::Ready(route) => route,
             hosts::Owner::None => return Ok(None),
-            hosts::Owner::Unavailable => return self.defer(claim).await.map(Some),
+            hosts::Owner::Unavailable => return self.owner_unavailable(claim).await.map(Some),
         };
         let action = match self
             .store

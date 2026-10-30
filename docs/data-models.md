@@ -316,6 +316,10 @@ Each record holds the initiating token hash, normalized source plan/reference, d
 
 [Migration 0022](../migrations/0022_allocation_retirement_scan.sql) adds `allocations.retirement_scan_at` and a partial released-allocation index for fair controller scanning. This timestamp is a retry scheduling hint, independent of immutable retirement intent, delivery claim leases and retained completion. See [automatic allocation retirement](allocation-retirement.md#automatic-controller-worker).
 
+## Fleet uncertainty and retained ownership
+
+[Host-loss reconciliation](lifecycle.md#fleet-host-loss-reconciliation) uses existing host freshness, sandbox observations, allocations and operation claims; it adds no replacement-owner or checkpoint schema. Unavailable inventory changes the current sandbox observation to `unknown` without changing its generation, desired state or allocation pointer. Dispatched operations whose owner cannot be routed retain their phase, attempt count, receipts and claim revision while reporting `unknown`. Heartbeat refresh is separate from allocation readiness evidence. Reservations remain attached to unreleased allocation rows until the existing verified-release transaction succeeds; a stale heartbeat, expired lease or new database epoch cannot refund capacity. Published durable checkpoint metadata and recovery remain pending #178.
+
 ## Accepted v1 fleet and warm-pool model
 
 Decision locked on 2026-10-30: the following logical models and ownership rules are the implementation baseline for multi-host and warm-pool work. **Accepted design does not mean implemented schema.** No migrations or runtime behavior are added by this decision. Changes to these boundaries need an explicit design revision; SQL types, indexes, protocol messages and migration/backfill mechanics are specified and tested in implementation PRs.

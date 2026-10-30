@@ -107,6 +107,12 @@ epoch conflicts, and invalid/overflowing epochs are refused. Statement and lock
 waits are bounded to two seconds and one second respectively. An epoch floor
 does not replace a backup/restore protocol or authorize a database rollback.
 
+## Unavailable and returning hosts
+
+The controller's [fleet recovery loop](lifecycle.md#fleet-host-loss-reconciliation) treats missing/stale heartbeat or an epoch mismatch as runtime uncertainty. Health failures clear placement freshness for the checked epoch immediately. Neither condition proves a VM stopped; all unreleased CPU/RAM/disk reservations stay charged. Missing transport identity also cannot authorize replacement. A fresh returning host must reconcile original ownership before readiness is confirmed. An old incarnation cannot mutate a newer epoch or release its reservations.
+
+Keep journals, launch-permit history and allocation directories through a restart. The existing [previous-epoch recovery](controller.md#previous-epoch-allocation-recovery) requires verified cleanup evidence; missing local records and a successful health response cannot substitute for it. Without a durable checkpoint, cleanup is destruction/failure, never process recovery. A provider adapter must not interpret stale inventory or a database epoch advance as an infrastructure fencing receipt.
+
 ## Upgrade and recovery
 
 Follow the [offline upgrade and recovery procedure](operator-recovery.md) before replacing application/supervisor versions or restoring database state. It includes the compatibility matrix, private backup boundaries, quarantine requirements and an executable PostgreSQL dump/restore rehearsal. A restored epoch is not independent proof that old execution or storage writers have stopped.

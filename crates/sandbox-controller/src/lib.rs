@@ -216,7 +216,9 @@ impl Controller {
         // Resolve the owner before committing another stop attempt.
         let mut route = match self.owner(claim).await? {
             hosts::Owner::Ready(route) => route,
-            hosts::Owner::Unavailable | hosts::Owner::None => return self.defer(claim).await,
+            hosts::Owner::Unavailable | hosts::Owner::None => {
+                return self.owner_unavailable(claim).await;
+            }
         };
         let action = match self.store.prepare_destroy(claim, false).await {
             Ok(action) => action,
@@ -383,6 +385,7 @@ impl Controller {
     /// maintain at most one due allocation and process at most one operation.
     /// Rotating preference prevents create/destroy/execute queues starving each other.
     pub async fn tick(&mut self) -> Result<Tick, ControllerError> {
+        self.store.reconcile_unavailable_hosts().await?;
         let cancellation = match tokio::time::timeout(std::time::Duration::from_secs(2), async {
             let Some(claim) = self.store.claim_next(OperationKind::Cancel, 30).await? else {
                 return Ok(None);
@@ -478,7 +481,7 @@ impl Controller {
             .await
         {
             Ok(route) => route,
-            Err(_) => return self.defer(claim).await,
+            Err(_) => return self.owner_unavailable(claim).await,
         };
         let launch_permit = match self.route_permit(&mut route, claim, &allocation).await {
             Ok(permit) => permit,
@@ -566,7 +569,7 @@ impl Controller {
         let mut route = match self.owner(claim).await? {
             hosts::Owner::Ready(route) => Some(route),
             hosts::Owner::Unavailable => match self.store.fence_unavailable_execute(claim).await {
-                Ok(()) => return self.defer(claim).await,
+                Ok(()) => return self.owner_unavailable(claim).await,
                 Err(DispatchError::LostClaim) => return Ok(Tick::LostOwnership),
                 Err(error) => return Err(error.into()),
             },

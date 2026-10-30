@@ -36,7 +36,7 @@ impl Controller {
             .ok_or(ControllerError::InvalidConfig)?;
         let mut route = match self.owner(claim).await? {
             hosts::Owner::Ready(route) => Some(route),
-            hosts::Owner::Unavailable => return self.defer(claim).await,
+            hosts::Owner::Unavailable => return self.owner_unavailable(claim).await,
             hosts::Owner::None => None,
         };
         let (host, epoch) = route
