@@ -148,6 +148,7 @@ Internal ID: `hst_<uuidv7>`.
 | `runtime_capabilities`, `runtime_capabilities_epoch` | Matching authenticated [capability observation](host-capabilities.md), bound to the current epoch; never operator policy or physical isolation proof |
 | `max_snapshot_uploads` | Maximum concurrent snapshot uploads/staging admissions on this host |
 | `supervisor_epoch` | Increasing registration epoch that rejects stale supervisor messages |
+| `host_pool_id`, `endpoint`, `transport_server_name`, `transport_certificate_sha256`, `provider_ref` | Owning [host pool](host-maintenance.md#host-registry-and-pools), operator-registered gRPC/mTLS address and expected server identity, and external resource reference; never changed by health |
 
 Hosts are infrastructure records shared across projects. Calculate reservations from unreleased allocations under transactional capacity checks. A heartbeat timeout makes a host uncertain; it does not prove its VMs stopped. The operator currently provisions a fresh increasing supervisor epoch after restart; automatic epoch issuance remains planned. It is separate from an OS boot ID and requires reconciliation before existing ownership is renewed. Authenticated health enrolls capability metadata only against a separately approved operator policy, and cannot create a host or change its epoch/capacity.
 
@@ -318,6 +319,8 @@ Each record holds the initiating token hash, normalized source plan/reference, d
 ## Accepted v1 fleet and warm-pool model
 
 Decision locked on 2026-10-30: the following logical models and ownership rules are the implementation baseline for multi-host and warm-pool work. **Accepted design does not mean implemented schema.** No migrations or runtime behavior are added by this decision. Changes to these boundaries need an explicit design revision; SQL types, indexes, protocol messages and migration/backfill mechanics are specified and tested in implementation PRs.
+
+Implementation status: [migration 0025](../migrations/0025_host_registry.sql) implements `host_pools`, `project_host_pool_access` and the `hosts` extension for [#192](https://github.com/hudson-frontier/hudsonbox/issues/192); the [host registry](host-maintenance.md#host-registry-and-pools) section owns its column choices, legacy backfill and operator commands. Controller routing by registry ([#193](https://github.com/hudson-frontier/hudsonbox/issues/193)), access-checked placement ([#194](https://github.com/hudson-frontier/hudsonbox/issues/194)), templates, warm pools, capacity operations and the Kubernetes adapter remain unimplemented.
 
 The existing `projects`, `sandboxes`, `allocations` and `operations` relationships remain. A sandbox is the stable customer identity; an allocation is one execution incarnation on a particular supervisor. Customer operations retain the existing durable operation model. Existing supporting upload, output cleanup, permit and history-retirement records remain necessary.
 
