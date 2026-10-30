@@ -112,7 +112,7 @@ make down
 ```
 
 `make down` stops the dependency stack while keeping its data. See
-[control-plane development](docs/implementation/dev-env.md) for local connection
+[control-plane development](docs/local-development.md) for local connection
 settings and the [HTTPS API guide](docs/api-server.md) for certificates,
 provisioning, and service startup.
 

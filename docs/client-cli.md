@@ -151,7 +151,7 @@ cargo build --locked -p sandbox-cli --bin sandbox-api-test-client
 ./target/debug/sandbox-api-test-client --help
 ```
 
-With the [development dependencies](implementation/dev-env.md) available, run
+With the [development dependencies](local-development.md) available, run
 the same API integration suite against a trusted, locally built Hudson CLI:
 
 ```sh

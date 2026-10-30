@@ -75,7 +75,7 @@ def inspect(profile):
     checks.append(check(
         "python", "passed" if sys.version_info >= (3, 11) else "failed",
         "Version " + platform.python_version(),
-        "Use Python 3.11+; see docs/implementation/dev-env.md",
+        "Use Python 3.11+; see docs/local-development.md",
     ))
     if profile == "control-plane":
         checks.append(check(
@@ -94,11 +94,11 @@ def inspect(profile):
             probe(["cargo", "--version"], r"^cargo (\d+\.\d+\.\d+)(?:\s|$)", setup,
                   exact=channel, rust_channel=channel),
             probe(["protoc", "--version"], r"^libprotoc (\d+(?:\.\d+)+)\b",
-                  "Install protobuf; see docs/implementation/dev-env.md"),
+                  "Install protobuf; see docs/local-development.md"),
             probe(["docker", "--version"], r"^Docker version (\d+\.\d+\.\d+)\b",
                   "Configure a local container engine; see docs/local-development.md"),
             probe(["docker", "compose", "version"], r"^Docker Compose version v?(\d+\.\d+\.\d+)\b",
-                  "Install Compose v2; see docs/implementation/dev-env.md", minimum=(2, 0, 0)),
+                  "Install Compose v2; see docs/local-development.md", minimum=(2, 0, 0)),
             probe(["node", "--version"], r"^v(\d+\.\d+\.\d+)\s*$",
                   "Use Node 24.9.0+ for SDK checks; see docs/language-clients.md", minimum=(24, 9, 0)),
             probe(["npm", "--version"], r"^(\d+\.\d+\.\d+)\s*$",

@@ -1,6 +1,6 @@
 # Contributing to Hudsonbox
 
-Hudsonbox is being designed in public by Hudson Frontier. Start with the [README](README.md) and [documentation guide](docs/README.md). The runtime is partially implemented; the [development guide](docs/implementation/dev-env.md) distinguishes local checks, controlled VM evidence and unfinished release gates.
+Hudsonbox is being designed in public by Hudson Frontier. Start with the [README](README.md) and [documentation guide](docs/README.md). The runtime is partially implemented; the [development guide](docs/local-development.md) distinguishes local checks, controlled VM evidence and unfinished release gates.
 
 The project is released under [Apache-2.0](LICENSE); contributions are accepted under the same terms, as its section 5 provides. No CLA or commit-signoff requirement is currently configured.
 
@@ -8,7 +8,7 @@ The project is released under [Apache-2.0](LICENSE); contributions are accepted 
 
 1. **Agree on the problem.** Small fixes may go straight to a PR. Open an issue first for substantial features, architecture changes, or new dependencies. Describe the use case, scope, and acceptance criteria. Report vulnerabilities [privately](SECURITY.md).
 2. **Create a branch.** Outside contributors fork the repository; maintainers use a branch in this repository. Start from current `main`. Use a descriptive name such as `feat/sandbox-create`, `fix/snapshot-cleanup`, or `docs/auth-flow`. Coding agents use `codex/` branches in isolated worktrees.
-3. **Make one focused change.** Preserve unrelated edits. Update the authoritative document when behavior changes. Add tests that demonstrate the behavior or regression when executable code is involved. Do not claim a planned feature is implemented. If your change finishes work described in [docs/implementation](docs/implementation/README.md), move anything durable into the document that owns it and delete the note in the same pull request.
+3. **Make one focused change.** Preserve unrelated edits. Update the authoritative document when behavior changes. Add tests that demonstrate the behavior or regression when executable code is involved. Do not claim a planned feature is implemented. Keep implementation tasks in GitHub issues. Put durable decisions and verified behavior in the owning document, and validation records in `docs/evidence`; remove superseded working notes.
 4. **Check locally.** Run the commands below and any tests relevant to the change. Report skipped checks and their reason.
 5. **Open a PR against `main`.** Use the PR template. Draft PRs are welcome for early feedback; mark ready when the change and its validation are reviewable.
 6. **Review and merge.** Address feedback and rerun affected checks after edits. Reviews are optional. Only @itsafal and @dipeshbabu are on the merge allowlist; they squash-merge after required checks pass and review threads are resolved.
