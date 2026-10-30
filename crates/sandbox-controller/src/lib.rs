@@ -481,7 +481,7 @@ impl Controller {
             .await
         {
             Ok(route) => route,
-            Err(_) => return self.defer(claim).await,
+            Err(_) => return self.owner_unavailable(claim).await,
         };
         let launch_permit = match self.route_permit(&mut route, claim, &allocation).await {
             Ok(permit) => permit,

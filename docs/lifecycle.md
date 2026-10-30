@@ -164,6 +164,18 @@ Automatic retries are appropriate only when receipts and operation semantics mak
 
 Stop admitting new allocations on draining hosts. Keep existing work reachable while safely saving/stopping it; a completed maintenance drain requires confirmed release of active allocations and outstanding snapshot work, not a service restart or a desired-state update. Snapshot staging remains accounted for until actual cleanup or host storage retirement.
 
+### Fleet host-loss reconciliation
+
+For [#195](https://github.com/hudson-frontier/hudsonbox/issues/195), each controller tick first reconciles up to 128 unreleased current allocations whose registered host has no heartbeat, whose heartbeat is at least thirty seconds old, or whose registered epoch differs from the allocation epoch. Locked sandbox rows are skipped and revisited on later ticks. This PostgreSQL batch includes hosts with no routable endpoint and can run across concurrent controller replicas. It marks the sandbox observation `unknown`; it preserves desired state, operation phases/receipts, allocation identity/generation/epoch, claims, launch permits and every reservation. Missing heartbeats do not establish VM termination, even after the stored allocation lease expires.
+
+A failed authenticated host-health attempt also invalidates that epoch's placement freshness immediately, rather than waiting out the thirty-second window, and runs another bounded unknown-observation batch. An old-epoch failure cannot invalidate a newer epoch's heartbeat. These writes do not stop, fence or release anything. The heartbeat and runtime observation writes are separate to preserve lifecycle lock ordering; a later reconciliation tick covers interrupted observation updates. Concurrent conflicting health results may conservatively leave freshness absent until another successful check.
+
+When an operation's original owner cannot be routed, the current claimant records `unknown` only if dispatch intent already exists (`attempt_count > 0`), preserving its phase and receipts before deferring. Undispatched work retains its existing status and attempt count; command admission's existing unavailable-owner fence still prevents delayed first execution. An available heartbeat alone cannot turn an unknown allocation back into running: the controller must inspect that same incarnation and verify current evidence. A returning old epoch cannot update a newer owner. Late replies must still pass current claim revision, allocation generation, epoch and freshness checks.
+
+Recovery continues through the existing same-epoch inspection and verified previous-epoch cleanup paths. No new allocation is created for host loss, and no uncertain command is replayed. Without the published compatible durable checkpoints planned in [#178](https://github.com/hudson-frontier/hudsonbox/issues/178), host loss reports uncertainty until release is verified; verified cleanup reports destruction or failed creation rather than restored work. There is no implemented disk or RAM recovery here. Future disk-only restore restarts processes and cannot claim memory continuation.
+
+The [portable fleet recovery tests](../crates/sandbox-controller/tests/fleet_recovery.rs) qualify database and simulated-host behavior alongside the existing [release/epoch tests](../crates/sandbox-controller/tests/recovery.rs), including missing supervisor journals. They do not qualify physical fencing, watchdog termination or real Linux/KVM recovery.
+
 ## Acceptance checks
 
 The [create controller tests](../crates/sandbox-controller/tests/create.rs) cover the implemented create subset using a fake host. The remaining contracts, including real runtime behavior, require tests for:

@@ -236,3 +236,131 @@ async fn stale_scan_skips_busy_sandboxes_and_revisits_without_overwriting_releas
             .unwrap();
     assert_eq!(held, 1);
 }
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn uncertain_external_command_is_inspected_after_restart_never_replayed(pool: PgPool) {
+    use sandbox_protocol::supervisor::{CommandInspection, CommandRequest};
+    use sandbox_store::execute::ExecuteAction;
+    let f = Fixture::new(&pool).await;
+    let (_, sandbox) = f.admit().await;
+    assert_eq!(f.controller().await.tick().await.unwrap(), Tick::Confirmed);
+    let (status, _) = f
+        .send(
+            "POST",
+            &format!("/v1/sandboxes/{sandbox}/execute"),
+            serde_json::json!({"argv":["/bin/busybox","echo","external-effect"],
+            "deadline_unix_ms":sandbox_fake_host::unix_ms().unwrap()+60_000}),
+        )
+        .await;
+    assert_eq!(status, http::StatusCode::ACCEPTED);
+    let old = f
+        .store
+        .claim_next(OperationKind::Execute, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    let ExecuteAction::Dispatch { owner, command } = f
+        .store
+        .prepare_execute(&old, f.config.host, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("initial dispatch");
+    };
+    let reply = f
+        .fake
+        .execute_command(Request::new(CommandRequest {
+            ownership: Some(owner),
+            command: Some((&command).into()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    f.store.record_owner_unavailable(&old).await.unwrap();
+    stale(&f).await;
+    f.store.reconcile_unavailable_hosts().await.unwrap();
+    let before = allocations(&pool).await;
+    f.reclaim_now().await;
+    let new = f
+        .store
+        .claim_next(OperationKind::Execute, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.previous_status, "unknown");
+    assert!(matches!(
+        f.store.record_execute_observation(&old, &reply, true).await,
+        Err(DispatchError::LostClaim)
+    ));
+    // Inspection remains permitted even while placement freshness is absent.
+    let ExecuteAction::Inspect { owner, digest } = f
+        .store
+        .prepare_execute(&new, f.config.host, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("uncertain effects must never dispatch again");
+    };
+    let inspected = f
+        .fake
+        .inspect_command(Request::new(CommandInspection {
+            ownership: Some(owner),
+            command_digest: digest.to_vec(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    f.store
+        .record_execute_observation(&new, &inspected, true)
+        .await
+        .unwrap();
+    let (state, attempts): (String, i32) =
+        sqlx::query_as("SELECT status,attempt_count FROM operations WHERE kind='execute'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((state.as_str(), attempts), ("succeeded", 1));
+    assert_eq!(f.fake.total_commands().await, 1);
+    assert_eq!(allocations(&pool).await, before);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn failed_health_immediately_closes_placement_and_keeps_create_reservation(pool: PgPool) {
+    use sandbox_store::placement::{PlacementError, Reservation};
+    let f = Fixture::new(&pool).await;
+    f.admit().await;
+    let (claim, _) = f.prepared().await;
+    let before = allocations(&pool).await;
+    f.store
+        .mark_host_runtime_unknown(f.config.host, 1)
+        .await
+        .unwrap();
+    let fresh: bool = sqlx::query_scalar("SELECT last_seen_at IS NOT NULL FROM hosts")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!fresh);
+    let Reservation::Existing(original) = f
+        .store
+        .reserve_create(&claim, f.config.host, 1)
+        .await
+        .unwrap()
+    else {
+        panic!("retained owner");
+    };
+    assert_eq!(original.generation, 1);
+    assert_eq!(allocations(&pool).await, before);
+    // A second admission cannot spend the apparently idle host's capacity.
+    f.admit().await;
+    let next = f
+        .store
+        .claim_next(OperationKind::Create, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.store.reserve_create(&next, f.config.host, 1).await,
+        Err(PlacementError::HostUnavailable)
+    ));
+    assert_eq!(allocations(&pool).await, before);
+}
