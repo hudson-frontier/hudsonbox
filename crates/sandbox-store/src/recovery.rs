@@ -18,6 +18,70 @@ pub enum PreviousAction {
 }
 
 impl Store {
+    /// Reconcile stale inventory across every registered host, including hosts
+    /// without a routable endpoint. Freshness is placement evidence, never proof
+    /// of termination. Keep allocation/operation authority and all reservations.
+    /// A bounded SKIP LOCKED batch lets replicas share work without waiting on
+    /// lifecycle transactions; later ticks revisit skipped sandboxes.
+    pub async fn reconcile_unavailable_hosts(&self) -> Result<u64, DispatchError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET LOCAL statement_timeout='2s'")
+            .execute(&mut *tx)
+            .await?;
+        let changed = sqlx::query(
+            "WITH candidates AS (
+                SELECT s.id FROM sandboxes s
+                JOIN allocations a ON a.id=s.current_allocation_id
+                JOIN hosts h ON h.id=a.host_id
+                WHERE a.released_at IS NULL AND s.observed_state<>'unknown'
+                AND (h.last_seen_at IS NULL
+                    OR h.last_seen_at<=clock_timestamp()-interval '30 seconds'
+                    OR h.supervisor_epoch<>a.supervisor_epoch)
+                ORDER BY s.id FOR UPDATE OF s SKIP LOCKED LIMIT 128)
+            UPDATE sandboxes s SET observed_state='unknown',
+                state_revision=state_revision+1,updated_at=clock_timestamp()
+            FROM candidates c WHERE s.id=c.id",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Called under a live operation claim when its persisted owner cannot be
+    /// reached. Preserve phase and receipts so recovery inspects the original
+    /// intent. Never classify an undispatched request as an uncertain command.
+    pub async fn record_owner_unavailable(&self, claim: &Claim) -> Result<(), DispatchError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET LOCAL statement_timeout='2s'")
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query(
+            "SELECT attempt_count FROM operations WHERE id=$1 AND claim_revision=$2
+            AND lease_expires_at>clock_timestamp() AND status IN ('running','unknown')
+            FOR UPDATE",
+        )
+        .bind(claim.operation_id.uuid())
+        .bind(claim.revision)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DispatchError::LostClaim)?;
+        if row.try_get::<i32, _>("attempt_count")? > 0 {
+            sqlx::query(
+                "UPDATE operations SET status='unknown',
+                error=coalesce(error,'{\"code\":\"owner_unavailable\"}'::jsonb),
+                updated_at=clock_timestamp() WHERE id=$1",
+            )
+            .bind(claim.operation_id.uuid())
+            .execute(&mut *tx)
+            .await?;
+        }
+        dispatch::fence(&mut tx, claim).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn prepare_previous_allocation(
         &self,
         claim: &Claim,
