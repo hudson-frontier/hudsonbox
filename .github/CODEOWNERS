@@ -1,3 +1,3 @@
-# Initial owners are current repository administrators.
-# Either owner may review; only itsafal has the configured PR/review bypass.
+# Route optional review requests to the maintainers.
+# Reviews are not required; both maintainers must pass required CI to merge.
 * @itsafal @dipeshbabu
