@@ -1,4 +1,3 @@
-# Initial owners are current repository administrators.
-# Either owner may review; both have the configured PR/review bypass.
-# Required CI checks still apply to both accounts.
+# Route optional review requests to the maintainers.
+# Reviews are not required; both maintainers must pass required CI to merge.
 * @itsafal @dipeshbabu
