@@ -51,6 +51,8 @@ The initial project receives explicit allocation quotas matching the current pla
 
 Retry the same command with the same file after any uncertain result. It verifies the same ID, name, credential metadata, active status, and quotas. It never overwrites an existing project, replaces a token, renews expiry, unsuspends a project, or reverses revocation. If a project was legitimately changed, provisioning reports a conflict. An expired or malformed file is refused and retained for operator investigation. There is no atomic filesystem/database transaction: a crash can leave a credential file without a project. The retained file is the recovery input; deleting it and running with a fresh path can create a second project. Use an operator-owned private directory and retain the file until the result is confirmed.
 
+A provisioned project cannot place sandboxes until an operator grants it a host pool. Run [`grant-pool-access`](host-maintenance.md#pools) with the new project ID. Single-host installations use the backfilled `legacy-standalone` pool, as described in the [upgrade step](host-maintenance.md#legacy-backfill-and-upgrade). Creates from a project without a grant fail with `host_pool_access_denied`.
+
 ## Local control-plane example
 
 The [local certificate command](local-certificates.md) prepares a private

@@ -62,6 +62,18 @@ impl Fixture {
         let host = HostId::generate();
         sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch) VALUES($1,'ready',4,8192,65536,1)")
             .bind(host.uuid()).execute(pool).await.unwrap();
+        // Placement requires an explicit grant for the configured host's legacy
+        // pool. Upgrade fixtures can start before migration 0025 adds the table.
+        if sqlx::query_scalar::<_, bool>(
+            "SELECT to_regclass('project_host_pool_access') IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        {
+            sqlx::query("INSERT INTO project_host_pool_access(id,project_id,host_pool_id) SELECT gen_random_uuid(),$1,host_pool_id FROM hosts WHERE id=$2")
+                .bind(project.uuid()).bind(host.uuid()).execute(pool).await.unwrap();
+        }
         let digest = format!("sha256:{}", "a".repeat(64));
         let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

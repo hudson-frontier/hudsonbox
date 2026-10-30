@@ -232,6 +232,9 @@ async fn an_exact_retry_on_a_busy_draining_host_preserves_reservations_and_claim
     sqlx::query("INSERT INTO projects(id,name,status,limits,api_tokens) VALUES($1,'provisioning-test','active','{}',$2)")
         .bind(project.uuid()).bind(json!([{"key_id":token.key_id().as_str(),"hash":hex::encode(token.hash().as_bytes())}]))
         .execute(&pool).await.unwrap();
+    // Placement requires an explicit pool grant; these fixtures use only shared pools.
+    sqlx::query("INSERT INTO project_host_pool_access(id,project_id,host_pool_id) SELECT gen_random_uuid(),$1,id FROM host_pools")
+        .bind(project.uuid()).execute(&pool).await.unwrap();
     let digest = input.capabilities.images[0].rootfs_digest.clone();
     let payload =
         json!({"image_digest":digest,"resources":{"vcpu":1,"memory_mib":128,"disk_mib":256}});

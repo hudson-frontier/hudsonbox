@@ -40,6 +40,10 @@ use std::{
 };
 use tonic::{Request, Response, Status};
 
+// Shared with database placement so both layers charge identical overhead.
+const MEMORY_OVERHEAD: u64 = sandbox_protocol::resources::VMM_MEMORY_OVERHEAD_MIB as u64;
+const DISK_OVERHEAD: u64 = sandbox_protocol::resources::ARTIFACT_DISK_OVERHEAD_MIB as u64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Image {
@@ -439,14 +443,14 @@ impl Host {
                 && !r.released
             {
                 cpu = cpu.saturating_add(u64::from(m.start.vcpu));
-                memory = memory.saturating_add(m.start.memory_mib + 128);
-                disk = disk.saturating_add(m.start.disk_mib + 401);
+                memory = memory.saturating_add(m.start.memory_mib + MEMORY_OVERHEAD);
+                disk = disk.saturating_add(m.start.disk_mib + DISK_OVERHEAD);
             }
         }
         let cap = &self.inner.config.capacity;
         if u64::from(manifest.start.vcpu) > cap.vcpu.saturating_sub(cpu)
-            || manifest.start.memory_mib + 128 > cap.memory_mib.saturating_sub(memory)
-            || manifest.start.disk_mib + 401 > cap.disk_mib.saturating_sub(disk)
+            || manifest.start.memory_mib + MEMORY_OVERHEAD > cap.memory_mib.saturating_sub(memory)
+            || manifest.start.disk_mib + DISK_OVERHEAD > cap.disk_mib.saturating_sub(disk)
         {
             return Err(Status::resource_exhausted("host capacity reserved"));
         }

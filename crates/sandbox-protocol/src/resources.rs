@@ -6,6 +6,12 @@ pub const MIN_MEMORY_MIB: i64 = 128;
 pub const MAX_MEMORY_MIB: i64 = 8192;
 pub const MIN_DISK_MIB: i64 = 64;
 pub const MAX_DISK_MIB: i64 = 65536;
+/// Per-allocation host memory beyond guest RAM: the VMM allowance the real
+/// supervisor charges at admission. Database placement charges the same amount.
+pub const VMM_MEMORY_OVERHEAD_MIB: i64 = 128;
+/// Per-allocation host disk beyond the writable rootfs: the guardian's bounded
+/// staged Firecracker, jailer, kernel and bootstrap copies.
+pub const ARTIFACT_DISK_OVERHEAD_MIB: i64 = 401;
 
 /// i128 represents both signed database/API inputs and unsigned wire inputs
 /// without wrapping negative values or truncating oversized requests.

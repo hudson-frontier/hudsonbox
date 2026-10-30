@@ -17,12 +17,30 @@ async fn project(pool: &PgPool) -> (ProjectId, ProjectToken) {
     sqlx::query("INSERT INTO projects(id,name,status,limits,api_tokens) VALUES($1,'placement','active','{}',$2)")
         .bind(id.uuid()).bind(json!([{"key_id":token.key_id().as_str(),"hash":hex::encode(token.hash().as_bytes())}]))
         .execute(pool).await.unwrap();
+    // Placement requires an explicit pool grant; fixture hosts use the legacy
+    // pool. Upgrade fixtures run before migration 0025 creates the table.
+    let registry: bool =
+        sqlx::query_scalar("SELECT to_regclass('project_host_pool_access') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    if registry {
+        sqlx::query(
+            "INSERT INTO project_host_pool_access(id,project_id,host_pool_id) VALUES($1,$2,$3)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(id.uuid())
+        .bind(sandbox_store::host_registry::LEGACY_POOL_ID)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
     (id, token)
 }
 
 async fn host(pool: &PgPool) -> HostId {
     let id = HostId::generate();
-    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch,last_seen_at) VALUES($1,'ready',2,2048,8192,1,clock_timestamp())")
+    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch,last_seen_at) VALUES($1,'ready',2,2176,8593,1,clock_timestamp())")
         .bind(id.uuid()).execute(pool).await.unwrap();
     id
 }
@@ -128,7 +146,8 @@ async fn concurrent_projects_cannot_overbook_host(pool: PgPool) {
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
 async fn each_host_resource_is_checked_before_any_write(pool: PgPool) {
     let (store, claim, host) = fixture(&pool).await;
-    for (cpu, memory, disk) in [(1, 2048_i64, 8192_i64), (2, 2047, 8192), (2, 2048, 8191)] {
+    // Capacity must cover the request plus 128 MiB VMM and 401 MiB artifact overhead.
+    for (cpu, memory, disk) in [(1, 2176_i64, 8593_i64), (2, 2175, 8593), (2, 2176, 8592)] {
         sqlx::query("UPDATE hosts SET cpu_capacity=$1,memory_capacity_mib=$2,disk_capacity_mib=$3 WHERE id=$4")
             .bind(cpu).bind(memory).bind(disk).bind(host.uuid()).execute(&pool).await.unwrap();
         assert!(matches!(

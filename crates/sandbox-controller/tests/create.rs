@@ -590,3 +590,55 @@ async fn sizing_changes_never_replay_or_reject_a_dispatched_incarnation(pool: Pg
             .unwrap();
     assert_eq!((attempts, status.as_str()), (1, "succeeded"));
 }
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn project_without_pool_grant_fails_before_any_reservation(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let (operation, _) = f.admit().await;
+    sqlx::query("DELETE FROM project_host_pool_access")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(f.controller().await.tick().await.unwrap(), Tick::Rejected);
+    assert_eq!(f.fake.total_starts().await, 0);
+    let (_, body) = f
+        .send("GET", &format!("/v1/operations/{operation}"), Value::Null)
+        .await;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["error"]["code"], "host_pool_access_denied");
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM allocations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn full_host_keeps_create_queued_with_reason_then_fails_after_bound(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let (operation, _) = f.admit().await;
+    // Room for the request but not its 128 MiB VMM overhead.
+    sqlx::query("UPDATE hosts SET memory_capacity_mib=(SELECT (resources->>'memory_mib')::bigint FROM sandboxes)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut controller = f.controller().await;
+    assert_eq!(controller.tick().await.unwrap(), Tick::Deferred);
+    let (_, body) = f
+        .send("GET", &format!("/v1/operations/{operation}"), Value::Null)
+        .await;
+    assert_eq!(body["status"], "running");
+    assert_eq!(body["phase"], "awaiting_placement");
+    assert_eq!(body["error"]["code"], "insufficient_capacity");
+    sqlx::query("UPDATE operations SET next_retry_at=NULL,created_at=clock_timestamp()-interval '301 seconds'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(controller.tick().await.unwrap(), Tick::Rejected);
+    let (_, body) = f
+        .send("GET", &format!("/v1/operations/{operation}"), Value::Null)
+        .await;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["error"]["code"], "insufficient_capacity");
+    assert_eq!(f.fake.total_starts().await, 0);
+}

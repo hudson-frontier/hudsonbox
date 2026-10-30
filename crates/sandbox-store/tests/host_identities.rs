@@ -83,6 +83,9 @@ async fn claim(store: &Store, digest: &str) -> Claim {
         .bind(project.uuid())
         .bind(json!([{"key_id":token.key_id().as_str(),"hash":hex::encode(token.hash().as_bytes())}]))
         .execute(store.pool()).await.unwrap();
+    // Placement requires an explicit pool grant; these fixtures use only shared pools.
+    sqlx::query("INSERT INTO project_host_pool_access(id,project_id,host_pool_id) SELECT gen_random_uuid(),$1,id FROM host_pools")
+        .bind(project.uuid()).execute(store.pool()).await.unwrap();
     let payload =
         json!({"image_digest":digest,"resources":{"vcpu":1,"memory_mib":128,"disk_mib":256}});
     store

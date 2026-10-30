@@ -25,7 +25,7 @@ use sandbox_store::{
     destroy::DestroyAction,
     dispatch::{CreateAction, CreateRejection, DispatchError},
     leases::{AllocationClaim, LeaseAction, LeaseResult},
-    placement::{PlacementError, Reservation},
+    placement::{HostScope, PlacementError, PlacementWait, Reservation, WaitOutcome},
 };
 use sandbox_supervisor::{
     routing::RouteError,
@@ -37,7 +37,7 @@ use tonic::transport::Channel;
 pub use hosts::{HEALTH_CONCURRENCY, HEALTH_DEADLINE};
 
 /// `endpoint`, `host` and `epoch` name the configured host: the placement target
-/// for new creates and the legacy address of that host while its registry
+/// for legacy creates and the legacy address of that host while its registry
 /// transport is NULL. Registered hosts are addressed only by their registration.
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
@@ -160,6 +160,20 @@ impl Controller {
         match self.store.defer_claim(claim, 5).await {
             Ok(()) => Ok(Tick::Deferred),
             Err(ClaimError::LostClaim) => Ok(Tick::LostOwnership),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Bounded wait for placement; fails the create once the bound passes.
+    async fn await_placement(
+        &self,
+        claim: &Claim,
+        reason: PlacementWait,
+    ) -> Result<Tick, ControllerError> {
+        match self.store.await_placement(claim, reason).await {
+            Ok(WaitOutcome::Waiting) => Ok(Tick::Deferred),
+            Ok(WaitOutcome::Expired) => self.reject(claim, reason.rejection()).await,
+            Err(PlacementError::LostClaim) => Ok(Tick::LostOwnership),
             Err(error) => Err(error.into()),
         }
     }
@@ -424,11 +438,17 @@ impl Controller {
         if let Some(tick) = self.previous_tick(claim).await? {
             return Ok(tick);
         }
-        let reservation = match self
-            .store
-            .reserve_create(claim, self.config.host, self.config.epoch)
-            .await
-        {
+        // A registered bootstrap host opts into fleet placement. NULL transport
+        // keeps the explicit configured legacy/fake scope; never fall back from
+        // an unavailable fleet to that host.
+        let scope = match self.store.registered_host(self.config.host).await? {
+            Some(host) if host.transport.is_some() => HostScope::Fleet,
+            _ => HostScope::Configured {
+                host: self.config.host,
+                epoch: self.config.epoch,
+            },
+        };
+        let reservation = match self.store.place_create(claim, scope).await {
             Ok(value) => value,
             Err(PlacementError::Unauthorized) => {
                 return self.reject(claim, CreateRejection::Unauthorized).await;
@@ -436,15 +456,17 @@ impl Controller {
             Err(PlacementError::InvalidResources) => {
                 return self.reject(claim, CreateRejection::InvalidResources).await;
             }
-            Err(
-                PlacementError::Capacity
-                | PlacementError::Quota
-                | PlacementError::HostUnavailable
-                | PlacementError::HostCompatibility
-                | PlacementError::Reconcile,
-            ) => return self.defer(claim).await,
+            Err(PlacementError::NoPoolAccess) => {
+                return self
+                    .reject(claim, CreateRejection::HostPoolAccessDenied)
+                    .await;
+            }
+            Err(PlacementError::Reconcile) => return self.defer(claim).await,
             Err(PlacementError::LostClaim) => return Ok(Tick::LostOwnership),
-            Err(error) => return Err(error.into()),
+            Err(error) => match error.wait_reason() {
+                Some(reason) => return self.await_placement(claim, reason).await,
+                None => return Err(error.into()),
+            },
         };
         let allocation = match reservation {
             Reservation::Reserved(a) | Reservation::Existing(a) => a,

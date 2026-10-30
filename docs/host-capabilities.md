@@ -47,7 +47,7 @@ New placement requires policy and observed capabilities to match, an advertised 
 | New/unknown schema, guest protocol or unsupported artifact version | Refuse; publish a compatible contract implementation before operator approval |
 | Different approved contract after a drained upgrade | Prior observation stays retained but cannot admit work; require new matching authenticated health |
 
-Apply additive migration 0023 before starting the new controller. Legacy mode is an explicit migration boundary, not automatic supported-host admission. There is no manager command to downgrade an enrolled host to legacy. Keep the compatible controller/supervisor binaries, approved contracts, private credentials and immutable artifacts available for rollback; do not roll back a live epoch or erase retained ownership. Database/storage backup and restore procedures still need an access-controlled rehearsal before a release claim.
+Apply additive migration 0023 before starting the new controller. Legacy mode is an explicit migration boundary, not automatic supported-host admission. It is available only through configured-host placement. Fleet placement requires current capability evidence even when a legacy host has a registered transport identity; existing allocations still reconcile under their original ownership. There is no manager command to downgrade an enrolled host to legacy. Keep the compatible controller/supervisor binaries, approved contracts, private credentials and immutable artifacts available for rollback; do not roll back a live epoch or erase retained ownership. Database/storage backup and restore procedures still need an access-controlled rehearsal before a release claim.
 
 ## Validation
 
