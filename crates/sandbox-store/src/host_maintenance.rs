@@ -17,6 +17,10 @@ pub struct HostMaintenance {
     pub reserved_disk_mib: i64,
     pub unfinished_operations: i64,
     pub unknown_operations: i64,
+    /// Unreleased reservations issued under an older epoch of this host.
+    pub previous_epoch_allocations: i64,
+    /// Unreleased reservations whose sandbox runtime is currently unknown.
+    pub unknown_state_allocations: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,10 +93,30 @@ async fn report(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(Error::Conflict)?;
-    let reservations: (i64,i64,i64,i64) = sqlx::query_as("SELECT count(*),COALESCE(sum(vcpu),0)::bigint,COALESCE(sum(memory_mib),0)::bigint,COALESCE(sum(disk_mib),0)::bigint FROM allocations WHERE host_id=$1 AND released_at IS NULL")
-        .bind(host.uuid()).fetch_one(&mut **tx).await?;
-    let work: (i64,i64) = sqlx::query_as("SELECT count(*),count(*) FILTER (WHERE o.status='unknown') FROM operations o JOIN allocations a ON a.sandbox_id=o.sandbox_id WHERE a.host_id=$1 AND a.released_at IS NULL AND o.status IN ('queued','running','unknown')")
-        .bind(host.uuid()).fetch_one(&mut **tx).await?;
+    // Every count is scoped to this host identity. Another host's allocations,
+    // epochs or uncertain work never contribute, even at an equal epoch number.
+    let reservations: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*),COALESCE(sum(a.vcpu),0)::bigint,COALESCE(sum(a.memory_mib),0)::bigint,
+        COALESCE(sum(a.disk_mib),0)::bigint,count(*) FILTER (WHERE a.supervisor_epoch<$2),
+        count(*) FILTER (WHERE s.observed_state='unknown')
+        FROM allocations a JOIN sandboxes s ON s.id=a.sandbox_id
+        WHERE a.host_id=$1 AND a.released_at IS NULL",
+    )
+    .bind(host.uuid())
+    .bind(expected_epoch)
+    .fetch_one(&mut **tx)
+    .await?;
+    // A command/upload stays attributed to the allocation it was pinned to. A
+    // later replacement owner on another host does not inherit its outcome.
+    let work: (i64, i64) = sqlx::query_as(
+        "SELECT count(*),count(*) FILTER (WHERE o.status='unknown')
+        FROM allocations a JOIN operations o ON o.sandbox_id=a.sandbox_id
+        WHERE a.host_id=$1 AND a.released_at IS NULL AND o.status IN ('queued','running','unknown')
+        AND COALESCE(o.execution_allocation_id,o.file_allocation_id,a.id)=a.id",
+    )
+    .bind(host.uuid())
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(HostMaintenance {
         host_id: host.to_string(),
         supervisor_epoch: row.try_get("supervisor_epoch")?,
@@ -103,6 +127,8 @@ async fn report(
         reserved_disk_mib: reservations.3,
         unfinished_operations: work.0,
         unknown_operations: work.1,
+        previous_epoch_allocations: reservations.4,
+        unknown_state_allocations: reservations.5,
     })
 }
 
