@@ -274,6 +274,50 @@ async fn spread_selection_and_existing_allocations_stay_pinned(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn uncertain_and_previous_epoch_allocations_keep_holding_capacity(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let shared = host_pool(&store, "shared", Tenancy::Shared).await;
+    let a = host(&pool, shared, 1).await;
+    let b = host(&pool, shared, 1).await;
+    let (id, token) = project(&pool).await;
+    store.grant_host_pool_access(id, shared).await.unwrap();
+    let first = create(&store, id, &token).await;
+    let owner = placed(store.place_create(&first, HostScope::Fleet).await);
+    // The outcome is unknown, the release is unconfirmed and its lease expired,
+    // and the owner restarted at a new epoch. Nothing proves the VM is gone.
+    // A far retry time keeps the next claims on the new creates.
+    sqlx::query(
+        "UPDATE operations SET status='unknown',lease_expires_at=NULL,
+        next_retry_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+    )
+    .bind(first.operation_id.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE allocations SET status='releasing',lease_expires_at=clock_timestamp()-interval '1 minute'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE hosts SET supervisor_epoch=2 WHERE id=$1")
+        .bind(owner.uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let second = create(&store, id, &token).await;
+    let other = if owner == a { b } else { a };
+    assert_eq!(
+        placed(store.place_create(&second, HostScope::Fleet).await),
+        other
+    );
+    let third = create(&store, id, &token).await;
+    assert!(matches!(
+        store.place_create(&third, HostScope::Fleet).await,
+        Err(PlacementError::Capacity)
+    ));
+    assert_within_capacity(&pool).await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
 async fn stale_draining_unregistered_and_incompatible_hosts_are_excluded(pool: PgPool) {
     let store = Store::from_pool(pool.clone());
     let shared = host_pool(&store, "shared", Tenancy::Shared).await;
