@@ -22,6 +22,7 @@ pub mod leases;
 pub mod lists;
 pub mod output;
 pub mod output_cleanup;
+pub mod owner_routing;
 pub mod placement;
 pub mod projects;
 pub mod provision;

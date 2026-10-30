@@ -34,9 +34,15 @@ impl Controller {
     }
 
     async fn previous_inner(&mut self, claim: &Claim) -> Result<Option<Tick>, ControllerError> {
+        // Reconciliation is reported by the owner host's current incarnation.
+        let mut route = match self.owner(claim).await? {
+            hosts::Owner::Ready(route) => route,
+            hosts::Owner::None => return Ok(None),
+            hosts::Owner::Unavailable => return self.defer(claim).await.map(Some),
+        };
         let action = match self
             .store
-            .prepare_previous_allocation(claim, self.config.host, self.config.epoch)
+            .prepare_previous_allocation(claim, route.host, route.epoch)
             .await
         {
             Ok(Some(a)) => a,
@@ -51,7 +57,7 @@ impl Controller {
                 .await
                 .map(Some);
         };
-        let response = match self
+        let response = match route
             .client
             .reconcile_previous_allocation(request.clone())
             .await

@@ -14,21 +14,18 @@ pub trait LiveReader: fmt::Debug + Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<LiveOutputObservation, Problem>> + Send + 'a>>;
 }
 pub struct LiveClient {
-    host: HostId,
-    endpoint: String,
-    ca: Vec<u8>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
+    routes: crate::owners::OwnerRoutes,
     allow_simulated: bool,
 }
 impl fmt::Debug for LiveClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LiveClient")
-            .field("host", &self.host)
+            .field("routes", &self.routes)
             .finish_non_exhaustive()
     }
 }
 impl LiveClient {
+    /// Legacy single-host reader.
     pub fn new(
         host: HostId,
         endpoint: String,
@@ -37,32 +34,27 @@ impl LiveClient {
         key: Vec<u8>,
         allow_simulated: bool,
     ) -> anyhow::Result<Self> {
-        let uri: http::Uri = endpoint
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid live host endpoint"))?;
-        anyhow::ensure!(
-            uri.scheme_str() == Some("https")
-                && uri.host().is_some()
-                && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
-                && uri.path() == "/"
-                && uri.query().is_none(),
-            "invalid live host endpoint"
-        );
-        anyhow::ensure!(
-            !ca.is_empty()
-                && !cert.is_empty()
-                && !key.is_empty()
-                && ca.len() <= 65536
-                && cert.len() <= 65536
-                && key.len() <= 65536,
-            "invalid live host TLS files"
-        );
+        Self::routed(
+            None,
+            Some((host, endpoint)),
+            &ca,
+            &cert,
+            &key,
+            allow_simulated,
+        )
+    }
+    /// Registry routing to each allocation owner, optionally keeping one legacy host.
+    pub fn routed(
+        store: Option<sandbox_store::Store>,
+        legacy: Option<(HostId, String)>,
+        ca: &[u8],
+        cert: &[u8],
+        key: &[u8],
+        allow_simulated: bool,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            host,
-            endpoint,
-            ca,
-            cert,
-            key,
+            routes: crate::owners::OwnerRoutes::new(store, legacy, ca, cert, key)
+                .map_err(|e| anyhow::anyhow!("live reader: {e}"))?,
             allow_simulated,
         })
     }
@@ -74,21 +66,16 @@ impl LiveReader for LiveClient {
         request: LiveOutputRequest,
     ) -> Pin<Box<dyn Future<Output = Result<LiveOutputObservation, Problem>> + Send + 'a>> {
         Box::pin(async move {
-            if host != self.host {
-                return Err(Problem::Unavailable);
-            }
-            let mut client = sandbox_supervisor::transport::connect_output_reader(
-                &self.endpoint,
-                host,
-                &self.ca,
-                &self.cert,
-                &self.key,
-            )
-            .await
-            .map_err(|_| Problem::Unavailable)?;
-            let reply = client
-                .read(request)
-                .await
+            let route = self.routes.route(host).await?;
+            let mut client =
+                sandbox_protocol::supervisor::live_output_client::LiveOutputClient::new(
+                    route.lease.channel.clone(),
+                )
+                .max_decoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES);
+            let response = client.read(request).await;
+            self.routes.observe(&route, &response);
+            let reply = response
                 .map_err(|e| match e.code() {
                     tonic::Code::NotFound | tonic::Code::FailedPrecondition => {
                         Problem::OutputMissing
@@ -97,7 +84,13 @@ impl LiveReader for LiveClient {
                     _ => Problem::Unavailable,
                 })?
                 .into_inner();
-            if reply.simulated && !self.allow_simulated || reply.host_id != self.host.to_string() {
+            // A reply from any other host or incarnation is never accepted.
+            if reply.simulated && !self.allow_simulated
+                || reply.host_id != host.to_string()
+                || route
+                    .epoch
+                    .is_some_and(|epoch| reply.supervisor_epoch != epoch)
+            {
                 return Err(Problem::Unavailable);
             }
             Ok(reply)

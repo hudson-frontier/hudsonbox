@@ -2,8 +2,9 @@
 //! dispatch calls belong here. Run separately from lifecycle maintenance.
 use crate::Controller;
 use sandbox_protocol::{
+    HostId,
     output::{OutputPlans, OutputRefs},
-    supervisor::{OutputObservation, OutputRequest, supervisor_client::SupervisorClient},
+    supervisor::{OutputObservation, OutputRequest},
 };
 use sandbox_store::{
     Store,
@@ -11,13 +12,12 @@ use sandbox_store::{
 };
 use sandbox_supervisor::archive::{MAX_METADATA, encode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tonic::transport::Channel;
 
 #[derive(Debug)]
 pub struct Archiver {
     store: Store,
     config: crate::ControllerConfig,
-    client: SupervisorClient<Channel>,
+    hosts: Controller,
     retention: u32,
     grace: u32,
 }
@@ -51,7 +51,7 @@ impl Controller {
         Ok(Archiver {
             store: self.store.clone(),
             config: self.config.clone(),
-            client: self.archive_client.clone(),
+            hosts: self.worker(0),
             retention,
             grace,
         })
@@ -70,12 +70,13 @@ impl Archiver {
     }
     fn validate(
         &self,
+        (host, epoch): (HostId, i64),
         request: &OutputRequest,
         response: &OutputObservation,
     ) -> Result<OutputPlans, ArchiveError> {
         if response.request.as_ref() != Some(request)
-            || response.host_id != self.config.host.to_string()
-            || response.supervisor_epoch != self.config.epoch
+            || response.host_id != host.to_string()
+            || response.supervisor_epoch != epoch
             || (response.simulated && !self.config.allow_simulated)
             || now().abs_diff(response.observed_unix_ms) > 10_000
             || response.plans_json.len() > MAX_METADATA
@@ -100,9 +101,13 @@ impl Archiver {
             Err(OutputError::Expired) => return Ok(ArchiveTick::Expired),
             Err(e) => return Err(e.into()),
         };
-        if work.ticket.owner.host_id != self.config.host {
-            return Err(ArchiveError::Evidence);
-        }
+        // Only the ticket's exact owner incarnation can publish its output.
+        let owner = (work.ticket.owner.host_id, work.ticket.owner.host_epoch);
+        let mut route = self
+            .hosts
+            .route(owner.0, owner.1, true)
+            .await
+            .map_err(|_| ArchiveError::Rpc)?;
         let mut request = OutputRequest {
             ticket_json: encode(&work.ticket).map_err(|_| ArchiveError::Evidence)?,
             publication_revision: claim.revision,
@@ -115,13 +120,13 @@ impl Archiver {
         if work.plans.is_none() {
             let response = tokio::time::timeout(
                 Duration::from_secs(30),
-                self.client.prepare_output(request.clone()),
+                route.client.prepare_output(request.clone()),
             )
             .await
             .map_err(|_| ArchiveError::Rpc)?
             .map_err(|_| ArchiveError::Rpc)?
             .into_inner();
-            let plans = self.validate(&request, &response)?;
+            let plans = self.validate(owner, &request, &response)?;
             if !response.references_json.is_empty() || response.simulated != work.simulated {
                 return Err(ArchiveError::Evidence);
             }
@@ -134,13 +139,13 @@ impl Archiver {
         request.plans_json = encode(&plans).map_err(|_| ArchiveError::Evidence)?;
         let response = tokio::time::timeout(
             Duration::from_secs(80),
-            self.client.archive_output(request.clone()),
+            route.client.archive_output(request.clone()),
         )
         .await
         .map_err(|_| ArchiveError::Rpc)?
         .map_err(|_| ArchiveError::Rpc)?
         .into_inner();
-        let observed = self.validate(&request, &response)?;
+        let observed = self.validate(owner, &request, &response)?;
         if observed != plans || response.simulated != work.simulated {
             return Err(ArchiveError::Evidence);
         }

@@ -119,9 +119,10 @@ The [registry store](../crates/sandbox-store/src/host_registry.rs) exposes the
 read model a controller resolves per host: identity, pool and type, status,
 epoch, endpoint, expected transport identity, provider reference, capacity,
 approved/observed capabilities and heartbeat freshness (an authenticated
-observation within 30 seconds). This slice adds no controller routing,
-cross-host placement or project-access enforcement; those are
-[#193](https://github.com/hudson-frontier/hudsonbox/issues/193) and
+observation within 30 seconds). The controller and API use it for
+[per-owner routing](controller.md#per-owner-host-routing)
+([#193](https://github.com/hudson-frontier/hudsonbox/issues/193)). Cross-host
+placement and project-access enforcement remain
 [#194](https://github.com/hudson-frontier/hudsonbox/issues/194).
 
 ### Pools

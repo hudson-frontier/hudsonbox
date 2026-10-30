@@ -18,6 +18,8 @@ hex = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 tokio-rustls = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 prost = { workspace = true }
 sandbox-protocol = { workspace = true }
 sandbox-artifacts = { workspace = true }

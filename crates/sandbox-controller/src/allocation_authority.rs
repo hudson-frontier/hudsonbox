@@ -3,49 +3,49 @@ use sandbox_protocol::supervisor::{AllocationAuthorityObservation, AllocationAut
 impl Controller {
     async fn accept_registration(
         &self,
+        host: HostId,
+        epoch: i64,
         observed: &AllocationAuthorityObservation,
     ) -> Result<(), ControllerError> {
-        if observed.host_id != self.config.host.to_string()
-            || observed.reporting_epoch != self.config.epoch
-        {
+        if observed.host_id != host.to_string() || observed.reporting_epoch != epoch {
             return Err(ControllerError::HostIdentity);
         }
         self.store
-            .record_allocation_registration(
-                self.config.host,
-                self.config.epoch,
-                true,
-                observed.registered_through,
-            )
+            .record_allocation_registration(host, epoch, true, observed.registered_through)
             .await?;
         Ok(())
     }
-    pub(super) async fn sync_allocation_authority(&mut self) -> Result<u64, ControllerError> {
+    pub(super) async fn sync_allocation_authority(
+        &self,
+        host: HostId,
+        epoch: i64,
+        required: bool,
+        client: &mut SupervisorClient<Channel>,
+        authority: &tokio::sync::Mutex<()>,
+    ) -> Result<u64, ControllerError> {
         // Sibling workers must not advance host registration while another is
         // validating an acknowledgement against its bounded database batch.
-        let sync = self.authority_sync.clone();
-        let _guard = sync.lock().await;
-        if !self.launch_permits_required {
+        let _guard = authority.lock().await;
+        if !required {
             self.store
-                .record_allocation_registration(self.config.host, self.config.epoch, false, 0)
+                .record_allocation_registration(host, epoch, false, 0)
                 .await?;
             return Ok(0);
         }
         let request = AllocationAuthorityRequest {
-            host_id: self.config.host.to_string(),
-            reporting_epoch: self.config.epoch,
+            host_id: host.to_string(),
+            reporting_epoch: epoch,
             permits_json: Vec::new(),
         };
-        let observed = self
-            .client
+        let observed = client
             .allocation_authority(request.clone())
             .await
             .map_err(|_| ControllerError::Health)?
             .into_inner();
-        self.accept_registration(&observed).await?;
+        self.accept_registration(host, epoch, &observed).await?;
         let batch = self
             .store
-            .allocation_permits_after(self.config.host, observed.registered_through)
+            .allocation_permits_after(host, observed.registered_through)
             .await?;
         if batch.has_unissued_allocations {
             return Err(ControllerError::HostIdentity);
@@ -62,8 +62,7 @@ impl Controller {
         register.permits_json =
             serde_json::to_vec(&batch.permits).map_err(|_| ControllerError::HostIdentity)?;
         // A lost reply ends this attempt. The next tick inspects progress first.
-        let ack = self
-            .client
+        let ack = client
             .allocation_authority(register)
             .await
             .map_err(|_| ControllerError::Health)?
@@ -71,15 +70,25 @@ impl Controller {
         if ack.registered_through < expected || ack.registered_through > batch.issued_through {
             return Err(ControllerError::HostIdentity);
         }
-        self.accept_registration(&ack).await?;
+        self.accept_registration(host, epoch, &ack).await?;
         Ok(ack.registered_through)
     }
     pub(super) async fn prepare_launch_permit(
-        &mut self,
+        &self,
         claim: &Claim,
         allocation: &sandbox_store::placement::Allocation,
+        client: &mut SupervisorClient<Channel>,
+        authority: &tokio::sync::Mutex<()>,
     ) -> Result<Vec<u8>, ControllerError> {
-        let through = self.sync_allocation_authority().await?;
+        let through = self
+            .sync_allocation_authority(
+                allocation.host_id,
+                allocation.supervisor_epoch,
+                true,
+                client,
+                authority,
+            )
+            .await?;
         let owner = sandbox_protocol::supervisor::Ownership {
             host_id: allocation.host_id.to_string(),
             project_id: claim.project_id.to_string(),
