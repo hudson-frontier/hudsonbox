@@ -34,11 +34,15 @@ impl Controller {
             .file_sources
             .clone()
             .ok_or(ControllerError::InvalidConfig)?;
-        let action = match self
-            .store
-            .prepare_upload(claim, self.config.host, self.config.epoch)
-            .await
-        {
+        let mut route = match self.owner(claim).await? {
+            hosts::Owner::Ready(route) => Some(route),
+            hosts::Owner::Unavailable => return self.defer(claim).await,
+            hosts::Owner::None => None,
+        };
+        let (host, epoch) = route
+            .as_ref()
+            .map_or((self.config.host, self.config.epoch), |r| (r.host, r.epoch));
+        let action = match self.store.prepare_upload(claim, host, epoch).await {
             Ok(a) => a,
             Err(DispatchError::LostClaim) => return Ok(Tick::LostOwnership),
             Err(
@@ -51,6 +55,11 @@ impl Controller {
             Err(e) => return Err(e.into()),
         };
         let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        if route.is_none() && !matches!(action, UploadAction::Rejected | UploadAction::Source(_)) {
+            self.file_cache = None;
+            return self.upload_uncertain(claim).await;
+        }
+        let route = route.as_mut().ok_or(ControllerError::Unroutable);
         let mut written = None;
         let result = match action {
             UploadAction::Rejected => {
@@ -68,13 +77,13 @@ impl Controller {
                 },
                 Err(_) => return self.upload_uncertain(claim).await,
             },
-            UploadAction::Begin(request) => self.client.begin_file(request).await,
-            UploadAction::Commit(request) => self.client.commit_file(request).await,
+            UploadAction::Begin(request) => route?.client.begin_file(request).await,
+            UploadAction::Commit(request) => route?.client.commit_file(request).await,
             UploadAction::Abort(request) => {
                 self.file_cache = None;
-                self.client.abort_file(request).await
+                route?.client.abort_file(request).await
             }
-            UploadAction::Inspect(request) => self.client.inspect_file(request).await,
+            UploadAction::Inspect(request) => route?.client.inspect_file(request).await,
             UploadAction::Write {
                 request,
                 source,
@@ -130,7 +139,8 @@ impl Controller {
                     };
                 }
                 written = Some(end as u64);
-                self.client
+                route?
+                    .client
                     .write_file(FileWriteRequest {
                         request: Some(request),
                         offset,

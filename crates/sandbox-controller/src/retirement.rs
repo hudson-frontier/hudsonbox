@@ -2,18 +2,19 @@
 //! preparation and retained completion, never a missing host record, authorize
 //! each stage of the handoff.
 use crate::{Controller, ControllerConfig};
-use sandbox_protocol::supervisor::{
-    AllocationForgetRequest, AllocationMetadataRequest, supervisor_client::SupervisorClient,
+use sandbox_protocol::{
+    HostId,
+    supervisor::{AllocationForgetRequest, AllocationMetadataRequest},
 };
 use sandbox_store::{Store, allocation_retirement::Candidate};
 use std::time::Duration;
-use tonic::transport::Channel;
 
 #[derive(Debug)]
 pub struct Retirer {
     store: Store,
     config: ControllerConfig,
-    client: SupervisorClient<Channel>,
+    hosts: Controller,
+    host_cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub enum RetirementError {
     Rpc(#[source] tonic::Status),
     #[error("allocation retirement request encoding failed")]
     Encoding,
+    #[error("allocation owner host is not currently routable")]
+    Unroutable,
 }
 
 impl Controller {
@@ -38,7 +41,8 @@ impl Controller {
         Retirer {
             store: self.store.clone(),
             config: self.config.clone(),
-            client: self.archive_client.clone(),
+            hosts: self.worker(0),
+            host_cursor: 0,
         }
     }
 }
@@ -49,14 +53,27 @@ impl Retirer {
         if self.config.allow_simulated {
             return Ok(RetirementTick::Idle);
         }
-        let Some(candidate) = self
-            .store
-            .next_allocation_retirement(self.config.host, self.config.epoch)
-            .await?
-        else {
-            return Ok(RetirementTick::Idle);
-        };
-        match self.process(candidate).await {
+        let mut healthy = self.hosts.hosts.healthy();
+        if !healthy.is_empty() {
+            let first = self.host_cursor % healthy.len();
+            healthy.rotate_left(first);
+        }
+        self.host_cursor = self.host_cursor.wrapping_add(1);
+        for (host, epoch) in healthy {
+            if let Some(candidate) = self.store.next_allocation_retirement(host, epoch).await? {
+                return self.retire(host, epoch, candidate).await;
+            }
+        }
+        Ok(RetirementTick::Idle)
+    }
+
+    async fn retire(
+        &mut self,
+        host: HostId,
+        epoch: i64,
+        candidate: Candidate,
+    ) -> Result<RetirementTick, RetirementError> {
+        match self.process(host, epoch, candidate).await {
             Err(RetirementError::Store(
                 sandbox_store::allocation_retirement::Error::Ineligible,
             )) => Ok(RetirementTick::Deferred),
@@ -64,7 +81,17 @@ impl Retirer {
         }
     }
 
-    async fn process(&mut self, candidate: Candidate) -> Result<RetirementTick, RetirementError> {
+    async fn process(
+        &mut self,
+        host: HostId,
+        epoch: i64,
+        candidate: Candidate,
+    ) -> Result<RetirementTick, RetirementError> {
+        let mut route = self
+            .hosts
+            .route(host, epoch, true)
+            .await
+            .map_err(|_| RetirementError::Unroutable)?;
         let mut metadata = None;
         if let Some(intent) = &candidate.intent {
             if self
@@ -82,20 +109,15 @@ impl Retirer {
         } else {
             let Some(request) = self
                 .store
-                .prepare_allocation_retirement(
-                    candidate.allocation,
-                    self.config.host,
-                    self.config.epoch,
-                    120,
-                    false,
-                )
+                .prepare_allocation_retirement(candidate.allocation, host, epoch, 120, false)
                 .await?
             else {
                 return Ok(RetirementTick::Deferred);
             };
             let observed = tokio::time::timeout(
                 Duration::from_secs(30),
-                self.client
+                route
+                    .client
                     .retire_allocation_metadata(AllocationMetadataRequest {
                         request_json: request.encode().map_err(|_| RetirementError::Encoding)?,
                     }),
@@ -138,19 +160,14 @@ impl Retirer {
         }
         let Some(request) = self
             .store
-            .prepare_allocation_forgetting(
-                candidate.allocation,
-                self.config.host,
-                self.config.epoch,
-                120,
-            )
+            .prepare_allocation_forgetting(candidate.allocation, host, epoch, 120)
             .await?
         else {
             return Ok(RetirementTick::Deferred);
         };
         let observed = tokio::time::timeout(
             Duration::from_secs(30),
-            self.client.forget_allocation(AllocationForgetRequest {
+            route.client.forget_allocation(AllocationForgetRequest {
                 request_json: request.encode().map_err(|_| RetirementError::Encoding)?,
             }),
         )

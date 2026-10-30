@@ -15,21 +15,18 @@ pub trait FileReader: fmt::Debug + Send + Sync {
     fn release(&self, host: HostId, request: FileReleaseRequest) -> Reply<'_>;
 }
 pub struct FileClient {
-    host: HostId,
-    endpoint: String,
-    ca: Vec<u8>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
+    routes: crate::owners::OwnerRoutes,
     allow_simulated: bool,
 }
 impl fmt::Debug for FileClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FileClient")
-            .field("host", &self.host)
+            .field("routes", &self.routes)
             .finish_non_exhaustive()
     }
 }
 impl FileClient {
+    /// Legacy single-host reader.
     pub fn new(
         host: HostId,
         endpoint: String,
@@ -38,53 +35,48 @@ impl FileClient {
         key: Vec<u8>,
         allow_simulated: bool,
     ) -> anyhow::Result<Self> {
-        let uri: http::Uri = endpoint
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid file host endpoint"))?;
-        anyhow::ensure!(
-            uri.scheme_str() == Some("https")
-                && uri.host().is_some()
-                && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
-                && uri.path() == "/"
-                && uri.query().is_none(),
-            "invalid file host endpoint"
-        );
-        anyhow::ensure!(
-            [&ca, &cert, &key]
-                .iter()
-                .all(|v| !v.is_empty() && v.len() <= 65536),
-            "invalid file host TLS material"
-        );
+        Self::routed(
+            None,
+            Some((host, endpoint)),
+            &ca,
+            &cert,
+            &key,
+            allow_simulated,
+        )
+    }
+    /// Registry routing to each allocation owner, optionally keeping one legacy host.
+    pub fn routed(
+        store: Option<sandbox_store::Store>,
+        legacy: Option<(HostId, String)>,
+        ca: &[u8],
+        cert: &[u8],
+        key: &[u8],
+        allow_simulated: bool,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
-            host,
-            endpoint,
-            ca,
-            cert,
-            key,
+            routes: crate::owners::OwnerRoutes::new(store, legacy, ca, cert, key)
+                .map_err(|e| anyhow::anyhow!("file reader: {e}"))?,
             allow_simulated,
         })
     }
-    async fn connect(
-        &self,
-        host: HostId,
-    ) -> Result<
-        sandbox_protocol::supervisor::file_downloads_client::FileDownloadsClient<
-            tonic::transport::Channel,
-        >,
-        Problem,
-    > {
-        if host != self.host {
-            return Err(Problem::Unavailable);
-        }
-        sandbox_supervisor::transport::connect_file_reader(
-            &self.endpoint,
-            host,
-            &self.ca,
-            &self.cert,
-            &self.key,
+    async fn call<F, Fut>(&self, host: HostId, call: F) -> Result<FileAccessObservation, Problem>
+    where
+        F: FnOnce(
+            sandbox_protocol::supervisor::file_downloads_client::FileDownloadsClient<
+                tonic::transport::Channel,
+            >,
+        ) -> Fut,
+        Fut: Future<Output = Result<tonic::Response<FileAccessObservation>, tonic::Status>>,
+    {
+        let route = self.routes.owner_route(host).await?;
+        let client = sandbox_protocol::supervisor::file_downloads_client::FileDownloadsClient::new(
+            route.lease.channel.clone(),
         )
-        .await
-        .map_err(|_| Problem::Unavailable)
+        .max_decoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES);
+        let response = call(client).await;
+        self.routes.observe(&route, &response);
+        self.response(response)
     }
     fn response(
         &self,
@@ -99,42 +91,57 @@ impl FileClient {
         if reply.simulated && !self.allow_simulated {
             return Err(Problem::Unavailable);
         }
+        // The echoed scope (host, epoch, allocation) is compared by the caller.
         Ok(reply)
     }
 }
 impl FileReader for FileClient {
     fn capture(&self, host: HostId, r: FileCaptureRequest) -> Reply<'_> {
-        Box::pin(async move { self.response(self.connect(host).await?.capture(r).await) })
+        Box::pin(self.call(host, |mut c| async move { c.capture(r).await }))
     }
     fn read(&self, host: HostId, r: FileDownloadRequest) -> Reply<'_> {
-        Box::pin(async move { self.response(self.connect(host).await?.read(r).await) })
+        Box::pin(self.call(host, |mut c| async move { c.read(r).await }))
     }
     fn release(&self, host: HostId, r: FileReleaseRequest) -> Reply<'_> {
-        Box::pin(async move { self.response(self.connect(host).await?.release(r).await) })
+        Box::pin(self.call(host, |mut c| async move { c.release(r).await }))
     }
 }
 
 /// Optional operator wiring. API callers never supply an endpoint or TLS material.
 #[derive(Debug, clap::Args)]
 pub struct FileReaderArgs {
-    #[arg(long,requires_all=["file_endpoint","file_ca_cert","file_client_cert","file_client_key"])]
+    /// Legacy host addressed by `--file-endpoint` while its registry transport is NULL.
+    #[arg(long, requires_all=["file_endpoint","file_ca_cert","file_client_cert","file_client_key"])]
     file_host_id: Option<HostId>,
     #[arg(long, requires = "file_host_id")]
     file_endpoint: Option<String>,
-    #[arg(long, requires = "file_host_id")]
+    /// Route file reads to each allocation owner through the host registry.
+    #[arg(long, requires_all=["file_ca_cert","file_client_cert","file_client_key"])]
+    file_registry_routing: bool,
+    #[arg(long)]
     file_ca_cert: Option<std::path::PathBuf>,
-    #[arg(long, requires = "file_host_id")]
+    #[arg(long)]
     file_client_cert: Option<std::path::PathBuf>,
-    #[arg(long, requires = "file_host_id")]
+    #[arg(long)]
     file_client_key: Option<std::path::PathBuf>,
-    #[arg(long, requires = "file_host_id")]
+    #[arg(long)]
     allow_simulated_files: bool,
 }
 impl FileReaderArgs {
-    pub fn build(self) -> anyhow::Result<Option<std::sync::Arc<dyn FileReader>>> {
-        let Some(host) = self.file_host_id else {
+    pub fn build(
+        self,
+        store: &sandbox_store::Store,
+    ) -> anyhow::Result<Option<std::sync::Arc<dyn FileReader>>> {
+        if self.file_host_id.is_none() && !self.file_registry_routing {
+            anyhow::ensure!(
+                self.file_ca_cert.is_none()
+                    && self.file_client_cert.is_none()
+                    && self.file_client_key.is_none()
+                    && !self.allow_simulated_files,
+                "file reader options require --file-host-id or --file-registry-routing"
+            );
             return Ok(None);
-        };
+        }
         let read = |path: Option<std::path::PathBuf>| -> anyhow::Result<Vec<u8>> {
             use std::io::Read;
             let path = path.ok_or_else(|| anyhow::anyhow!("file reader TLS path required"))?;
@@ -145,13 +152,20 @@ impl FileReaderArgs {
             anyhow::ensure!(bytes.len() <= 65536, "file reader TLS material too large");
             Ok(bytes)
         };
-        Ok(Some(std::sync::Arc::new(FileClient::new(
-            host,
-            self.file_endpoint
-                .ok_or_else(|| anyhow::anyhow!("file endpoint required"))?,
-            read(self.file_ca_cert)?,
-            read(self.file_client_cert)?,
-            read(self.file_client_key)?,
+        let legacy = match self.file_host_id {
+            Some(host) => Some((
+                host,
+                self.file_endpoint
+                    .ok_or_else(|| anyhow::anyhow!("file endpoint required"))?,
+            )),
+            None => None,
+        };
+        Ok(Some(std::sync::Arc::new(FileClient::routed(
+            self.file_registry_routing.then(|| store.clone()),
+            legacy,
+            &read(self.file_ca_cert)?,
+            &read(self.file_client_cert)?,
+            &read(self.file_client_key)?,
             self.allow_simulated_files,
         )?)))
     }

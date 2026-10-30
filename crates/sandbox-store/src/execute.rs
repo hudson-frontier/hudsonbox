@@ -252,6 +252,24 @@ impl Store {
         })
     }
 
+    /// Remember lost owner authentication without inventing an outcome for
+    /// work with a dispatch intent. The normal prepare path rejects only work
+    /// independently proven never dispatched, even after maintenance recovers.
+    pub async fn fence_unavailable_execute(&self, claim: &Claim) -> Result<(), DispatchError> {
+        let mut tx = self.pool().begin().await?;
+        let ctx = context(&mut tx, claim).await?;
+        if ctx.op.try_get::<i32, _>("attempt_count")? == 0
+            && ctx.op.try_get::<String, _>("status")? != "unknown"
+            && ctx.op.try_get::<serde_json::Value, _>("attempt_receipts")? == json!([])
+        {
+            dispatch::fence(&mut tx, claim).await?;
+            sqlx::query("UPDATE operations SET phase='execution_owner_unavailable',updated_at=clock_timestamp() WHERE id=$1")
+                .bind(claim.operation_id.uuid()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Commit exactly one dispatch intent. Later calls inspect or cancel, including
     /// unknown outcomes and calls after revocation, expiry, destroy, or host loss.
     pub async fn prepare_execute(
@@ -344,7 +362,10 @@ impl Store {
         // Dispatched/unknown work took the inspection path above.
         let rejection = if !authorized.0 {
             Some("execution_authority_expired")
-        } else if !current {
+        } else if !current
+            || op.try_get::<Option<String>, _>("phase")?.as_deref()
+                == Some("execution_owner_unavailable")
+        {
             Some("execution_target_changed")
         } else if !has_capacity(&mut tx, allocation, None).await? {
             Some("execution_capacity_exhausted")

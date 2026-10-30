@@ -43,18 +43,7 @@ impl WorkerPool {
         let mut tasks = JoinSet::new();
         let (stop, stopping) = watch::channel(false);
         for index in 0..count {
-            let mut worker = Controller {
-                new_work_compatible: controller.new_work_compatible,
-                launch_permits_required: controller.launch_permits_required,
-                store: controller.store.clone(),
-                config: controller.config.clone(),
-                client: controller.client.clone(),
-                archive_client: controller.archive_client.clone(),
-                operation_cursor: index as usize,
-                authority_sync: controller.authority_sync.clone(),
-                file_sources: controller.file_sources.clone(),
-                file_cache: None,
-            };
+            let mut worker = controller.worker(index as usize);
             let mut signal = listener.subscribe();
             let mut stopping = WorkerShutdown(stopping.clone());
             tasks.spawn(async move {

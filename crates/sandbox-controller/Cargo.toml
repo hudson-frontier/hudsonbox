@@ -19,6 +19,7 @@ sandbox-protocol = { workspace = true }
 sandbox-store = { workspace = true }
 sandbox-supervisor = { workspace = true }
 anyhow = { workspace = true }
+futures-util = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }

@@ -55,14 +55,17 @@ struct ServeArgs {
     live_host_id: Option<sandbox_protocol::HostId>,
     #[arg(long, requires = "live_host_id")]
     live_endpoint: Option<String>,
-    #[arg(long, requires = "live_host_id")]
+    /// Route live reads to each allocation owner through the host registry.
+    #[arg(long, requires_all = ["live_ca_cert", "live_client_cert", "live_client_key"])]
+    live_registry_routing: bool,
+    #[arg(long)]
     live_ca_cert: Option<PathBuf>,
-    #[arg(long, requires = "live_host_id")]
+    #[arg(long)]
     live_client_cert: Option<PathBuf>,
-    #[arg(long, requires = "live_host_id")]
+    #[arg(long)]
     live_client_key: Option<PathBuf>,
     /// Explicit development opt-in for a configured fake reader host.
-    #[arg(long, requires = "live_host_id")]
+    #[arg(long)]
     allow_simulated_live: bool,
     #[command(flatten)]
     files: Box<sandbox_api::files::client::FileReaderArgs>,
@@ -101,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
                 file_source_config,
                 live_host_id,
                 live_endpoint,
+                live_registry_routing,
                 live_ca_cert,
                 live_client_cert,
                 live_client_key,
@@ -115,35 +119,45 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = shutdown_signal()?;
             let store = store().await?;
             let output = load_output(output_config.as_deref())?;
-            let live = match live_host_id {
-                None => None,
-                Some(host) => {
-                    let read = |path: Option<PathBuf>| -> anyhow::Result<Vec<u8>> {
-                        use std::io::Read;
-                        let path = path.context("live TLS file required")?;
-                        let mut bytes = Vec::new();
-                        std::fs::File::open(path)
-                            .context("opening live TLS file")?
-                            .take(65537)
-                            .read_to_end(&mut bytes)
-                            .context("reading live TLS file")?;
-                        anyhow::ensure!(bytes.len() <= 65536, "live TLS file too large");
-                        Ok(bytes)
-                    };
-                    Some(
-                        std::sync::Arc::new(sandbox_api::streams::live::LiveClient::new(
-                            host,
-                            live_endpoint.context("live endpoint required")?,
-                            read(live_ca_cert)?,
-                            read(live_client_cert)?,
-                            read(live_client_key)?,
-                            allow_simulated_live,
-                        )?)
-                            as std::sync::Arc<dyn sandbox_api::streams::live::LiveReader>,
-                    )
-                }
+            let live = if live_host_id.is_none() && !live_registry_routing {
+                anyhow::ensure!(
+                    live_ca_cert.is_none()
+                        && live_client_cert.is_none()
+                        && live_client_key.is_none()
+                        && !allow_simulated_live,
+                    "live reader options require --live-host-id or --live-registry-routing"
+                );
+                None
+            } else {
+                let read = |path: Option<PathBuf>| -> anyhow::Result<Vec<u8>> {
+                    use std::io::Read;
+                    let path = path.context("live TLS file required")?;
+                    let mut bytes = Vec::new();
+                    std::fs::File::open(path)
+                        .context("opening live TLS file")?
+                        .take(65537)
+                        .read_to_end(&mut bytes)
+                        .context("reading live TLS file")?;
+                    anyhow::ensure!(bytes.len() <= 65536, "live TLS file too large");
+                    Ok(bytes)
+                };
+                let legacy = match live_host_id {
+                    Some(host) => Some((host, live_endpoint.context("live endpoint required")?)),
+                    None => None,
+                };
+                Some(
+                    std::sync::Arc::new(sandbox_api::streams::live::LiveClient::routed(
+                        live_registry_routing.then(|| store.clone()),
+                        legacy,
+                        &read(live_ca_cert)?,
+                        &read(live_client_cert)?,
+                        &read(live_client_key)?,
+                        allow_simulated_live,
+                    )?)
+                        as std::sync::Arc<dyn sandbox_api::streams::live::LiveReader>,
+                )
             };
-            let files = (*files).build()?;
+            let files = (*files).build(&store)?;
             let sources = file_source_config
                 .map(|p| sandbox_artifacts::S3Config::read_private(&p)?.build_sources())
                 .transpose()?

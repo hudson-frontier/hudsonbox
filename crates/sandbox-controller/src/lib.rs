@@ -1,9 +1,11 @@
-//! One configured host, durable create/destroy dispatch, and reconciliation over mTLS.
-//! The supervisor is trusted only after its certificate, host ID, and epoch match.
+//! Durable create/destroy dispatch and reconciliation over per-host mTLS.
+//! Each request goes to its allocation's persisted owner host and epoch; a
+//! supervisor is trusted only after its certificate, host ID, and epoch match.
 mod allocation_authority;
 pub mod archive;
 pub mod history;
 pub mod host_discovery;
+mod hosts;
 mod recovery;
 pub mod retirement;
 mod uploads;
@@ -25,10 +27,18 @@ use sandbox_store::{
     leases::{AllocationClaim, LeaseAction, LeaseResult},
     placement::{PlacementError, Reservation},
 };
-use sandbox_supervisor::transport::{self, TransportError};
-use std::collections::BTreeSet;
+use sandbox_supervisor::{
+    routing::RouteError,
+    transport::{self, TransportError},
+};
+use std::{collections::BTreeSet, sync::Arc};
 use tonic::transport::Channel;
 
+pub use hosts::{HEALTH_CONCURRENCY, HEALTH_DEADLINE};
+
+/// `endpoint`, `host` and `epoch` name the configured host: the placement target
+/// for new creates and the legacy address of that host while its registry
+/// transport is NULL. Registered hosts are addressed only by their registration.
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
     pub endpoint: String,
@@ -53,6 +63,14 @@ pub enum ControllerError {
     #[error(transparent)]
     Transport(#[from] TransportError),
     #[error(transparent)]
+    Route(#[from] RouteError),
+    #[error("owner host is unregistered, unaddressed, unhealthy or at another epoch")]
+    Unroutable,
+    #[error(transparent)]
+    Registry(#[from] sandbox_store::host_registry::RegistryError),
+    #[error(transparent)]
+    Store(#[from] sandbox_store::StoreError),
+    #[error(transparent)]
     Claim(#[from] ClaimError),
     #[error(transparent)]
     Placement(#[from] PlacementError),
@@ -73,14 +91,11 @@ pub enum Tick {
 
 #[derive(Debug)]
 pub struct Controller {
-    new_work_compatible: bool,
-    launch_permits_required: bool,
     store: Store,
     config: ControllerConfig,
-    client: SupervisorClient<Channel>,
-    archive_client: SupervisorClient<Channel>,
+    hosts: Arc<hosts::Hosts>,
     operation_cursor: usize,
-    authority_sync: std::sync::Arc<tokio::sync::Mutex<()>>,
+    host_cursor: usize,
     file_sources: Option<std::sync::Arc<dyn sandbox_artifacts::sources::SourceBackend>>,
     file_cache: uploads::FileCache,
 }
@@ -102,73 +117,43 @@ impl Controller {
         {
             return Err(ControllerError::InvalidConfig);
         }
-        let client = transport::connect(&config.endpoint, config.host, ca, cert, key).await?;
-        let archive_client =
-            transport::connect_archiver(&config.endpoint, config.host, ca, cert, key).await?;
-        let mut controller = Self {
-            new_work_compatible: true,
-            launch_permits_required: false,
+        let hosts = Arc::new(hosts::Hosts::new(ca, cert, key)?);
+        let controller = Self {
             store,
             config,
-            client,
-            archive_client,
+            hosts,
             operation_cursor: 0,
-            authority_sync: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            host_cursor: 0,
             file_sources: None,
             file_cache: None,
         };
-        controller.check_host().await?;
+        // The configured host must authenticate at startup, as in single-host mode.
+        let address = controller
+            .resolve(controller.config.host)
+            .await?
+            .ok_or(ControllerError::InvalidConfig)?;
+        controller.check_host(address).await?;
         Ok(controller)
     }
 
-    async fn check_host(&mut self) -> Result<(), ControllerError> {
-        let health = self
-            .client
-            .health(HealthRequest {})
-            .await
-            .map_err(|_| ControllerError::Health)?
-            .into_inner();
-        if health.host_id != self.config.host.to_string()
-            || health.supervisor_epoch != self.config.epoch
-            || (health.simulated && !self.config.allow_simulated)
-        {
-            return Err(ControllerError::HostIdentity);
+    /// A worker sharing this controller's connections and host observations.
+    pub(crate) fn worker(&self, operation_cursor: usize) -> Self {
+        Self {
+            store: self.store.clone(),
+            config: self.config.clone(),
+            hosts: self.hosts.clone(),
+            operation_cursor,
+            host_cursor: operation_cursor,
+            file_sources: self.file_sources.clone(),
+            file_cache: None,
         }
-        self.launch_permits_required = health.launch_permits_required;
-        self.sync_allocation_authority().await?;
-        // This only touches the existing operator-provisioned epoch. Registration
-        // and epoch issuance remain separate; the RPC cannot insert arbitrary hosts.
-        let observed = self
-            .store
-            .observe_configured_host_with_capabilities(
-                self.config.host,
-                self.config.epoch,
-                &health.capabilities_json,
-                health.simulated,
-            )
-            .await;
-        match observed {
-            Ok(()) => self.new_work_compatible = true,
-            Err(DispatchError::HostCompatibility) => {
-                self.store
-                    .invalidate_host_capability_observation(self.config.host, self.config.epoch)
-                    .await?;
-                if self.new_work_compatible {
-                    eprintln!(
-                        "Host compatibility changed: new work denied; retained work still requires reconciliation and explicit cleanup."
-                    );
-                }
-                self.new_work_compatible = false;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        Ok(())
     }
 
     /// Admission status only; true also includes unqualified legacy mode.
     /// Incompatible but authenticated hosts remain available for retained cleanup.
+    /// Reports the configured host.
     pub fn new_work_compatible(&self) -> bool {
-        self.new_work_compatible
+        self.hosts.new_work_compatible(self.config.host)
     }
 
     async fn defer(&self, claim: &Claim) -> Result<Tick, ControllerError> {
@@ -214,6 +199,11 @@ impl Controller {
         if let Some(tick) = self.previous_tick(claim).await? {
             return Ok(tick);
         }
+        // Resolve the owner before committing another stop attempt.
+        let mut route = match self.owner(claim).await? {
+            hosts::Owner::Ready(route) => route,
+            hosts::Owner::Unavailable | hosts::Owner::None => return self.defer(claim).await,
+        };
         let action = match self.store.prepare_destroy(claim, false).await {
             Ok(action) => action,
             Err(DispatchError::LostClaim) => return Ok(Tick::LostOwnership),
@@ -223,21 +213,20 @@ impl Controller {
         let owner = match &action {
             DestroyAction::Stop(owner) | DestroyAction::Inspect(owner) => owner,
         };
-        if owner.host_id != self.config.host.to_string()
-            || owner.supervisor_epoch != self.config.epoch
-        {
+        if !route.owns(owner) {
             return self.defer(claim).await;
         }
         let response = match action {
             DestroyAction::Stop(owner) => {
-                self.client
+                route
+                    .client
                     .stop(StopRequest {
                         ownership: Some(owner),
                     })
                     .await
             }
             DestroyAction::Inspect(owner) => {
-                match self
+                match route
                     .client
                     .inspect(InspectRequest {
                         ownership: Some(owner.clone()),
@@ -262,7 +251,11 @@ impl Controller {
                         let DestroyAction::Stop(owner) = next else {
                             return self.destroy_unknown(claim).await;
                         };
-                        self.client
+                        if !route.owns(&owner) {
+                            return self.destroy_unknown(claim).await;
+                        }
+                        route
+                            .client
                             .stop(StopRequest {
                                 ownership: Some(owner),
                             })
@@ -315,13 +308,29 @@ impl Controller {
     }
 
     /// One due allocation per tick, independently of operation queue pressure.
+    /// Healthy hosts take turns so one host's backlog cannot starve another's.
     async fn maintenance_tick(&mut self) -> Result<Tick, ControllerError> {
-        let Some(claim) = self
-            .store
-            .claim_allocation(self.config.host, self.config.epoch, 10)
-            .await?
-        else {
-            return Ok(Tick::Idle);
+        let hosts = self.hosts.healthy();
+        let first = self.host_cursor;
+        self.host_cursor = self.host_cursor.wrapping_add(1);
+        for offset in 0..hosts.len() {
+            let (host, epoch) = hosts[(first + offset) % hosts.len()];
+            if let Some(claim) = self.store.claim_allocation(host, epoch, 10).await? {
+                return self.maintain(claim, host, epoch).await;
+            }
+        }
+        Ok(Tick::Idle)
+    }
+
+    async fn maintain(
+        &mut self,
+        claim: AllocationClaim,
+        host: HostId,
+        epoch: i64,
+    ) -> Result<Tick, ControllerError> {
+        let mut route = match self.route(host, epoch, false).await {
+            Ok(route) => route,
+            Err(_) => return self.lease_error(&claim, DispatchError::Conflict).await,
         };
         let action = match self.store.prepare_lease(&claim).await {
             Ok(action) => action,
@@ -329,9 +338,10 @@ impl Controller {
         };
         let response = match action {
             LeaseAction::Cleanup(_) => return Ok(Tick::Maintained),
-            LeaseAction::Renew(request) => self.client.renew_lease(request).await,
+            LeaseAction::Renew(request) => route.client.renew_lease(request).await,
             LeaseAction::Inspect(owner) => {
-                self.client
+                route
+                    .client
                     .inspect_lease(LeaseInspection {
                         ownership: Some(owner),
                     })
@@ -377,12 +387,8 @@ impl Controller {
             // A previously committed claim expires normally; lifecycle continues.
             Err(_) => Some(Tick::Deferred),
         };
-        if let Err(error) = self.check_host().await {
-            self.store
-                .mark_host_runtime_unknown(self.config.host, self.config.epoch)
-                .await?;
-            return cancellation.map(Ok).unwrap_or(Err(error));
-        }
+        // Failed hosts are marked unknown and excluded; the rest still progress.
+        let unhealthy = self.check_hosts().await?;
         let maintenance = self.maintenance_tick().await?;
         let kinds = [
             OperationKind::Destroy,
@@ -406,7 +412,12 @@ impl Controller {
                 };
             }
         }
-        Ok(cancellation.unwrap_or(maintenance))
+        match (cancellation, maintenance, unhealthy) {
+            (Some(tick), _, _) => Ok(tick),
+            // Report a host failure only when no other work progressed.
+            (None, Tick::Idle, Some(error)) => Err(error),
+            (None, tick, _) => Ok(tick),
+        }
     }
 
     async fn create_tick(&mut self, claim: &Claim) -> Result<Tick, ControllerError> {
@@ -438,18 +449,18 @@ impl Controller {
         let allocation = match reservation {
             Reservation::Reserved(a) | Reservation::Existing(a) => a,
         };
-        if allocation.host_id != self.config.host
-            || allocation.supervisor_epoch != self.config.epoch
+        // Route to the reservation's persisted owner, including a retried
+        // reservation made earlier on another host, before committing intent.
+        let mut route = match self
+            .route(allocation.host_id, allocation.supervisor_epoch, false)
+            .await
         {
-            return self.defer(claim).await;
-        }
-        let launch_permit = if self.launch_permits_required {
-            match self.prepare_launch_permit(claim, &allocation).await {
-                Ok(permit) => permit,
-                Err(_) => return self.defer(claim).await,
-            }
-        } else {
-            Vec::new()
+            Ok(route) => route,
+            Err(_) => return self.defer(claim).await,
+        };
+        let launch_permit = match self.route_permit(&mut route, claim, &allocation).await {
+            Ok(permit) => permit,
+            Err(_) => return self.defer(claim).await,
         };
         let action = match self
             .store
@@ -478,11 +489,18 @@ impl Controller {
         };
         let response = match action {
             CreateAction::Start(mut request) => {
+                if !request.ownership.as_ref().is_some_and(|o| route.owns(o)) {
+                    return self.unknown(claim).await;
+                }
                 request.launch_permit_json = launch_permit;
-                self.client.create(request).await
+                route.client.create(request).await
             }
             CreateAction::Inspect(owner) => {
-                self.client
+                if !route.owns(&owner) {
+                    return self.unknown(claim).await;
+                }
+                route
+                    .client
                     .inspect(InspectRequest {
                         ownership: Some(owner),
                     })
@@ -521,11 +539,21 @@ impl Controller {
     async fn execute_tick(&mut self, claim: &Claim) -> Result<Tick, ControllerError> {
         use sandbox_protocol::supervisor::{CommandInspection, CommandRequest};
         use sandbox_store::execute::ExecuteAction;
-        let action = match self
-            .store
-            .prepare_execute(claim, self.config.host, self.config.epoch)
-            .await
-        {
+        // An owned sandbox is routed before any dispatch intent commits. Without
+        // an owner, only database-side outcomes (rejection, cancellation) apply.
+        let mut route = match self.owner(claim).await? {
+            hosts::Owner::Ready(route) => Some(route),
+            hosts::Owner::Unavailable => match self.store.fence_unavailable_execute(claim).await {
+                Ok(()) => return self.defer(claim).await,
+                Err(DispatchError::LostClaim) => return Ok(Tick::LostOwnership),
+                Err(error) => return Err(error.into()),
+            },
+            hosts::Owner::None => None,
+        };
+        let (host, epoch) = route
+            .as_ref()
+            .map_or((self.config.host, self.config.epoch), |r| (r.host, r.epoch));
+        let action = match self.store.prepare_execute(claim, host, epoch).await {
             Ok(a) => a,
             Err(DispatchError::LostClaim) => return Ok(Tick::LostOwnership),
             Err(DispatchError::Conflict | DispatchError::HostUnavailable) => {
@@ -539,14 +567,13 @@ impl Controller {
             | ExecuteAction::Inspect { owner, .. }
             | ExecuteAction::Cancel { owner, .. } => owner,
         };
-        if owner.host_id != self.config.host.to_string()
-            || owner.supervisor_epoch != self.config.epoch
-        {
+        let Some(route) = route.as_mut().filter(|r| r.owns(owner)) else {
             return self.execute_unknown(claim).await;
-        }
+        };
         let response = match action {
             ExecuteAction::Dispatch { owner, command } => {
-                self.client
+                route
+                    .client
                     .execute_command(CommandRequest {
                         ownership: Some(owner),
                         command: Some((&command).into()),
@@ -554,7 +581,8 @@ impl Controller {
                     .await
             }
             ExecuteAction::Inspect { owner, digest } => {
-                self.client
+                route
+                    .client
                     .inspect_command(CommandInspection {
                         ownership: Some(owner),
                         command_digest: digest.to_vec(),
@@ -562,7 +590,8 @@ impl Controller {
                     .await
             }
             ExecuteAction::Cancel { owner, digest } => {
-                self.client
+                route
+                    .client
                     .cancel_command(CommandInspection {
                         ownership: Some(owner),
                         command_digest: digest.to_vec(),
