@@ -80,7 +80,7 @@ async fn duplicate_intents_claim_races_and_stale_retry(pool: PgPool) {
         host: HostId::generate(),
         epoch: 1,
         action: Action::Provision {
-            config: provision(Some(p)),
+            config: Box::new(provision(Some(p))),
         },
     };
     let (a, b) = tokio::join!(
@@ -209,7 +209,7 @@ async fn pending_operations_block_type_change_and_pool_mismatch(pool: PgPool) {
     assert!(store.claim_capacity(p, 0).await.is_err());
     let bad = Request {
         action: Action::Provision {
-            config: provision(Some(other)),
+            config: Box::new(provision(Some(other))),
         },
         ..request
     };
@@ -372,14 +372,14 @@ async fn concurrent_provision_respects_inventory_bound_and_durable_target(pool: 
         host: HostId::generate(),
         epoch: 1,
         action: Action::Provision {
-            config: provision(Some(p)),
+            config: Box::new(provision(Some(p))),
         },
     };
     let second = Request {
         host: HostId::generate(),
         epoch: 1,
         action: Action::Provision {
-            config: provision(Some(p)),
+            config: Box::new(provision(Some(p))),
         },
     };
     store.enqueue_capacity(p, "a", &first).await.unwrap();
@@ -396,4 +396,157 @@ async fn concurrent_provision_respects_inventory_bound_and_durable_target(pool: 
     assert_ne!(x.is_ok(), y.is_ok());
     assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 1);
     assert!(store.registered_host(impostor).await.unwrap().is_none());
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn retire_then_replace_at_max_preserves_history_without_spending_slot(pool: PgPool) {
+    use sandbox_store::host_registry::HostTransport;
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    let mut one = spec(p, "replace");
+    one.max_hosts = 1;
+    store.put_host_pool(&one).await.unwrap();
+    let old = HostId::generate();
+    store
+        .provision_host(old, 1, &provision(Some(p)))
+        .await
+        .unwrap();
+    let transport = HostTransport {
+        version: 1,
+        endpoint: "https://machine.internal:7443".into(),
+        certificate_sha256: "a".repeat(64),
+        provider_ref: Some("static/machine".into()),
+    };
+    store.set_host_transport(old, 1, &transport).await.unwrap();
+    store
+        .observe_configured_host_with_capabilities(old, 1, &capabilities().to_json().unwrap(), true)
+        .await
+        .unwrap();
+    let replacement = HostId::generate();
+    assert!(
+        store
+            .provision_host(replacement, 1, &provision(Some(p)))
+            .await
+            .is_err()
+    );
+    store
+        .enqueue_capacity(
+            p,
+            "retire",
+            &Request {
+                host: old,
+                epoch: 1,
+                action: Action::Retire,
+            },
+        )
+        .await
+        .unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    store.apply_static_capacity(&claim).await.unwrap();
+    assert_eq!(store.host_pool(p).await.unwrap().unwrap().enrolled_hosts, 0);
+    store
+        .provision_host(replacement, 1, &provision(Some(p)))
+        .await
+        .unwrap();
+    store
+        .set_host_transport(replacement, 1, &transport)
+        .await
+        .unwrap();
+    let hosts = store.registered_hosts(Some(p)).await.unwrap();
+    assert_eq!(hosts.len(), 2);
+    assert!(
+        hosts
+            .iter()
+            .find(|h| h.host_id == old)
+            .unwrap()
+            .capacity_retired
+    );
+    assert_eq!(store.host_pool(p).await.unwrap().unwrap().enrolled_hosts, 1);
+    assert!(
+        store
+            .provision_host(HostId::generate(), 1, &provision(Some(p)))
+            .await
+            .is_err()
+    );
+    // Tombstone retains its registration, but no maintenance retry may reopen.
+    assert_eq!(
+        store
+            .registered_host(old)
+            .await
+            .unwrap()
+            .unwrap()
+            .transport
+            .unwrap()
+            .endpoint,
+        transport.endpoint
+    );
+    assert!(store.finish_host_drain(old, 1).await.is_err());
+    store
+        .observe_configured_host_with_capabilities(
+            replacement,
+            1,
+            &capabilities().to_json().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    store
+        .enqueue_capacity(
+            p,
+            "retire-replacement",
+            &Request {
+                host: replacement,
+                epoch: 1,
+                action: Action::Retire,
+            },
+        )
+        .await
+        .unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    store.apply_static_capacity(&claim).await.unwrap();
+    // All workers are retired and no intent remains unfinished: reconfigure
+    // adapter type, preserving both historical host identities and receipts.
+    let mut k8s = one;
+    k8s.pool_type = PoolType::K8s;
+    k8s.provider_config =
+        json!({"version":1,"namespace":"workers","worker_label_selector":"app=supervisor"});
+    assert_eq!(
+        store.put_host_pool(&k8s).await.unwrap().pool_type,
+        PoolType::K8s
+    );
+    assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 2);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn pending_intent_bound_is_serialized_and_exact_retry_survives_bound(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "queue-bound")).await.unwrap();
+    let request = Request {
+        host: HostId::generate(),
+        epoch: 1,
+        action: Action::Status,
+    };
+    let retained = store
+        .enqueue_capacity(p, "retained", &request)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO capacity_operations(id,host_pool_id,kind,target_ref,idempotency_key,request) SELECT gen_random_uuid(),$1,'status','fixture',n::text,$2 FROM generate_series(1,998) n")
+        .bind(p).bind(serde_json::to_value(&request).unwrap()).execute(&pool).await.unwrap();
+    let (a, b) = tokio::join!(
+        store.enqueue_capacity(p, "last-a", &request),
+        store.enqueue_capacity(p, "last-b", &request)
+    );
+    assert_ne!(a.is_ok(), b.is_ok());
+    assert_eq!(
+        store
+            .enqueue_capacity(p, "retained", &request)
+            .await
+            .unwrap(),
+        retained
+    );
+    assert!(matches!(
+        store.enqueue_capacity(p, "overflow", &request).await,
+        Err(Error::Invalid)
+    ));
 }

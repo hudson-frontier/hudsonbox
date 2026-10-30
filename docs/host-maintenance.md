@@ -334,8 +334,12 @@ Pool-scoped exact retries preserve the ID and receipt; changed input conflicts.
 Only one live claim can apply an intent. Expired/replaced claims cannot commit
 host effects or receipts. Static effects and completion commit in one database
 transaction; future external providers must reconcile external receipts and
-fencing before replaying uncertain calls. The trait alone does not supply that
-protocol. Pending operations prevent pool type changes even with zero hosts.
+fencing before replaying uncertain calls. The router rejects stale claims
+before selecting the adapter. Unfinished intent blocks pool type changes;
+future adapters must also freeze effect-defining configuration/credential
+references and enforce provider-side idempotency or fencing at dispatch.
+A lease check before a network call cannot prevent expiry during that call.
+The trait alone does not supply that protocol. Pending operations prevent pool type changes even with zero hosts.
 
 Use the existing private database configuration and `0600` input-file rules:
 
@@ -365,8 +369,10 @@ expiry, provider disappearance or operator assertion never releases capacity.
 Retire records a permanent tombstone while preserving the host, transport,
 histories and foreign keys. It cannot reopen through finish-drain, enrollment
 retry or epoch advancement. It does not authorize physical machine termination.
-Tombstones conservatively still count against `max_hosts`; reclamation of that
-inventory slot is outside this adapter.
+Retired tombstones do not count against `max_hosts`, demand inventory or pool
+type-change worker counts. Active-only endpoint/certificate/provider-reference
+uniqueness permits replacement enrollment while retaining historical identity.
+Pool type changes still require no active workers or unfinished capacity work.
 
 Each tick claims at most one intent, with a 30-second lease and no background
 retry loop. On refusal or a lost response, inspect `capacity-status`, resolve the
@@ -376,10 +382,17 @@ the store exposes fenced explicit retry. Outstanding intents are bounded to
 deleted. Inventory reads retain the registry's 10000-host bound. Demand is an
 explicit advisory input (at most 100000 waiting sandboxes, 1–100000 sandboxes per
 host, at most 1000 additional hosts); the plan caps additions by `max_hosts`,
-existing inventory, minimum ready workers and the operator's request budget.
+active inventory, minimum ready workers and the operator's request budget.
 It cannot infer compatibility, actual packing or resource guarantees from a
 sandbox count and makes no automatic provision or scale-down decision.
 
-Portable PostgreSQL tests are in `sandbox-store/tests/capacity.rs`. Their execution
-is pending the shared build slot; no new portable pass or real Linux/KVM drain,
-retirement, performance or isolation evidence is claimed here.
+Portable PostgreSQL tests are in
+[`sandbox-store/tests/capacity.rs`](../crates/sandbox-store/tests/capacity.rs)
+and [`sandbox-controller/tests/capacity.rs`](../crates/sandbox-controller/tests/capacity.rs).
+They cover upgrade preservation, claims/retries, occupied/uncertain retirement,
+retire-then-replace at `max_hosts`, bounded intent queues, adapter routing and
+advisory demand. Their Rust execution is pending the shared build slot. A light
+psql check of the full migration chain, pre-0027 host preservation and lease/
+receipt constraints passed in an isolated temporary database on the existing
+local PostgreSQL service. No real Linux/KVM drain, retirement, performance or
+isolation evidence is claimed here.

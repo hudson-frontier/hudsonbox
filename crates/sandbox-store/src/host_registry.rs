@@ -232,6 +232,7 @@ pub struct HostPool {
     pub placement_policy: PlacementPolicy,
     pub provider_config: ProviderConfig,
     pub credential_secret_ref: Option<String>,
+    /// Active workers; retained retired identities do not spend pool slots.
     pub enrolled_hosts: i64,
 }
 
@@ -419,7 +420,7 @@ fn pool_from_row(row: &sqlx::postgres::PgRow) -> Result<HostPool, RegistryError>
 }
 
 const POOL_SELECT: &str = "SELECT p.id,p.name,p.type,p.min_ready_hosts,p.max_hosts,p.placement_policy,
-    p.provider_config,p.credential_secret_ref,(SELECT count(*) FROM hosts h WHERE h.host_pool_id=p.id) enrolled_hosts
+    p.provider_config,p.credential_secret_ref,(SELECT count(*) FROM hosts h WHERE h.host_pool_id=p.id AND h.capacity_retired_at IS NULL) enrolled_hosts
     FROM host_pools p";
 
 fn host_from_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredHost, RegistryError> {
@@ -472,8 +473,8 @@ const HOST_SELECT: &str = "SELECT h.id,h.host_pool_id,p.type,h.status,(h.capacit
 
 impl Store {
     /// Create or update a pool under operator authority. A type change is
-    /// refused while any host is enrolled: hosts carry every reservation and
-    /// unfinished operation, and are never deleted or moved between pools.
+    /// refused while any active worker or unfinished capacity intent remains.
+    /// Retired identities retain their history without spending worker slots.
     pub async fn put_host_pool(&self, spec: &HostPoolSpec) -> Result<HostPool, RegistryError> {
         let config = spec.validate()?.to_value()?;
         let policy =

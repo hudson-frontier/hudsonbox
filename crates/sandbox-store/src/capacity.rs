@@ -29,7 +29,7 @@ pub enum Error {
 pub enum Action {
     /// Enroll an existing operator-supplied machine; never create infrastructure.
     Provision {
-        config: HostProvision,
+        config: Box<HostProvision>,
     },
     Status,
     Drain,
@@ -63,6 +63,19 @@ pub struct Claim {
 
 pub const MAX_PENDING: i64 = 1000;
 impl Store {
+    /// Routers validate live ownership before selecting an adapter. Pool type
+    /// cannot change while this intent is unfinished (including expired claims).
+    /// External providers still need their own idempotency/fencing protocol:
+    /// ownership may expire after this check and before a network call finishes.
+    pub async fn validate_capacity_claim(&self, claim: &Claim) -> Result<(), Error> {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 AND claim_revision=$3 AND status='running' AND lease_expires_at>clock_timestamp())")
+            .bind(claim.id).bind(claim.pool).bind(claim.revision).fetch_one(self.pool()).await?;
+        if !valid {
+            return Err(Error::LostClaim);
+        }
+        Ok(())
+    }
+
     pub async fn capacity_operation(&self, id: Uuid) -> Result<Option<Value>, Error> {
         Ok(
             sqlx::query_scalar("SELECT to_jsonb(c) FROM capacity_operations c WHERE id=$1")
