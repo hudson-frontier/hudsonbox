@@ -321,7 +321,7 @@ pub(crate) async fn provision_in(
     // Lock the pool before the host: serializes with pool type changes and
     // bounds enrollment by max_hosts. A host never moves between pools.
     let (max_hosts, enrolled, exists): (i32, i64, bool) = sqlx::query_as(
-        "SELECT max_hosts,(SELECT count(*) FROM hosts WHERE host_pool_id=$1),
+        "SELECT max_hosts,(SELECT count(*) FROM hosts WHERE host_pool_id=$1 AND capacity_retired_at IS NULL),
             EXISTS(SELECT 1 FROM hosts WHERE id=$2) FROM host_pools WHERE id=$1 FOR UPDATE",
     )
     .bind(pool)

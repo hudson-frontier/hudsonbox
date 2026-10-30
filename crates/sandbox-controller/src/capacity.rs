@@ -11,7 +11,13 @@ use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 pub type CapacityFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, Error>> + Send + 'a>>;
 /// Future adapters must persist/reconcile external provider receipts before
-/// retrying uncertain effects. A database lease alone cannot fence a provider.
+/// retrying uncertain effects. Use the durable operation ID as the provider
+/// idempotency identity; revalidate the claim/type at the dispatch boundary and
+/// retain unfinished intent until external effects are reconciled. Pool type
+/// changes are blocked for unfinished intent, but config may be updated: freeze
+/// any effect-defining config/credential reference in provider intent/receipts.
+/// A database lease alone cannot fence a provider. This trait does not claim
+/// to implement external provider fencing; standalone effects are transactional.
 pub trait CapacityProvider: Send + Sync + std::fmt::Debug {
     fn pool_type(&self) -> PoolType;
     fn apply<'a>(&'a self, store: &'a Store, claim: &'a Claim) -> CapacityFuture<'a>;
@@ -38,6 +44,7 @@ impl ProviderRouter {
         self
     }
     pub async fn apply(&self, store: &Store, claim: &Claim) -> Result<Value, Error> {
+        store.validate_capacity_claim(claim).await?;
         let pool = store
             .host_pool(claim.pool)
             .await
@@ -78,7 +85,8 @@ pub async fn plan(store: &Store, pool: &HostPool, demand: Demand) -> Result<Capa
         .registered_hosts(Some(pool.id))
         .await
         .map_err(|_| Error::Invalid)?;
-    let enrolled = u32::try_from(hosts.len()).map_err(|_| Error::Invalid)?;
+    let enrolled = u32::try_from(hosts.iter().filter(|h| !h.capacity_retired).count())
+        .map_err(|_| Error::Invalid)?;
     let ready = u32::try_from(hosts.iter().filter(|h| h.admits_new_work()).count())
         .map_err(|_| Error::Invalid)?;
     let max = u32::try_from(pool.max_hosts).map_err(|_| Error::Invalid)?;

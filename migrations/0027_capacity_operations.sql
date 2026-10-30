@@ -2,6 +2,13 @@
 -- These are infrastructure intents, never project/sandbox lifecycle authority.
 ALTER TABLE hosts ADD COLUMN capacity_retired_at timestamptz,
     ADD CONSTRAINT hosts_retired_closed CHECK (capacity_retired_at IS NULL OR status='draining');
+-- Retain historical identities without reserving an active machine address.
+ALTER TABLE hosts DROP CONSTRAINT hosts_endpoint_unique,
+    DROP CONSTRAINT hosts_transport_certificate_unique,
+    DROP CONSTRAINT hosts_provider_ref_unique;
+CREATE UNIQUE INDEX hosts_endpoint_unique ON hosts(endpoint) WHERE capacity_retired_at IS NULL;
+CREATE UNIQUE INDEX hosts_transport_certificate_unique ON hosts(transport_certificate_sha256) WHERE capacity_retired_at IS NULL;
+CREATE UNIQUE INDEX hosts_provider_ref_unique ON hosts(host_pool_id,provider_ref) WHERE capacity_retired_at IS NULL;
 CREATE TABLE capacity_operations (
     id uuid PRIMARY KEY,
     host_pool_id uuid NOT NULL REFERENCES host_pools(id),
