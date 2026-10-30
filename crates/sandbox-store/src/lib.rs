@@ -17,6 +17,7 @@ pub mod files;
 pub mod history;
 mod host_capabilities;
 pub mod host_maintenance;
+pub mod host_registry;
 pub mod leases;
 pub mod lists;
 pub mod output;
