@@ -1,3 +1,4 @@
 # Initial owners are current repository administrators.
-# Either owner may review; only itsafal has the configured PR/review bypass.
+# Either owner may review; both have the configured PR/review bypass.
+# Required CI checks still apply to both accounts.
 * @itsafal @dipeshbabu

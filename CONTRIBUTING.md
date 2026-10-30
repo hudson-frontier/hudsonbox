@@ -42,16 +42,16 @@ git diff --check
 
 The `docs-check` GitHub Actions job checks repository Markdown for local inline links and anchors, closed code fences, and valid JSON examples, plus whitespace errors in the proposed commit diff. It does not fetch external links, render Mermaid, or validate sandbox behavior. Use inline Markdown links and ATX (`#`) headings for checked document references.
 
-Keep the job name stable because branch protection requires it. CI runs on every PR to `main` and on pushes to `main`, including fork PRs with read-only permissions and no repository secrets. GitHub may require maintainer approval before a first-time contributor's workflow runs. Use GitHub-hosted runners for untrusted PR checks. Do not run fork code on privileged sandbox hosts or introduce `pull_request_target` execution of contributor code.
+Keep the `docs-check` and `rust-check` job names stable because branch protection requires both checks from GitHub Actions. CI runs on every PR to `main` and on pushes to `main`, including fork PRs with read-only permissions and no repository secrets. GitHub may require maintainer approval before a first-time contributor's workflow runs. Use GitHub-hosted runners for untrusted PR checks. Do not run fork code on privileged sandbox hosts or introduce `pull_request_target` execution of contributor code.
 
-The Rust job runs formatting, strict Clippy, PostgreSQL tests, explicit MinIO tests, and [OpenAPI generation/conformance](docs/openapi.md). Keep both hosted jobs passing on the final PR head. Broader [roadmap gates](docs/roadmap.md) remain separate. Real Firecracker tests need a controlled Linux/KVM environment. A docs-only PR does not need a VM test; a change to snapshot correctness does.
+The required `rust-check` job runs formatting, strict Clippy, PostgreSQL tests, explicit MinIO tests, Python and TypeScript SDK checks, optional MCP adapter checks, guest/host image checks, and [OpenAPI generation/conformance](docs/openapi.md). Keep both hosted jobs passing on the final PR head. Broader [roadmap gates](docs/roadmap.md) remain separate. Real Firecracker tests need a controlled Linux/KVM environment. A docs-only PR does not need a VM test; a change to snapshot correctness does.
 
 ## Review and branch rules
 
 `main` uses these repository settings:
 
 - Require a pull request with at least one approving review and code-owner approval for owned files. The GitHub accounts `itsafal` and `dipeshbabu` may bypass the PR/review requirement; no teams or apps have that allowance.
-- Stale approvals dismissed after changes, required `docs-check` success, and an up-to-date branch before merge.
+- Stale approvals dismissed after changes, required `docs-check` and `rust-check` success from GitHub Actions, and an up-to-date branch before merge.
 - Resolved review conversations and linear history; squash is the enabled PR merge method.
 - No force pushes or branch deletion. Protections apply to administrators too; the configured exceptions are the explicit PR/review bypasses for `itsafal` and `dipeshbabu`. Required checks still apply to both accounts, including on direct pushes.
 
