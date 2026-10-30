@@ -95,6 +95,15 @@ impl Drop for Supervisor {
 async fn serve(pki: &Pki, fake: &FakeHost, identity: HostId) -> Supervisor {
     let (cert, key, pin) = pki.server(identity);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    serve_on(pki, fake, listener, (cert, key, pin)).await
+}
+
+async fn serve_on(
+    pki: &Pki,
+    fake: &FakeHost,
+    listener: TcpListener,
+    (cert, key, pin): (String, String, String),
+) -> Supervisor {
     let endpoint = format!("https://{}", listener.local_addr().unwrap());
     let control = InterceptedService::new(
         SupervisorServer::new(fake.clone())
@@ -401,6 +410,19 @@ async fn lost_acknowledgement_on_a_routed_host_keeps_unknown_then_inspects(pool:
     let on_b = fleet.execute(1).await;
     assert_eq!(controller.tick().await.unwrap(), Tick::Unknown);
     assert_eq!(fleet.status(on_b).await, "unknown");
+    // Losing authentication after a dispatch intent must preserve unknown work.
+    let wrong = serve(&fleet.pki, &fleet.fakes[0], fleet.hosts[0]).await;
+    register(&pool, fleet.hosts[1], &wrong.endpoint, &wrong.pin).await;
+    fleet.retry_now(on_b).await;
+    let _ = controller.tick().await;
+    assert_eq!(fleet.status(on_b).await, "unknown");
+    register(
+        &pool,
+        fleet.hosts[1],
+        &fleet.supervisors[1].endpoint,
+        &fleet.supervisors[1].pin,
+    )
+    .await;
     assert_eq!(fleet.drive(&mut controller, on_b).await, "succeeded");
     // The retry inspected the same owner; nothing ran twice or on host A.
     assert_eq!(fleet.fakes[1].total_commands().await, 1);
@@ -469,6 +491,30 @@ async fn certificate_mismatch_is_refused_until_the_registration_matches(pool: Pg
     // Pinning the presented leaf makes the same server acceptable.
     register(&pool, fleet.hosts[1], &reissued.endpoint, &reissued.pin).await;
     fleet.supervisors.push(reissued);
+    // Force maintenance ahead of command retry. A recovered running observation
+    // must not erase the durable fence written during authentication loss.
+    sqlx::query("UPDATE allocations SET maintenance_next_at=NULL WHERE host_id=$1")
+        .bind(fleet.hosts[1].uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE operations SET next_retry_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+    )
+    .bind(on_b.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    for _ in 0..4 {
+        let _ = controller.tick().await;
+        if fleet.observed(1).await == "running" {
+            break;
+        }
+    }
+    assert_eq!(fleet.observed(1).await, "running");
+    assert_eq!(fleet.status(on_b).await, "running");
+    assert_eq!(fleet.fakes[1].total_commands().await, 0);
+    fleet.retry_now(on_b).await;
     // Two failures put host B in backoff; wait it out rather than skip it.
     tokio::time::sleep(Duration::from_millis(600)).await;
     // The command was admitted while its owner was unauthenticated, so it
@@ -584,6 +630,38 @@ async fn slow_host_is_isolated_and_backs_off(pool: PgPool) {
     );
     assert_eq!(fleet.fakes[1].total_commands().await, 0);
     held.abort();
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn rapid_health_polling_recovers_without_registration_change(pool: PgPool) {
+    let fleet = Fleet::new(&pool).await;
+    let mut controller = fleet.controller(0).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("https://{}", listener.local_addr().unwrap());
+    let material = fleet.pki.server(fleet.hosts[1]);
+    register(&pool, fleet.hosts[1], &endpoint, &material.2).await;
+    // No server consumes the socket yet: two real handshake failures establish
+    // backoff. Recovery keeps the exact endpoint, epoch and pinned certificate.
+    for _ in 0..2 {
+        let _ = controller.tick().await;
+    }
+    assert_eq!(fleet.observed(1).await, "unknown");
+    let _restored = serve_on(&fleet.pki, &fleet.fakes[1], listener, material).await;
+    sqlx::query("UPDATE allocations SET maintenance_next_at=NULL WHERE host_id=$1")
+        .bind(fleet.hosts[1].uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let _ = controller.tick().await;
+        if fleet.observed(1).await == "running" {
+            break;
+        }
+        // Poll much faster than the 250ms initial backoff.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(fleet.observed(1).await, "running");
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]

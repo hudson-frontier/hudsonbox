@@ -274,7 +274,14 @@ impl Controller {
             hosts: &self.hosts,
             address: address.clone(),
         };
-        let result = tokio::time::timeout(HEALTH_DEADLINE, self.health(&address, authority))
+        // Pool admission is not a network attempt. In particular, polling
+        // during backoff must not extend the retry deadline or erase health
+        // merely because all request slots are occupied.
+        let lease = match self.hosts.pool.acquire(&address, false) {
+            Ok(lease) => lease,
+            Err(error) => return Err(error.into()),
+        };
+        let result = tokio::time::timeout(HEALTH_DEADLINE, self.health(&address, authority, lease))
             .await
             .unwrap_or(Err(ControllerError::Health));
         {
@@ -318,8 +325,8 @@ impl Controller {
         &self,
         address: &HostAddress,
         authority: Arc<tokio::sync::Mutex<()>>,
+        lease: Lease,
     ) -> Result<(bool, bool), ControllerError> {
-        let lease = self.hosts.pool.acquire(address, false)?;
         let mut client = client(&lease);
         let health = client
             .health(HealthRequest {})

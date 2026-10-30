@@ -543,7 +543,11 @@ impl Controller {
         // an owner, only database-side outcomes (rejection, cancellation) apply.
         let mut route = match self.owner(claim).await? {
             hosts::Owner::Ready(route) => Some(route),
-            hosts::Owner::Unavailable => return self.defer(claim).await,
+            hosts::Owner::Unavailable => match self.store.fence_unavailable_execute(claim).await {
+                Ok(()) => return self.defer(claim).await,
+                Err(DispatchError::LostClaim) => return Ok(Tick::LostOwnership),
+                Err(error) => return Err(error.into()),
+            },
             hosts::Owner::None => None,
         };
         let (host, epoch) = route

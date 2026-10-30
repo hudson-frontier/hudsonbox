@@ -68,7 +68,7 @@ impl FileClient {
         ) -> Fut,
         Fut: Future<Output = Result<tonic::Response<FileAccessObservation>, tonic::Status>>,
     {
-        let route = self.routes.route(host).await?;
+        let route = self.routes.owner_route(host).await?;
         let client = sandbox_protocol::supervisor::file_downloads_client::FileDownloadsClient::new(
             route.lease.channel.clone(),
         )

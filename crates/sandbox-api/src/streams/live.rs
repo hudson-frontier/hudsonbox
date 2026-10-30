@@ -66,7 +66,7 @@ impl LiveReader for LiveClient {
         request: LiveOutputRequest,
     ) -> Pin<Box<dyn Future<Output = Result<LiveOutputObservation, Problem>> + Send + 'a>> {
         Box::pin(async move {
-            let route = self.routes.route(host).await?;
+            let route = self.routes.owner_route(host).await?;
             let mut client =
                 sandbox_protocol::supervisor::live_output_client::LiveOutputClient::new(
                     route.lease.channel.clone(),

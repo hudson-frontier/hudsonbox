@@ -107,7 +107,7 @@ impl OwnerRoutes {
 
     /// Reserve one request slot on exactly `host`. Saturated, backing-off and
     /// unregistered hosts fail fast without affecting other hosts.
-    pub async fn route(&self, host: HostId) -> Result<OwnerRoute, Problem> {
+    pub async fn owner_route(&self, host: HostId) -> Result<OwnerRoute, Problem> {
         let (address, epoch) = self.address(host).await?;
         let lease = self
             .pool
