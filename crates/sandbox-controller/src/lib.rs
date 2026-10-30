@@ -25,7 +25,7 @@ use sandbox_store::{
     destroy::DestroyAction,
     dispatch::{CreateAction, CreateRejection, DispatchError},
     leases::{AllocationClaim, LeaseAction, LeaseResult},
-    placement::{PlacementError, PlacementWait, Reservation, WaitOutcome},
+    placement::{HostScope, PlacementError, PlacementWait, Reservation, WaitOutcome},
 };
 use sandbox_supervisor::{
     routing::RouteError,
@@ -37,7 +37,7 @@ use tonic::transport::Channel;
 pub use hosts::{HEALTH_CONCURRENCY, HEALTH_DEADLINE};
 
 /// `endpoint`, `host` and `epoch` name the configured host: the placement target
-/// for new creates and the legacy address of that host while its registry
+/// for legacy creates and the legacy address of that host while its registry
 /// transport is NULL. Registered hosts are addressed only by their registration.
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
@@ -438,11 +438,17 @@ impl Controller {
         if let Some(tick) = self.previous_tick(claim).await? {
             return Ok(tick);
         }
-        let reservation = match self
-            .store
-            .reserve_create(claim, self.config.host, self.config.epoch)
-            .await
-        {
+        // A registered bootstrap host opts into fleet placement. NULL transport
+        // keeps the explicit configured legacy/fake scope; never fall back from
+        // an unavailable fleet to that host.
+        let scope = match self.store.registered_host(self.config.host).await? {
+            Some(host) if host.transport.is_some() => HostScope::Fleet,
+            _ => HostScope::Configured {
+                host: self.config.host,
+                epoch: self.config.epoch,
+            },
+        };
+        let reservation = match self.store.place_create(claim, scope).await {
             Ok(value) => value,
             Err(PlacementError::Unauthorized) => {
                 return self.reject(claim, CreateRejection::Unauthorized).await;

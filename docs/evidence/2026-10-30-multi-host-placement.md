@@ -59,14 +59,12 @@ boundaries, drain/placement races, host freshness, claim and epoch fencing,
 uncertain capacity, bounded waiting and original-owner recovery. They do not
 prove physical resource enforcement or guest isolation.
 
-## Remaining gates
+## Remaining gates at the original placement-only revision
 
 - Required hosted `docs-check` and aggregate `rust-check` must pass on the final
   pushed head. Native focused results do not replace the full CI suite.
-- [Routing PR #207](https://github.com/hudson-frontier/hudsonbox/pull/207) remains
-  separate. Parent integration must select `HostScope::Fleet` in registry mode,
-  preserve configured fake mode, and run its `owner_routing` regressions
-  (reported routing head `7f494c5`). No routing code was duplicated here.
+- The original routing integration requirement is now satisfied by the
+  [integrated validation record](2026-10-30-placement-routing-integration.md).
 - Execute the Linux-only supervisor host regressions on compatible Linux/KVM
   hardware, with real evidence reported separately.
 - Pool grants remain an explicit upgrade/provisioning step documented in

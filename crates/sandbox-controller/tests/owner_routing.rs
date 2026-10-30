@@ -29,6 +29,36 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{service::interceptor::InterceptedService, transport::Server};
 use tower::ServiceExt;
 
+use sandbox_protocol::host_capabilities::{Capabilities, Image, Limits};
+
+fn capabilities() -> Capabilities {
+    Capabilities {
+        version: 1,
+        simulated: true,
+        architecture: "x86_64".into(),
+        host_kernel_release: "6.8.0-fixture".into(),
+        kvm_api_version: 12,
+        cgroup_version: 2,
+        supervisor_version: env!("CARGO_PKG_VERSION").into(),
+        firecracker_version: "1.17.0".into(),
+        firecracker_digest: format!("sha256:{}", "c".repeat(64)),
+        jailer_digest: format!("sha256:{}", "d".repeat(64)),
+        limits: Limits {
+            vcpu: 4,
+            memory_mib: 8192,
+            disk_mib: 65536,
+        },
+        images: vec![Image {
+            rootfs_digest: digest(),
+            kernel_digest: format!("sha256:{}", "b".repeat(64)),
+            minimum_disk_mib: 256,
+            guest_version: env!("CARGO_PKG_VERSION").into(),
+            bootstrap_version: 1,
+            guest_protocol_version: 1,
+        }],
+    }
+}
+
 fn digest() -> String {
     format!("sha256:{}", "a".repeat(64))
 }
@@ -193,16 +223,26 @@ impl Fleet {
     async fn new(pool: &PgPool) -> Self {
         let token = project(pool).await;
         let pki = Pki::new();
-        let hosts = [HostId::generate(), HostId::generate()];
+        let mut hosts = [HostId::generate(), HostId::generate()];
+        hosts.sort();
         let fakes = [fake(hosts[0]), fake(hosts[1])];
         let mut supervisors = Vec::new();
         for (host, fake) in hosts.iter().zip(&fakes) {
             sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch) VALUES($1,'ready',4,8192,65536,1)")
                 .bind(host.uuid()).execute(pool).await.unwrap();
+            fake.set_capabilities(capabilities()).await.unwrap();
+            sqlx::query("UPDATE hosts SET compatibility=$2 WHERE id=$1")
+                .bind(host.uuid())
+                .bind(serde_json::to_value(capabilities()).unwrap())
+                .execute(pool)
+                .await
+                .unwrap();
             let supervisor = serve(&pki, fake, *host).await;
             register(pool, *host, &supervisor.endpoint, &supervisor.pin).await;
             supervisors.push(supervisor);
         }
+        sqlx::query("INSERT INTO project_host_pool_access(id,project_id,host_pool_id) SELECT gen_random_uuid(),p.id,h.host_pool_id FROM projects p CROSS JOIN hosts h GROUP BY p.id,h.host_pool_id")
+            .execute(pool).await.unwrap();
         let store = Store::from_pool(pool.clone());
         let files = FileClient::routed(
             Some(store.clone()),
@@ -233,8 +273,9 @@ impl Fleet {
             supervisors,
             sandboxes: [SandboxId::generate(), SandboxId::generate()],
         };
-        // Placement still targets each controller's configured host (#194 owns
-        // multi-host placement); one sandbox is placed on each host.
+        // One controller chooses A by deterministic tie-break, then B because
+        // B has more remaining capacity. No pre-reservation or host override.
+        let mut placing = fleet.controller(0).await;
         for index in 0..2 {
             let (_, body) = fleet
                 .send(
@@ -244,7 +285,6 @@ impl Fleet {
                 )
                 .await;
             fleet.sandboxes[index] = body["sandbox_id"].as_str().unwrap().parse().unwrap();
-            let mut placing = fleet.controller(index).await;
             assert_eq!(placing.tick().await.unwrap(), Tick::Confirmed);
         }
         let owners: Vec<(uuid::Uuid,)> = sqlx::query_as(
@@ -362,6 +402,45 @@ impl Fleet {
             .await
             .unwrap()
     }
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_create_uses_reserved_owner_and_inspects_after_lost_reply(pool: PgPool) {
+    let fleet = Fleet::new(&pool).await;
+    assert_eq!(fleet.fakes[0].total_starts().await, 1);
+    assert_eq!(fleet.fakes[1].total_starts().await, 1);
+    // The bootstrap host cannot accept new work. Fleet placement must still
+    // choose B, and an uncertain create must remain there after A reopens.
+    sqlx::query("UPDATE hosts SET status='draining' WHERE id=$1")
+        .bind(fleet.hosts[0].uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, body) = fleet.send("POST", "/v1/sandboxes",
+        json!({"image_digest":digest(),"resources":{"vcpu":2,"memory_mib":2048,"disk_mib":8192}})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let operation: OperationId = body["operation_id"].as_str().unwrap().parse().unwrap();
+    let sandbox: SandboxId = body["sandbox_id"].as_str().unwrap().parse().unwrap();
+    fleet.fakes[1].lose_next_create_reply().await;
+    let mut controller = fleet.controller(0).await;
+    assert_eq!(controller.tick().await.unwrap(), Tick::Unknown);
+    let owner: (uuid::Uuid, i64) = sqlx::query_as("SELECT a.host_id,a.supervisor_epoch FROM allocations a JOIN sandboxes s ON s.current_allocation_id=a.id WHERE s.id=$1")
+        .bind(sandbox.uuid()).fetch_one(&pool).await.unwrap();
+    assert_eq!(owner, (fleet.hosts[1].uuid(), 1));
+    sqlx::query("UPDATE hosts SET status='ready' WHERE id=$1")
+        .bind(fleet.hosts[0].uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(fleet.drive(&mut controller, operation).await, "succeeded");
+    assert_eq!(fleet.fakes[0].total_starts().await, 1);
+    assert_eq!(fleet.fakes[1].total_starts().await, 2);
+    let attempts: i32 = sqlx::query_scalar("SELECT attempt_count FROM operations WHERE id=$1")
+        .bind(operation.uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 1);
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
