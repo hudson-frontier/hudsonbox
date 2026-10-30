@@ -61,7 +61,7 @@ retrying reconciles the existing row instead of assigning another identity.
 
 `drain` locks the host row used by placement, transitions ready to draining and returns bounded counts. Repeated drain at the same epoch is idempotent. A changed/missing epoch or unhealthy state fails. A placement serialized after drain cannot reserve that host. Work already dispatched continues through service-owned inspection/lease/cleanup; no caller mutation is replayed. New command/upload admission on that draining host follows the existing fail-closed rules.
 
-The report contains the status/epoch, outstanding allocations, reserved CPU/RAM/disk, unfinished operations and unknown operations associated with unreleased allocations. Counts describe database reservations; they are not independent physical cleanup receipts or proof that external effects are known. Drain preserves allocations, leases, permits, idempotency keys, histories and retirement scope. It never refunds capacity, cancels, destroys, deletes storage or promises resumable memory.
+The report contains the status/epoch, outstanding allocations, reserved CPU/RAM/disk, unfinished operations and unknown operations associated with unreleased allocations. It also reports `previous_epoch_allocations` (unreleased reservations issued under an older epoch of this host, which need [previous-epoch recovery](controller.md#previous-epoch-allocation-recovery)) and `unknown_state_allocations` (unreleased reservations whose sandbox runtime is currently unknown). Every count is scoped to the named host identity. A command or upload stays attributed to the allocation it was pinned to; unpinned lifecycle operations follow the sandbox's unreleased allocation. Counts describe database reservations; they are not independent physical cleanup receipts or proof that external effects are known. Drain preserves allocations, leases, permits, idempotency keys, histories and retirement scope. It never refunds capacity, cancels, destroys, deletes storage or promises resumable memory.
 
 Let admitted work finish or explicitly cancel/destroy the relevant sandbox through its ordinary authenticated API. Destroy remains available after a command failure or unknown outcome. Confirm its terminal cleanup operation; reservations stay until the existing verified release path completes. Closing the manager/controller is not resource reclamation.
 
@@ -114,6 +114,17 @@ Follow the [offline upgrade and recovery procedure](operator-recovery.md) before
 ## Validation and limits
 
 [Store tests](../crates/sandbox-store/tests/host_maintenance.rs) exercise epoch fencing, idempotence, unhealthy refusal, stale health and explicit reopening. [Controller tests](../crates/sandbox-controller/tests/host_maintenance.rs) prove placement exclusion while an admitted command reports a nonzero exit, followed by explicit destruction and reopening. The command's unit test rejects unsafe/private configuration boundaries.
+
+[Host identity tests](../crates/sandbox-store/tests/host_identities.rs) use two
+simulated identities in one database. Draining, epoch advancement, capability
+approval, health observation and runtime-unknown marking on one host leave the
+other host's row, reservations, admission and report unchanged. An epoch number
+valid for one host grants nothing on another: maintenance, observation,
+placement, maintenance claims and previous-epoch recovery are all keyed by host
+identity and epoch together. A pinned unknown command stays reported on its
+original host after a fixture-only replacement owner exists elsewhere. These
+tests do not implement a host registry, per-host routing, cross-host scheduling
+or replacement placement.
 
 [Provisioning tests](../crates/sandbox-store/tests/host_provisioning.rs) cover a
 new draining host, exact and competing retries, changed-input conflicts,
