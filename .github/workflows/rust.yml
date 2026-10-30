@@ -19,8 +19,35 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  rust-check:
-    name: rust-check
+  changes:
+    name: Determine runtime scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      runtime: ${{ steps.scope.outputs.runtime }}
+    steps:
+      - name: Check out complete PR history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed paths
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            python3 scripts/ci_scope.py --base "$BASE_SHA" --head "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "runtime=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  rust-tests:
+    name: Rust and integration tests
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -57,6 +84,18 @@ jobs:
           rustup show active-toolchain
           cargo --version
 
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          prefix-key: ubuntu-24.04-v1
+          cache-bin: false
+
+      - name: Cache Python package downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/*requirements.txt') }}
+
       - name: Install protobuf compiler
         run: |
           sudo apt-get update
@@ -73,6 +112,8 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.9.0'
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
 
       - name: Set up Python and TypeScript clients
         run: make sdk-setup
@@ -99,8 +140,24 @@ jobs:
 
       # Ordinary unprivileged object storage, never a KVM/host integration test.
       # Compose and CI share the same verified official source build recipe.
+      - name: Cache pinned object storage image
+        id: storage-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/hudson-storage-image
+          # Exact recipe/context only; never load a different fixture as fallback.
+          key: minio-v1-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('dev/object-storage/**') }}
+
+      - name: Load cached test object storage
+        if: steps.storage-cache.outputs.cache-hit == 'true'
+        run: docker load --input "$RUNNER_TEMP/hudson-storage-image/image.tar"
+
       - name: Build pinned test object storage
-        run: docker build -t hudson-output-fixture ./dev/object-storage
+        if: steps.storage-cache.outputs.cache-hit != 'true'
+        run: |
+          docker build -t hudson-output-fixture ./dev/object-storage
+          mkdir -p "$RUNNER_TEMP/hudson-storage-image"
+          docker save --output "$RUNNER_TEMP/hudson-storage-image/image.tar" hudson-output-fixture
 
       - name: Start private test object storage
         id: object-storage
@@ -153,3 +210,26 @@ jobs:
           STORAGE_CONTAINER: ${{ steps.object-storage.outputs.container }}
         run: |
           if [[ -n "$STORAGE_CONTAINER" ]]; then docker rm -f "$STORAGE_CONTAINER"; fi
+
+  # Keep the required status stable; scope failures and skipped runtime jobs
+  # must not accidentally satisfy branch protection.
+  rust-check:
+    name: rust-check
+    needs: [changes, rust-tests]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require the applicable checks
+        env:
+          SCOPE_RESULT: ${{ needs.changes.result }}
+          RUNTIME_REQUIRED: ${{ needs.changes.outputs.runtime }}
+          RUNTIME_RESULT: ${{ needs.rust-tests.result }}
+        run: |
+          [[ "$SCOPE_RESULT" == "success" ]] || exit 1
+          if [[ "$RUNTIME_REQUIRED" == "false" ]]; then
+            [[ "$RUNTIME_RESULT" == "skipped" ]] || exit 1
+            echo "Documentation-only PR; documentation checks run separately."
+          else
+            [[ "$RUNTIME_REQUIRED" == "true" && "$RUNTIME_RESULT" == "success" ]] || exit 1
+          fi
