@@ -119,11 +119,9 @@ The [registry store](../crates/sandbox-store/src/host_registry.rs) exposes the
 read model a controller resolves per host: identity, pool and type, status,
 epoch, endpoint, expected transport identity, provider reference, capacity,
 approved/observed capabilities and heartbeat freshness (an authenticated
-observation within 30 seconds). The controller and API use it for
-[per-owner routing](controller.md#per-owner-host-routing)
-([#193](https://github.com/hudson-frontier/hudsonbox/issues/193)). Cross-host
-placement and project-access enforcement remain
-[#194](https://github.com/hudson-frontier/hudsonbox/issues/194).
+observation within 30 seconds). [Placement](controller.md#placement)
+([#194](https://github.com/hudson-frontier/hudsonbox/issues/194)) enforces
+project pool grants over this registry. Controller and API [per-owner routing](controller.md#per-owner-host-routing) implement [#193](https://github.com/hudson-frontier/hudsonbox/issues/193).
 
 ### Pools
 
@@ -162,6 +160,10 @@ implementation must join this check.
 
 `grant-pool-access` records an explicit, idempotent project/pool pair. A
 missing grant is denial; grants confer no host or maintenance authority.
+Placement chooses only hosts in a granted pool and never falls back to another
+pool, including when every granted pool is full. A create from a project with
+no grant for an eligible pool fails with `host_pool_access_denied`. There is no
+revoke command; removing access needs a design for already placed work.
 
 ### Host enrollment and transport identity
 
@@ -243,11 +245,24 @@ Migration 0025 creates the shared standalone pool `legacy-standalone`
 this pool, which is also the column default. Legacy hosts keep NULL endpoint
 and transport identity, meaning the single-host controller configuration still
 supplies the address. All prior constraints, epochs, capacity, health and
-reservations are unchanged. No project receives pool access implicitly; current
-placement does not consult grants yet, and #194 must define how existing
-projects obtain them before enforcing access. Apply the migration before
-starting a new controller; roll back by restoring a compatible build, not by
-dropping the columns under live hosts.
+reservations are unchanged. No project receives pool access implicitly.
+Placement requires a grant, so this upgrade has an explicit operator step.
+Before starting a controller that includes multi-host placement, grant
+`legacy-standalone` to every project that should keep creating sandboxes:
+
+```sh
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json grant-pool-access \
+  --pool-id 00000000-0000-4000-8000-000000000001 --project-id PROJECT_ID
+```
+
+Repeat for each project, and for each project provisioned later. Without a
+grant, new creates fail with `host_pool_access_denied` before any reservation.
+Existing allocations, running sandboxes, destroys and commands are unaffected.
+The single-host controller still reaches a legacy host through its configured
+endpoint, so the host needs no transport registration for this. Apply the
+migration before starting a new controller; roll back by restoring a
+compatible build, not by dropping the columns under live hosts.
 
 ## Validation and limits
 
@@ -272,6 +287,18 @@ changes outside drain, heartbeat immutability and stale/never-seen freshness.
 [Discovery unit tests](../crates/sandbox-controller/src/host_discovery.rs) cover
 routing by pool type, duplicate discovery identities and reconciliation reports.
 These simulated identities make no gRPC connection.
+
+[Multi-host placement tests](../crates/sandbox-store/tests/multi_host_placement.rs)
+use two to five simulated hosts per test. They cover racing workers with no
+overbooking or duplicate owners, contiguous permit serials, spread selection,
+pinned existing allocations, capacity still held by uncertain
+and previous-epoch allocations, and exclusion of stale, draining, unregistered or
+incompatible hosts. They also cover drain/placement races, denial for dedicated
+pools and missing grants without fallback, quota under concurrency, the bounded
+wait and project fairness in claiming.
+[Controller tests](../crates/sandbox-controller/tests/create.rs) check grant
+denial and the bounded wait through the controller loop. No real supervisor
+or VM takes part.
 
 [Provisioning tests](../crates/sandbox-store/tests/host_provisioning.rs) cover a
 new draining host, exact and competing retries, changed-input conflicts,

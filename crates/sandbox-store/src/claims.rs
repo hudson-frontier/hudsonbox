@@ -79,8 +79,9 @@ fn lease_seconds(seconds: u32) -> Result<i32, ClaimError> {
 }
 
 impl Store {
-    /// Claim the oldest eligible operation of a supported kind without waiting
-    /// on another controller's row lock. The selection and revision increment
+    /// Claim the next eligible operation of a supported kind (oldest first;
+    /// creates round-robin across projects) without waiting on another
+    /// controller's row lock. The selection and revision increment
     /// are one statement. Claiming does not increment dispatch attempts.
     pub async fn claim_next(
         &self,
@@ -94,22 +95,56 @@ impl Store {
         } else {
             ""
         };
+        let eligible = format!(
+            r"kind = $1
+               AND ($1 <> 'cancel' OR phase = 'cancel_requested')
+               {file_filter}
+               AND status IN ('queued', 'running', 'unknown')
+               AND phase IS DISTINCT FROM 'cleanup_owned_by_destroy'
+               AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
+               AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())"
+        );
+        // Creates take turns across projects: a create's turn is its position
+        // among its project's unfinished creates, including ones already
+        // claimed or waiting, so one project's backlog cannot delay another
+        // project's first placement. Other kinds stay oldest-first. Eligibility
+        // is checked on the locked row so a concurrent claim that commits
+        // first is re-evaluated, not reused.
+        let candidate = if matches!(kind, OperationKind::Create) {
+            format!(
+                r"
+                ranked AS (
+                    SELECT id, created_at,
+                           row_number() OVER (PARTITION BY project_id ORDER BY created_at, id) AS turn
+                      FROM operations
+                     WHERE kind = $1 AND status IN ('queued', 'running', 'unknown')
+                       AND phase IS DISTINCT FROM 'cleanup_owned_by_destroy'
+                ),
+                candidate AS (
+                    SELECT o.id, o.status AS previous_status
+                      FROM operations o JOIN ranked r ON r.id = o.id
+                     WHERE {eligible}
+                     ORDER BY r.turn, r.created_at, r.id
+                     FOR UPDATE OF o SKIP LOCKED
+                     LIMIT 1
+                )"
+            )
+        } else {
+            format!(
+                r"
+                candidate AS (
+                    SELECT id, status AS previous_status
+                      FROM operations
+                     WHERE {eligible}
+                     ORDER BY created_at, id
+                     FOR UPDATE SKIP LOCKED
+                     LIMIT 1
+                )"
+            )
+        };
         let query = format!(
             r"
-            WITH candidate AS (
-                SELECT id, status AS previous_status
-                  FROM operations
-                 WHERE kind = $1
-                   AND ($1 <> 'cancel' OR phase = 'cancel_requested')
-                   {file_filter}
-                   AND status IN ('queued', 'running', 'unknown')
-                   AND phase IS DISTINCT FROM 'cleanup_owned_by_destroy'
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
-                   AND (next_retry_at IS NULL OR next_retry_at <= clock_timestamp())
-                 ORDER BY created_at, id
-                 FOR UPDATE SKIP LOCKED
-                 LIMIT 1
-            )
+            WITH {candidate}
             UPDATE operations AS o
                SET claim_revision = o.claim_revision + 1,
                    lease_expires_at = clock_timestamp() + make_interval(secs => $2),

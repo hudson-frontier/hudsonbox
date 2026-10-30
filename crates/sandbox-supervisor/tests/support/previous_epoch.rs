@@ -131,8 +131,12 @@ async fn recover(pool: PgPool, lost_create: bool) {
     let token = ProjectToken::generate().unwrap();
     sqlx::query("INSERT INTO projects(id,name,status,limits,api_tokens) VALUES($1,'epoch-recovery','active','{}',$2)")
         .bind(project.uuid()).bind(json!([{"key_id":token.key_id().as_str(),"hash":hex::encode(token.hash().as_bytes())}])).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch) VALUES($1,'ready',1,128,64,1)")
+    // One 1 vCPU/128 MiB/64 MiB sandbox plus 128 MiB VMM and 401 MiB artifact overhead.
+    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch) VALUES($1,'ready',1,256,465,1)")
         .bind(f.config.host.uuid()).execute(&pool).await.unwrap();
+    // Placement requires an explicit grant for the configured host's legacy pool.
+    sqlx::query("INSERT INTO project_host_pool_access(id,project_id,host_pool_id) SELECT gen_random_uuid(),$1,host_pool_id FROM hosts WHERE id=$2")
+        .bind(project.uuid()).bind(f.config.host.uuid()).execute(&pool).await.unwrap();
     let token = token.render_once();
     let image = f.config.images.keys().next().unwrap().clone();
     let store = Store::from_pool(pool.clone());

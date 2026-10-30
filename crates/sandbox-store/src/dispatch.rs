@@ -406,6 +406,13 @@ pub enum CreateRejection {
     Unauthorized,
     ImageDenied,
     InvalidResources,
+    /// The project has no grant for any eligible host pool. Not retried.
+    HostPoolAccessDenied,
+    /// Placement waits below expired without a fit.
+    InsufficientCapacity,
+    ProjectQuota,
+    NoReadyHost,
+    NoCompatibleHost,
 }
 impl CreateRejection {
     fn code(self) -> &'static str {
@@ -414,6 +421,11 @@ impl CreateRejection {
             Self::Unauthorized => "authorization_revoked",
             Self::ImageDenied => "image_not_allowed",
             Self::InvalidResources => "invalid_resources",
+            Self::HostPoolAccessDenied => "host_pool_access_denied",
+            Self::InsufficientCapacity => "insufficient_capacity",
+            Self::ProjectQuota => "project_quota_exceeded",
+            Self::NoReadyHost => "no_ready_host",
+            Self::NoCompatibleHost => "no_compatible_host",
         }
     }
 }
@@ -432,7 +444,7 @@ impl Store {
             .bind(claim.operation_id.uuid()).bind(claim.revision).fetch_optional(&mut *tx).await?.ok_or(DispatchError::Conflict)?;
         if !matches!(
             op.try_get::<Option<String>, _>("phase")?.as_deref(),
-            None | Some("queued" | "reserved")
+            None | Some("queued" | "awaiting_placement" | "reserved")
         ) {
             return Err(DispatchError::Conflict);
         }

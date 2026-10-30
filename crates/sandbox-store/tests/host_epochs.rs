@@ -139,6 +139,9 @@ async fn advancing_a_busy_host_preserves_old_ownership_claims_and_all_capacity_c
     sqlx::query("INSERT INTO projects(id,name,status,limits,api_tokens) VALUES($1,'epoch-test','active','{}',$2)")
         .bind(project.uuid()).bind(json!([{"key_id":token.key_id().as_str(),"hash":hex::encode(token.hash().as_bytes())}]))
         .execute(&pool).await.unwrap();
+    // Placement requires an explicit pool grant; these fixtures use only shared pools.
+    sqlx::query("INSERT INTO project_host_pool_access(id,project_id,host_pool_id) SELECT gen_random_uuid(),$1,id FROM host_pools")
+        .bind(project.uuid()).execute(&pool).await.unwrap();
     let image = format!("sha256:{}", "a".repeat(64));
     let payload =
         json!({"image_digest":image,"resources":{"vcpu":1,"memory_mib":128,"disk_mib":256}});

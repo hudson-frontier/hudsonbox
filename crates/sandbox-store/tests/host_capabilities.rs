@@ -192,6 +192,11 @@ async fn claim(store: &Store, disk_mib: i64) -> sandbox_store::claims::Claim {
     .execute(store.pool())
     .await
     .unwrap();
+    // Placement requires an explicit grant for the fixture host's legacy pool.
+    store
+        .grant_host_pool_access(project, sandbox_store::host_registry::LEGACY_POOL_ID)
+        .await
+        .unwrap();
     let digest = capabilities().images[0].rootfs_digest.clone();
     let payload =
         json!({"image_digest":digest,"resources":{"vcpu":1,"memory_mib":128,"disk_mib":disk_mib}});

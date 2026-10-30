@@ -25,7 +25,7 @@ use sandbox_store::{
     destroy::DestroyAction,
     dispatch::{CreateAction, CreateRejection, DispatchError},
     leases::{AllocationClaim, LeaseAction, LeaseResult},
-    placement::{PlacementError, Reservation},
+    placement::{PlacementError, PlacementWait, Reservation, WaitOutcome},
 };
 use sandbox_supervisor::{
     routing::RouteError,
@@ -160,6 +160,20 @@ impl Controller {
         match self.store.defer_claim(claim, 5).await {
             Ok(()) => Ok(Tick::Deferred),
             Err(ClaimError::LostClaim) => Ok(Tick::LostOwnership),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Bounded wait for placement; fails the create once the bound passes.
+    async fn await_placement(
+        &self,
+        claim: &Claim,
+        reason: PlacementWait,
+    ) -> Result<Tick, ControllerError> {
+        match self.store.await_placement(claim, reason).await {
+            Ok(WaitOutcome::Waiting) => Ok(Tick::Deferred),
+            Ok(WaitOutcome::Expired) => self.reject(claim, reason.rejection()).await,
+            Err(PlacementError::LostClaim) => Ok(Tick::LostOwnership),
             Err(error) => Err(error.into()),
         }
     }
@@ -436,15 +450,17 @@ impl Controller {
             Err(PlacementError::InvalidResources) => {
                 return self.reject(claim, CreateRejection::InvalidResources).await;
             }
-            Err(
-                PlacementError::Capacity
-                | PlacementError::Quota
-                | PlacementError::HostUnavailable
-                | PlacementError::HostCompatibility
-                | PlacementError::Reconcile,
-            ) => return self.defer(claim).await,
+            Err(PlacementError::NoPoolAccess) => {
+                return self
+                    .reject(claim, CreateRejection::HostPoolAccessDenied)
+                    .await;
+            }
+            Err(PlacementError::Reconcile) => return self.defer(claim).await,
             Err(PlacementError::LostClaim) => return Ok(Tick::LostOwnership),
-            Err(error) => return Err(error.into()),
+            Err(error) => match error.wait_reason() {
+                Some(reason) => return self.await_placement(claim, reason).await,
+                None => return Err(error.into()),
+            },
         };
         let allocation = match reservation {
             Reservation::Reserved(a) | Reservation::Existing(a) => a,
