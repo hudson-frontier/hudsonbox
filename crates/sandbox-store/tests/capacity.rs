@@ -218,3 +218,182 @@ async fn pending_operations_block_type_change_and_pool_mismatch(pool: PgPool) {
         Err(Error::Invalid)
     ));
 }
+
+#[sqlx::test(migrations = false)]
+async fn upgrade_preserves_existing_host_state_and_is_repeatable(pool: PgPool) {
+    use sandbox_store::MIGRATOR;
+    use sqlx::migrate::Migrator;
+    use std::borrow::Cow;
+    Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version < 27)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    }
+    .run(&pool)
+    .await
+    .unwrap();
+    let host = Uuid::now_v7();
+    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch,last_seen_at) VALUES($1,'unhealthy',4,8192,65536,7,clock_timestamp())")
+        .bind(host).execute(&pool).await.unwrap();
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(h) FROM hosts h WHERE id=$1")
+            .bind(host)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let mut after: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(h) FROM hosts h WHERE id=$1")
+            .bind(host)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        after
+            .as_object_mut()
+            .unwrap()
+            .remove("capacity_retired_at")
+            .unwrap()
+            .is_null()
+    );
+    assert_eq!(before, after);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM capacity_operations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    for sql in [
+        "INSERT INTO capacity_operations(id,host_pool_id,kind,target_ref,idempotency_key,request,warm_pool_id) SELECT gen_random_uuid(),id,'status','host','x','{}',gen_random_uuid() FROM host_pools",
+        "INSERT INTO capacity_operations(id,host_pool_id,kind,target_ref,idempotency_key,request,status) SELECT gen_random_uuid(),id,'retire','host','x','{}','succeeded' FROM host_pools",
+        "INSERT INTO capacity_operations(id,host_pool_id,kind,target_ref,idempotency_key,request,status) SELECT gen_random_uuid(),id,'status','host','x','{}','running' FROM host_pools",
+    ] {
+        assert!(sqlx::query(sql).execute(&pool).await.is_err());
+    }
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn occupied_and_unknown_reservations_never_retire_or_disappear(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "occupied")).await.unwrap();
+    let host = HostId::generate();
+    store
+        .provision_host(host, 2, &provision(Some(p)))
+        .await
+        .unwrap();
+    store
+        .observe_configured_host_with_capabilities(
+            host,
+            2,
+            &capabilities().to_json().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    let project = Uuid::now_v7();
+    let sandbox = Uuid::now_v7();
+    let allocation = Uuid::now_v7();
+    sqlx::query("INSERT INTO projects(id,name,status,limits,api_tokens) VALUES($1,'capacity','active','{}','[]')").bind(project).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO sandboxes(id,project_id,image_digest,resources,desired_state,observed_state) VALUES($1,$2,'fixture','{}','running','unknown')")
+        .bind(sandbox).bind(project).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO allocations(id,project_id,sandbox_id,host_id,generation,supervisor_epoch,vcpu,memory_mib,disk_mib,status) VALUES($1,$2,$3,$4,1,1,1,512,1024,'running')")
+        .bind(allocation).bind(project).bind(sandbox).bind(host.uuid()).execute(&pool).await.unwrap();
+    let request = Request {
+        host,
+        epoch: 2,
+        action: Action::Retire,
+    };
+    store.enqueue_capacity(p, "busy", &request).await.unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    let before: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(a) FROM allocations a WHERE id=$1")
+            .bind(allocation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(matches!(
+        store.apply_static_capacity(&claim).await,
+        Err(Error::Conflict)
+    ));
+    let report = store.host_maintenance(host, 2).await.unwrap();
+    assert_eq!(
+        (
+            report.outstanding_allocations,
+            report.previous_epoch_allocations,
+            report.unknown_state_allocations
+        ),
+        (1, 1, 1)
+    );
+    let after: serde_json::Value =
+        sqlx::query_scalar("SELECT to_jsonb(a) FROM allocations a WHERE id=$1")
+            .bind(allocation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    assert!(
+        !store
+            .registered_host(host)
+            .await
+            .unwrap()
+            .unwrap()
+            .capacity_retired
+    );
+    // A late fresh health reply is still not allocation cleanup/fencing evidence.
+    store
+        .observe_configured_host_with_capabilities(
+            host,
+            2,
+            &capabilities().to_json().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.apply_static_capacity(&claim).await,
+        Err(Error::Conflict)
+    ));
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn concurrent_provision_respects_inventory_bound_and_durable_target(pool: PgPool) {
+    let store = Store::from_pool(pool);
+    let p = Uuid::now_v7();
+    let mut spec = spec(p, "bounded");
+    spec.max_hosts = 1;
+    store.put_host_pool(&spec).await.unwrap();
+    let first = Request {
+        host: HostId::generate(),
+        epoch: 1,
+        action: Action::Provision {
+            config: provision(Some(p)),
+        },
+    };
+    let second = Request {
+        host: HostId::generate(),
+        epoch: 1,
+        action: Action::Provision {
+            config: provision(Some(p)),
+        },
+    };
+    store.enqueue_capacity(p, "a", &first).await.unwrap();
+    store.enqueue_capacity(p, "b", &second).await.unwrap();
+    let mut a = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    let b = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    // Even a caller-mutated Claim cannot redirect the retained request.
+    let impostor = HostId::generate();
+    a.request.host = impostor;
+    let (x, y) = tokio::join!(
+        store.apply_static_capacity(&a),
+        store.apply_static_capacity(&b)
+    );
+    assert_ne!(x.is_ok(), y.is_ok());
+    assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 1);
+    assert!(store.registered_host(impostor).await.unwrap().is_none());
+}

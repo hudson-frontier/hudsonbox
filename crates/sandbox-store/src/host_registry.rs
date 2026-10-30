@@ -336,6 +336,7 @@ pub struct RegisteredHost {
     pub host_pool_id: Uuid,
     pub pool_type: PoolType,
     pub status: String,
+    pub capacity_retired: bool,
     pub supervisor_epoch: i64,
     /// `None` for a legacy host still addressed by single-host controller config.
     pub transport: Option<TransportIdentity>,
@@ -383,7 +384,10 @@ impl RegisteredHost {
     /// owner identity and epoch regardless of this flag.
     #[must_use]
     pub fn admits_new_work(&self) -> bool {
-        self.status == "ready" && self.heartbeat_fresh && self.transport.is_some()
+        self.status == "ready"
+            && !self.capacity_retired
+            && self.heartbeat_fresh
+            && self.transport.is_some()
     }
 }
 
@@ -441,6 +445,7 @@ fn host_from_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredHost, Registry
         host_pool_id: row.try_get("host_pool_id")?,
         pool_type: PoolType::parse(row.try_get("type")?)?,
         status: row.try_get("status")?,
+        capacity_retired: row.try_get("capacity_retired")?,
         supervisor_epoch: row.try_get("supervisor_epoch")?,
         transport,
         provider_ref: row.try_get("provider_ref")?,
@@ -458,7 +463,7 @@ fn host_from_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredHost, Registry
     })
 }
 
-const HOST_SELECT: &str = "SELECT h.id,h.host_pool_id,p.type,h.status,h.supervisor_epoch,h.endpoint,
+const HOST_SELECT: &str = "SELECT h.id,h.host_pool_id,p.type,h.status,(h.capacity_retired_at IS NOT NULL) capacity_retired,h.supervisor_epoch,h.endpoint,
     h.transport_server_name,h.transport_certificate_sha256,h.provider_ref,h.cpu_capacity,h.memory_capacity_mib,h.disk_capacity_mib,h.compatibility,h.runtime_capabilities,
     h.runtime_capabilities_epoch,h.last_seen_at,
     (extract(epoch FROM clock_timestamp()-h.last_seen_at)*1000)::bigint AS heartbeat_age_ms,

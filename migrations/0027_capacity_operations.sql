@@ -1,6 +1,7 @@
 -- #196; 0026 reserved for concurrent #195 fencing work.
 -- These are infrastructure intents, never project/sandbox lifecycle authority.
-ALTER TABLE hosts ADD COLUMN capacity_retired_at timestamptz;
+ALTER TABLE hosts ADD COLUMN capacity_retired_at timestamptz,
+    ADD CONSTRAINT hosts_retired_closed CHECK (capacity_retired_at IS NULL OR status='draining');
 CREATE TABLE capacity_operations (
     id uuid PRIMARY KEY,
     host_pool_id uuid NOT NULL REFERENCES host_pools(id),

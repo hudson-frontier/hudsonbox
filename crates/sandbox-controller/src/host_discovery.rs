@@ -352,6 +352,7 @@ mod tests {
 
     fn registered(worker: &DiscoveredWorker) -> RegisteredHost {
         RegisteredHost {
+            capacity_retired: false,
             host_id: worker.host_id,
             host_pool_id: uuid::Uuid::now_v7(),
             pool_type: PoolType::Standalone,
