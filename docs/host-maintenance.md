@@ -1,6 +1,6 @@
 # Local host maintenance
 
-The offline `sandbox-host-manager` command provides initial host provisioning and draining for [#116](https://github.com/hudson-frontier/hudsonbox/issues/116). It uses trusted operator database access; no new public management endpoint or guest authority is exposed. [Capability enrollment](host-capabilities.md) adds a separate operator-approved compatibility contract. Backup/restore rehearsals and supported-host upgrade qualification remain work in that issue.
+The offline `sandbox-host-manager` command provides initial host provisioning and draining for [#116](https://github.com/hudson-frontier/hudsonbox/issues/116), and the [multi-host registry](#host-registry-and-pools) for [#192](https://github.com/hudson-frontier/hudsonbox/issues/192). It uses trusted operator database access; no new public management endpoint or guest authority is exposed. [Capability enrollment](host-capabilities.md) adds a separate operator-approved compatibility contract. Backup/restore rehearsals and supported-host upgrade qualification remain work in that issue.
 
 ## Private configuration and commands
 
@@ -111,6 +111,143 @@ does not replace a backup/restore protocol or authorize a database rollback.
 
 Follow the [offline upgrade and recovery procedure](operator-recovery.md) before replacing application/supervisor versions or restoring database state. It includes the compatibility matrix, private backup boundaries, quarantine requirements and an executable PostgreSQL dump/restore rehearsal. A restored epoch is not independent proof that old execution or storage writers have stopped.
 
+## Host registry and pools
+
+[Migration 0025](../migrations/0025_host_registry.sql) implements the accepted
+[`host_pools`, `project_host_pool_access` and `hosts` extension](data-models.md#accepted-v1-fleet-and-warm-pool-model).
+The [registry store](../crates/sandbox-store/src/host_registry.rs) exposes the
+read model a controller resolves per host: identity, pool and type, status,
+epoch, endpoint, expected transport identity, provider reference, capacity,
+approved/observed capabilities and heartbeat freshness (an authenticated
+observation within 30 seconds). This slice adds no controller routing,
+cross-host placement or project-access enforcement; those are
+[#193](https://github.com/hudson-frontier/hudsonbox/issues/193) and
+[#194](https://github.com/hudson-frontier/hudsonbox/issues/194).
+
+### Pools
+
+`put-pool` creates or updates one pool from an operator-owned `0600` JSON
+document with the same file bounds as other manager inputs:
+
+```json
+{"version":1,"id":"0190f000-0000-7000-8000-00000000c0de","name":"edge","type":"standalone","min_ready_hosts":0,"max_hosts":4,"placement_policy":{"version":1,"tenancy":"shared"},"provider_config":{"version":1},"credential_secret_ref":null}
+```
+
+```sh
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json put-pool --pool-config /private/pool.json
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json grant-pool-access --pool-id POOL_UUID --project-id PROJECT_ID
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json registry [--pool-id POOL_UUID]
+```
+
+Names are unique DNS labels. `max_hosts` is at least `min_ready_hosts`, at most
+100000, never below the enrolled host count, and bounds provisioning into the
+pool. `provider_config` is decoded against `type` with unknown fields refused:
+`standalone` accepts only `{"version":1}`; `k8s` accepts `version`, a namespace
+label and `worker_label_selector` for the future worker adapter
+([#197](https://github.com/hudson-frontier/hudsonbox/issues/197)).
+`credential_secret_ref` is an opaque reference name, never a secret value.
+`placement_policy.tenancy` is `shared` or `dedicated`; a dedicated pool accepts
+exactly one project grant. An exact retry changes nothing.
+
+A type change is refused while any host is enrolled in the pool. Hosts carry
+every reservation and unfinished operation, are never deleted and never move
+between pools, so in practice a pool's type is fixed once it holds a host.
+Provisioning and pool updates lock the pool row, so a concurrent enrollment
+cannot race the check. Durable capacity operations do not exist yet; their
+implementation must join this check.
+
+`grant-pool-access` records an explicit, idempotent project/pool pair. A
+missing grant is denial; grants confer no host or maintenance authority.
+
+### Host enrollment and transport identity
+
+Add optional `host_pool_id` to the [provisioning document](#initial-host-provisioning).
+Absent means the backfilled legacy pool. The pool is part of the exact-retry
+tuple, and an existing host cannot be re-provisioned into a different pool.
+Replacing a worker means a new host identity.
+
+`set-transport` records how the controller reaches and authenticates one host:
+
+```json
+{"version":1,"endpoint":"https://10.0.0.5:7443","certificate_sha256":"<64 hex>","provider_ref":"rack-a-5"}
+```
+
+```sh
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json --host-id HOST_ID --host-epoch CURRENT_EPOCH \
+  set-transport --transport-config /private/transport.json
+```
+
+The endpoint must be `https://HOST:PORT` (DNS name, IPv4 or bracketed IPv6;
+no path, query or credentials) and is stored lowercased. The transport identity
+has three parts. All are required:
+
+- the existing CA-verified server certificate chain;
+- `transport_server_name`: the host-ID-bound subjectAltName
+  `host-<uuid>.sandbox.internal` the controller already requests. A database
+  check binds it to the row's own ID;
+- `transport_certificate_sha256`: SHA-256 of the exact host server leaf
+  certificate DER, the same pin format as the
+  [local PKI report](local-certificates.md).
+
+Endpoints, certificate fingerprints and per-pool provider references are
+unique across hosts, so two identities cannot share an address or server
+certificate. `RegisteredHost::verify_transport` refuses a connection whose
+epoch, endpoint or presented leaf certificate differs from the registration.
+A CA-valid certificate issued to another host, or a new certificate not yet
+registered, is a mismatch.
+
+The first registration and every change require the expected epoch on a
+`draining` host. A change clears `last_seen_at`, so `finish-drain` waits for
+authenticated health through the new registration. An exact retry reports the
+current state in any status without touching the row. A changed endpoint,
+certificate or provider reference on a ready or unhealthy host, or one with a
+stale epoch, is refused. Certificate rotation is therefore drain, `set-transport`
+and explicit reopening. Registration survives `advance-epoch`; the new epoch
+then owns further changes. Authenticated health and heartbeats only refresh
+freshness and capability observation. They never change the pool, endpoint,
+transport identity, provider reference, capacity or epoch, and never promote a
+draining host.
+
+### Discovery and provider routing
+
+`sandbox_controller::host_discovery` defines the provider-neutral
+`HostDiscovery` trait and the application-code `ProviderRouter` (pool type to
+adapter). `StandaloneStaticDiscovery` reads operator-configured addresses. A
+Kubernetes worker adapter implements the same trait for `k8s` pools. Without
+one, the router refuses `k8s` discovery rather than falling back. No Kubernetes
+dependency exists. Discovery is advisory:
+
+```sh
+cargo run -p sandbox-controller --bin sandbox-host-manager -- \
+  --database-config /private/database.json discover --pool-id POOL_UUID \
+  --discovery-config /private/standalone-hosts.json
+```
+
+The `0600` discovery file is
+`{"version":1,"pools":{"POOL_UUID":[{"host_id":"hst_...","endpoint":"https://...","certificate_sha256":"...","provider_ref":"..."}]}}`.
+Duplicate host IDs, endpoints, certificates or provider references are refused.
+The report lists matched, mismatched, unregistered, missing and unaddressed
+hosts. It never enrolls a host, issues an epoch or edits a registration; each
+correction remains an explicit operator command above.
+
+### Legacy backfill and upgrade
+
+Migration 0025 creates the shared standalone pool `legacy-standalone`
+(`00000000-0000-4000-8000-000000000001`, `min_ready_hosts` 0, `max_hosts`
+1000 or the existing host count if larger). It assigns every existing host to
+this pool, which is also the column default. Legacy hosts keep NULL endpoint
+and transport identity, meaning the single-host controller configuration still
+supplies the address. All prior constraints, epochs, capacity, health and
+reservations are unchanged. No project receives pool access implicitly; current
+placement does not consult grants yet, and #194 must define how existing
+projects obtain them before enforcing access. Apply the migration before
+starting a new controller; roll back by restoring a compatible build, not by
+dropping the columns under live hosts.
+
 ## Validation and limits
 
 [Store tests](../crates/sandbox-store/tests/host_maintenance.rs) exercise epoch fencing, idempotence, unhealthy refusal, stale health and explicit reopening. [Controller tests](../crates/sandbox-controller/tests/host_maintenance.rs) prove placement exclusion while an admitted command reports a nonzero exit, followed by explicit destruction and reopening. The command's unit test rejects unsafe/private configuration boundaries.
@@ -125,6 +262,15 @@ identity and epoch together. A pinned unknown command stays reported on its
 original host after a fixture-only replacement owner exists elsewhere. These
 tests do not implement a host registry, per-host routing, cross-host scheduling
 or replacement placement.
+
+[Registry tests](../crates/sandbox-store/tests/host_registry.rs) cover legacy
+backfill over pre-0025 data, pool validation and bounds, blocked type changes,
+unique project grants and dedicated pools, duplicate endpoint/certificate/provider
+identities, certificate mismatch, restart with a new epoch, refused endpoint
+changes outside drain, heartbeat immutability and stale/never-seen freshness.
+[Discovery unit tests](../crates/sandbox-controller/src/host_discovery.rs) cover
+routing by pool type, duplicate discovery identities and reconciliation reports.
+These simulated identities make no gRPC connection.
 
 [Provisioning tests](../crates/sandbox-store/tests/host_provisioning.rs) cover a
 new draining host, exact and competing retries, changed-input conflicts,

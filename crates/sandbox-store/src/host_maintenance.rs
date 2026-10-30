@@ -48,6 +48,9 @@ pub struct HostProvision {
     pub version: u32,
     pub capacity: HostCapacity,
     pub capabilities: sandbox_protocol::host_capabilities::Capabilities,
+    /// Owning pool; absent means the backfilled legacy standalone pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_pool_id: Option<uuid::Uuid>,
 }
 impl HostProvision {
     pub fn from_json(bytes: &[u8]) -> Result<Self, Error> {
@@ -80,7 +83,7 @@ impl HostProvision {
     }
 }
 
-async fn report(
+pub(crate) async fn report(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     host: HostId,
     expected_epoch: i64,
@@ -194,11 +197,30 @@ impl Store {
         sqlx::query("SET LOCAL lock_timeout='1s'")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,compatibility,supervisor_epoch,last_seen_at) VALUES($1,'draining',$2,$3,$4,$5,$6,NULL) ON CONFLICT(id) DO NOTHING")
-            .bind(host.uuid()).bind(cpu).bind(memory).bind(disk).bind(&policy).bind(expected_epoch)
-            .execute(&mut *tx).await?;
-        let matches: bool = sqlx::query_scalar("SELECT supervisor_epoch=$2 AND cpu_capacity=$3 AND memory_capacity_mib=$4 AND disk_capacity_mib=$5 AND compatibility=$6 FROM hosts WHERE id=$1 FOR UPDATE")
-            .bind(host.uuid()).bind(expected_epoch).bind(cpu).bind(memory).bind(disk).bind(&policy)
+        let pool = request
+            .host_pool_id
+            .unwrap_or(crate::host_registry::LEGACY_POOL_ID);
+        // Lock the pool before the host: serializes with pool type changes and
+        // bounds enrollment by max_hosts. A host never moves between pools.
+        let (max_hosts, enrolled, exists): (i32, i64, bool) = sqlx::query_as(
+            "SELECT max_hosts,(SELECT count(*) FROM hosts WHERE host_pool_id=$1),
+            EXISTS(SELECT 1 FROM hosts WHERE id=$2) FROM host_pools WHERE id=$1 FOR UPDATE",
+        )
+        .bind(pool)
+        .bind(host.uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::Conflict)?;
+        if !exists {
+            if enrolled >= i64::from(max_hosts) {
+                return Err(Error::Conflict);
+            }
+            sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,compatibility,supervisor_epoch,last_seen_at,host_pool_id) VALUES($1,'draining',$2,$3,$4,$5,$6,NULL,$7) ON CONFLICT(id) DO NOTHING")
+                .bind(host.uuid()).bind(cpu).bind(memory).bind(disk).bind(&policy).bind(expected_epoch).bind(pool)
+                .execute(&mut *tx).await?;
+        }
+        let matches: bool = sqlx::query_scalar("SELECT supervisor_epoch=$2 AND cpu_capacity=$3 AND memory_capacity_mib=$4 AND disk_capacity_mib=$5 AND compatibility=$6 AND host_pool_id=$7 FROM hosts WHERE id=$1 FOR UPDATE")
+            .bind(host.uuid()).bind(expected_epoch).bind(cpu).bind(memory).bind(disk).bind(&policy).bind(pool)
             .fetch_one(&mut *tx).await?;
         if !matches {
             return Err(Error::Conflict);

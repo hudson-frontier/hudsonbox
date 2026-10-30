@@ -46,6 +46,7 @@ fn request() -> HostProvision {
                 guest_protocol_version: 1,
             }],
         },
+        host_pool_id: None,
     }
 }
 async fn row(pool: &PgPool, id: HostId) -> Value {
