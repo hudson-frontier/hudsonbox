@@ -8,6 +8,7 @@ The repository is in **early implementation**. PostgreSQL-backed API routes, the
 | --- | --- | --- |
 | [Product goal](goal.md) | Product scope, core capabilities, and engineering priorities | What we are building and how validation supports the product |
 | [Architecture](architecture.md) | Components, client interfaces, stack, topology, isolation boundaries | What runs where and how data moves |
+| [Architecture v1 deployment snapshot](arch-v1.md) | Proposed standalone and Kubernetes deployment view; existing contracts remain authoritative | How clients, multiple hosts, microVMs, tenant boundaries and storage fit together |
 | [Data models](data-models.md) | Fields, relationships, IDs, database constraints, storage layout | What we persist and how records connect |
 | [Authentication](auth-design.md) | Project/Admin permissions, credentials, sessions, CSRF, revocation, audit semantics | Who can do what and how access is enforced |
 | [Lifecycle](lifecycle.md) | State transitions, completion evidence, deadlines, cancellation, recovery | How create/pause/resume/destroy actually work |
