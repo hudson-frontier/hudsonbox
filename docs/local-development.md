@@ -37,15 +37,47 @@ status is `passed`, `missing`, `failed` or informational `info`. `ready` means o
 that this profile's prerequisite checks passed. It does not certify a working
 service, VM boot, resource enforcement, networking policy or isolation.
 
-After fixing prerequisites, follow the existing [native development commands](implementation/dev-env.md#stage-0--everything-except-a-real-vm-on-macos)
-and [authenticated API setup](api-server.md). Starting local dependencies and
-provisioning credentials are explicit operator steps, not doctor side effects.
-The fake supervisor never executes customer code and is not an isolation substitute.
+## Build and test the control plane
 
+The API, controller, CLI and fake supervisor run natively on macOS or Linux.
+PostgreSQL and MinIO run through Compose. The fake supervisor starts no VM or
+customer process; real execution requires Linux/KVM.
+
+Install the pinned Rust toolchain, Python 3.11+, Node 24.9.0+, Docker Compose and
+`protoc` (`brew install protobuf` on macOS). Copy `.env.example` to `.env` for the
+local dependency configuration, then run:
+
+```sh
+make api-setup
+make sdk-setup
+make mcp-setup
+make up
+make check
+make down
+```
+
+`make down` keeps data. `make reset-db` drops the development schema; use it only
+for disposable development data. The default Compose project is `hudsonbox-dev`;
+set `COMPOSE_PROJECT_NAME` to reuse an existing project's volumes. Choose unused
+ports rather than stopping another instance. PostgreSQL and MinIO use ports
+55432 and 59000 by default. MinIO is built from [verified sources](../dev/object-storage/README.md).
+
+Follow [authenticated API setup](api-server.md) to provision and run the service.
 The [source installer](source-installation.md) builds committed native tools into
-a new private prefix and records their source and binary hashes. It provides
-application binaries; instance provisioning and runtime acceptance retain their
-separate gates.
+a new private prefix; installation is separate from instance setup and runtime qualification.
+
+Use the [Linux guide](linux-development.md) for the nested-aarch64 development
+host and pinned VM artifacts. The supervisor runs on Linux; the guest agent runs
+inside each microVM. Build image artifacts for each supported architecture;
+aarch64 development results do not qualify the supported x86_64 release envelope.
+
+History cleanup is opt-in. Configure [history retirement](history-reclamation.md#operator-activation)
+before `--retire-history`. Registered physical hosts can additionally use
+`--retire-allocations` for [whole-allocation reclamation](allocation-retirement.md#automatic-controller-worker);
+this requires history retirement and cannot run with simulation. For the periodic
+CLI integration test, first build `cargo build -p sandbox-controller --bin sandbox-controller`
+in the same Linux checkout. Use separate Cargo target directories across worktrees
+to avoid testing against another checkout's embedded migration set.
 
 ## Check the actual Linux runtime host
 
