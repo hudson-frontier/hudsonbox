@@ -396,3 +396,43 @@ psql check of the full migration chain, pre-0027 host preservation and lease/
 receipt constraints passed in an isolated temporary database on the existing
 local PostgreSQL service. No real Linux/KVM drain, retirement, performance or
 isolation evidence is claimed here.
+
+## Fleet diagnostics and incident runbooks
+
+The offline operator command `sandbox-host-manager --database-config <private-file> fleet-status`
+reads one bounded database snapshot. `fleet-status --prometheus` prints fixed-vocabulary
+Prometheus gauges for an operator-managed collector; it starts no listener. Database
+access is the operator authorization boundary. Do not forward this output through a
+project route. Host IDs/epochs remain operator-only; endpoints, certificate identities,
+provider references, credential references, payloads and terminal output are omitted.
+Project operation reads retain project authorization and fixed placement rejection codes.
+
+Reservations include every unreleased allocation, including unknown and previous-epoch
+owners, plus the same VMM memory and artifact disk overhead used by placement. Retired
+identities remain visible but have zero available capacity. Available means accounting
+headroom, not permission to place: readiness, freshness, policy and compatibility still
+apply. Queue age uses database admission time. Renewal lag measures time since the last
+allocation update while a renewal is pending, not supervisor watchdog lateness. Confirmed
+fenced counts require retained `fenced_absent` release evidence; unavailable, stale,
+draining, or a new epoch alone never establishes physical fencing.
+
+- **Drain:** use the existing epoch-bound `drain`, then inspect active reservations,
+  unknown allocations and pending cleanup. Finish existing work or reconcile explicit
+  termination evidence. Never refund reservations because the queue is slow. `finish-drain`
+  reopens only after the existing empty/fresh checks; it does not retire a host.
+- **Host loss:** inspect freshness, epoch and previous-epoch/unknown allocations. Restore
+  authenticated connectivity and reconcile the owner; retain capacity while unreachable.
+  Independent fencing or verified supervisor release evidence must precede replacement.
+  A diagnostic unavailable state must never be interpreted as confirmed fenced.
+- **Capacity exhaustion:** compare reserved and available resources including overhead,
+  active versus retired inventory, queue age and the fixed rejection counts. Check project
+  quota and pool grants before adding operator-managed capacity. No fallback outside an
+  allowed pool, automatic paid provisioning or forced reservation deletion is authorized.
+- **Certificate rotation:** drain first; use epoch-bound `set-transport` with private
+  configuration and the approved CA/server identity. Changing transport invalidates
+  freshness. Confirm authenticated health at the expected epoch before reopening. Failed
+  authentication means unavailable, not stopped or fenced. Keep old reservations until
+  reconciliation; certificate replacement is not allocation termination evidence.
+
+Portable SQL/fake-host tests and Linux/KVM qualification are separate evidence. These
+read models establish neither physical isolation nor cross-host recovery qualification.
