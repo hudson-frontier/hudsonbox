@@ -427,6 +427,14 @@ impl Manifest {
                     "invalid adopted member view"
                 ),
             }
+        } else {
+            // Nil placeholders decode only so inert warm members can reload;
+            // a cold allocation must always name real ownership.
+            let o = &self.start.owner;
+            ensure!(
+                !o.project.uuid().is_nil() && !o.sandbox.uuid().is_nil(),
+                "cold allocation must not use inert ownership placeholders"
+            );
         }
         ensure!(
             sandbox_protocol::resources::supported(
