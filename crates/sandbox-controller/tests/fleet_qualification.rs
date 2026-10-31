@@ -34,6 +34,7 @@ use sandbox_protocol::{
 use sandbox_store::{
     Store,
     capacity::{Action, Claim, Error as CapacityError, Request as CapacityRequest},
+    dispatch::DispatchError,
     host_maintenance::{HostCapacity, HostProvision},
     host_registry::{HostPoolSpec, PlacementPolicy, PoolType, Tenancy},
 };
@@ -135,6 +136,8 @@ impl Pki {
 struct Supervisor {
     endpoint: String,
     pin: String,
+    /// Server certificate and key PEM, so a test can model copied key material.
+    identity: (String, String),
     task: JoinHandle<()>,
 }
 
@@ -145,7 +148,15 @@ impl Drop for Supervisor {
 }
 
 async fn serve(pki: &Pki, fake: &FakeHost, identity: HostId) -> Supervisor {
-    let (cert, key, pin) = pki.server(identity);
+    serve_with(pki, fake, pki.server(identity)).await
+}
+
+/// Serve `fake` with the given server certificate, key and leaf pin.
+async fn serve_with(
+    pki: &Pki,
+    fake: &FakeHost,
+    (cert, key, pin): (String, String, String),
+) -> Supervisor {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("https://{}", listener.local_addr().unwrap());
     let control = InterceptedService::new(
@@ -180,6 +191,7 @@ async fn serve(pki: &Pki, fake: &FakeHost, identity: HostId) -> Supervisor {
     Supervisor {
         endpoint,
         pin,
+        identity: (cert, key),
         task,
     }
 }
@@ -526,6 +538,43 @@ impl Fleet {
         .await
         .unwrap();
         owner.map(HostId::from_uuid)
+    }
+
+    async fn last_seen(&self, host: HostId) -> bool {
+        sqlx::query_scalar("SELECT last_seen_at IS NOT NULL FROM hosts WHERE id=$1")
+            .bind(host.uuid())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Ownership invariants that must hold at every step of any fault mix:
+    /// no sandbox has two unreleased allocations, and every released
+    /// allocation carries supervisor release evidence for exactly that
+    /// allocation, host and epoch. Capacity is derived from unreleased
+    /// allocations, so this is also "no refund without fencing evidence".
+    async fn assert_single_live_owner(&self) {
+        let duplicated: Vec<(Uuid, i64)> = sqlx::query_as(
+            "SELECT sandbox_id,count(*) FROM allocations WHERE released_at IS NULL
+             GROUP BY sandbox_id HAVING count(*)>1",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        assert!(duplicated.is_empty(), "{duplicated:?}");
+        let unfenced: Vec<(Uuid, Option<Value>)> = sqlx::query_as(
+            "SELECT id,release_evidence FROM allocations WHERE released_at IS NOT NULL AND NOT (
+                status='released'
+                AND release_evidence->>'phase'='allocation_released'
+                AND right(release_evidence->>'allocation_id',36)=id::text
+                AND right(release_evidence->>'host_id',36)=host_id::text
+                AND (release_evidence->>'supervisor_epoch')::bigint=supervisor_epoch
+                AND (release_evidence->>'simulated')::boolean)",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        assert!(unfenced.is_empty(), "{unfenced:?}");
     }
 
     async fn unreleased(&self, sandbox: SandboxId) -> i64 {
@@ -1290,4 +1339,292 @@ async fn retire_replace_at_pool_max_routes_new_identity_without_inheriting_histo
     assert_eq!(fleet.fakes[1].total_starts().await, 2);
     assert_eq!(fleet.fakes[1].total_commands().await, 0);
     assert_eq!(fleet.host_history(old).await, old_history);
+}
+
+/// Tick until `operation` is durably unknown (its reply was lost).
+async fn until_unknown(fleet: &Fleet, controller: &mut Controller, operation: OperationId) {
+    for _ in 0..8 {
+        let _ = controller.tick().await;
+        if fleet.status(operation).await == "unknown" {
+            return;
+        }
+        fleet.retry_now(operation).await;
+    }
+    panic!("operation {operation} never became unknown");
+}
+
+/// Supervisors never push heartbeats: the controller dials the registered
+/// endpoint, verifies the pinned leaf certificate, and only then records an
+/// observation at the host ID and epoch the supervisor reports. A "heartbeat"
+/// from a duplicate process is therefore either a health reply to the
+/// controller or a direct store observation; both are exercised here.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn duplicate_supervisor_same_host_id_is_fenced(pool: PgPool) {
+    let fleet = Fleet::new(&pool, true).await;
+    let host = fleet.hosts[1];
+    // (a) Operator restart of B issues epoch 2, but the epoch-1 process keeps
+    // running and answering at the registered endpoint with its own key.
+    fleet.store.drain_host(host, 1).await.unwrap();
+    fleet.store.advance_host_epoch(host, 1).await.unwrap();
+    let old = &fleet.fakes[1];
+    let mut controller = fleet.controller(0).await;
+    // Only A admits work: fill it so later placement can only target B.
+    for project in [0, 1] {
+        let (create, sandbox) = fleet.create(project).await;
+        assert_eq!(fleet.drive(&mut controller, create).await, "succeeded");
+        assert_eq!(fleet.owner(sandbox).await, Some(fleet.hosts[0]));
+    }
+    // The controller's checks reached the old process, which reports epoch 1:
+    // identity is refused, so B has no fresh observation at epoch 2.
+    assert!(!fleet.last_seen(host).await);
+    // Old-epoch heartbeats cannot refresh the host, with or without capabilities.
+    assert!(matches!(
+        fleet.store.observe_configured_host(host, 1).await,
+        Err(DispatchError::HostUnavailable)
+    ));
+    assert!(matches!(
+        fleet
+            .store
+            .observe_configured_host_with_capabilities(
+                host,
+                1,
+                &capabilities().to_json().unwrap(),
+                true
+            )
+            .await,
+        Err(DispatchError::HostUnavailable)
+    ));
+    assert!(!fleet.last_seen(host).await);
+    assert!(fleet.store.finish_host_drain(host, 2).await.is_err());
+
+    // The fresh epoch-2 process is registered, observed and reopened.
+    let fresh = fake(host, 2).await;
+    let current = serve(&fleet.pki, &fresh, host).await;
+    register(&pool, host, &current.endpoint, &current.pin).await;
+    let mut controller = fleet.controller(0).await;
+    for _ in 0..3 {
+        let _ = controller.tick().await;
+    }
+    assert!(fleet.last_seen(host).await);
+    fleet.store.finish_host_drain(host, 2).await.unwrap();
+    // The old process keeps heartbeating; it is still refused.
+    assert!(matches!(
+        fleet.store.observe_configured_host(host, 1).await,
+        Err(DispatchError::HostUnavailable)
+    ));
+    let epoch: i64 = sqlx::query_scalar("SELECT supervisor_epoch FROM hosts WHERE id=$1")
+        .bind(host.uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(epoch, 2);
+
+    // The old process regains the address (stale registration with its own
+    // pin). Health reports epoch 1 against registered epoch 2 and is refused.
+    register(
+        &pool,
+        host,
+        &fleet.supervisors[1].endpoint,
+        &fleet.supervisors[1].pin,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut controller = fleet.controller(0).await;
+    let (waiting, queued) = fleet.create(0).await;
+    for _ in 0..4 {
+        fleet.retry_now(waiting).await;
+        let _ = controller.tick().await;
+    }
+    assert_ne!(fleet.status(waiting).await, "succeeded");
+    assert!(!fleet.last_seen(host).await);
+
+    // (b) A second process at the same host ID and the current epoch, with a
+    // CA-valid certificate for the same server name but its own key, takes
+    // over the address. The registered leaf pin refuses it before any RPC.
+    let twin = fake(host, 2).await;
+    let twin_supervisor = serve(&fleet.pki, &twin, host).await;
+    assert_ne!(twin_supervisor.pin, current.pin);
+    register(&pool, host, &twin_supervisor.endpoint, &current.pin).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut controller = fleet.controller(0).await;
+    for _ in 0..4 {
+        fleet.retry_now(waiting).await;
+        let _ = controller.tick().await;
+    }
+    assert_ne!(fleet.status(waiting).await, "succeeded");
+    assert!(!fleet.last_seen(host).await);
+
+    // Neither duplicate received any work; nothing was placed at epoch 1.
+    for duplicate in [old, &twin] {
+        assert_eq!(duplicate.total_starts().await, 0);
+        assert_eq!(duplicate.total_commands().await, 0);
+    }
+    assert_eq!(fresh.total_starts().await, 0);
+    let old_epoch: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM allocations WHERE host_id=$1 AND supervisor_epoch<>2",
+    )
+    .bind(host.uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(old_epoch, 0);
+    fleet.assert_single_live_owner().await;
+
+    // Restoring the genuine registration routes the queued create to the
+    // epoch-2 process only.
+    register(&pool, host, &current.endpoint, &current.pin).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut controller = fleet.controller(0).await;
+    assert_eq!(fleet.drive(&mut controller, waiting).await, "succeeded");
+    assert_eq!(fleet.owner(queued).await, Some(host));
+    let owner_epoch: i64 = sqlx::query_scalar(
+        "SELECT a.supervisor_epoch FROM sandboxes s JOIN allocations a ON a.id=s.current_allocation_id WHERE s.id=$1",
+    )
+    .bind(queued.uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner_epoch, 2);
+    let command = fleet.execute(0, queued).await;
+    assert_eq!(fleet.drive(&mut controller, command).await, "succeeded");
+    assert_eq!(fresh.total_starts().await, 1);
+    assert_eq!(fresh.total_commands().await, 1);
+    for duplicate in [old, &twin] {
+        assert_eq!(duplicate.total_starts().await, 0);
+        assert_eq!(duplicate.total_commands().await, 0);
+    }
+    fleet.assert_single_live_owner().await;
+}
+
+/// A process at the same host ID and epoch holding a copy of the registered
+/// certificate and key is indistinguishable at the transport and health
+/// layers. The safe behaviour is that it cannot supply release evidence for
+/// an allocation it never ran while the genuine process still holds it.
+///
+/// Observed (CI run 41219994173): the clone answers the stop with
+/// `FencedAbsent` from empty memory and the allocation is released. Same-epoch
+/// uniqueness of a supervisor process is an unenforced deployment assumption.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+#[ignore = "gap: a same-host, same-epoch clone holding the registered key can release capacity via FencedAbsent"]
+async fn same_epoch_clone_with_copied_key_cannot_release_capacity(pool: PgPool) {
+    let fleet = Fleet::new(&pool, true).await;
+    let mut controller = fleet.controller(0).await;
+    let sandboxes = fleet.fill(&mut controller).await;
+    let (project, on_b) = sandboxes[1];
+    let host = fleet.hosts[1];
+    let genuine = &fleet.supervisors[1];
+    let clone = fake(host, 1).await;
+    let (cert, key) = genuine.identity.clone();
+    let cloned = serve_with(&fleet.pki, &clone, (cert, key, genuine.pin.clone())).await;
+    assert_eq!(cloned.pin, genuine.pin);
+    // The clone takes over B's address; the registration is otherwise unchanged.
+    register(&pool, host, &cloned.endpoint, &genuine.pin).await;
+    let destroy = fleet.destroy(project, on_b).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut controller = fleet.controller(0).await;
+    for _ in 0..6 {
+        fleet.retry_now(destroy).await;
+        let _ = controller.tick().await;
+    }
+    // The genuine B still runs the sandbox; its slot must stay reserved.
+    assert_eq!(fleet.unreleased(on_b).await, 1);
+    assert_ne!(fleet.status(destroy).await, "succeeded");
+    assert_eq!(clone.total_starts().await, 0);
+}
+
+/// Partition, stale heartbeat, controller restart and lost replies across
+/// both hosts at once. Ownership is checked after every fault.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn combined_faults_preserve_single_live_owner(pool: PgPool) {
+    let fleet = Fleet::new(&pool, true).await;
+    let mut first = fleet.controller(0).await;
+    // A owns sandboxes 0 and 2; B owns 1 and 3.
+    let sandboxes = fleet.fill(&mut first).await;
+    fleet.assert_single_live_owner().await;
+    let (a, b) = (fleet.hosts[0], fleet.hosts[1]);
+
+    // Lost reply on A: the stop applies but the controller never hears it.
+    fleet.fakes[0].lose_next_stop_reply().await;
+    let lost_stop = fleet.destroy(sandboxes[0].0, sandboxes[0].1).await;
+    until_unknown(&fleet, &mut first, lost_stop).await;
+    assert_eq!(fleet.unreleased(sandboxes[0].1).await, 1);
+    fleet.assert_single_live_owner().await;
+
+    // Partition B, request a destroy there, then let B's heartbeat go stale.
+    fleet.partition(1).await;
+    let stranded = fleet.destroy(sandboxes[1].0, sandboxes[1].1).await;
+    sqlx::query(
+        "UPDATE hosts SET last_seen_at=clock_timestamp()-interval '31 seconds' WHERE id=$1",
+    )
+    .bind(b.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    fleet.store.reconcile_unavailable_hosts().await.unwrap();
+    // A heartbeat at any epoch other than B's current one cannot refresh it.
+    assert!(fleet.store.observe_configured_host(b, 2).await.is_err());
+    for _ in 0..3 {
+        fleet.retry_now(stranded).await;
+        let _ = first.tick().await;
+    }
+    assert_ne!(fleet.status(stranded).await, "succeeded");
+    for &(_, sandbox) in [&sandboxes[1], &sandboxes[3]] {
+        assert_eq!(fleet.unreleased(sandbox).await, 1);
+    }
+    fleet.assert_single_live_owner().await;
+
+    // A frees one slot through confirmed cleanup; a create there loses its reply.
+    let confirmed = fleet.destroy(sandboxes[2].0, sandboxes[2].1).await;
+    assert_eq!(fleet.drive(&mut first, confirmed).await, "succeeded");
+    assert_eq!(fleet.unreleased(sandboxes[2].1).await, 0);
+    fleet.fakes[0].lose_next_create_reply().await;
+    let (create, placed) = fleet.create(1).await;
+    until_unknown(&fleet, &mut first, create).await;
+    assert_eq!(fleet.owner(placed).await, Some(a));
+    assert_eq!(fleet.unreleased(placed).await, 1);
+    fleet.assert_single_live_owner().await;
+
+    // Controller restart: the replacement has no in-memory state and resolves
+    // both uncertain A operations by inspection, without replaying a start.
+    drop(first);
+    let mut second = fleet.controller(0).await;
+    assert_eq!(fleet.drive(&mut second, create).await, "succeeded");
+    assert_eq!(fleet.owner(placed).await, Some(a));
+    assert_eq!(fleet.drive(&mut second, lost_stop).await, "succeeded");
+    assert_eq!(fleet.unreleased(sandboxes[0].1).await, 0);
+    assert_eq!(fleet.fakes[0].total_starts().await, 3);
+    fleet.assert_single_live_owner().await;
+
+    // B is still partitioned: the restarted controller cannot finish its
+    // destroy, and no capacity there is refunded from absence of contact.
+    for _ in 0..3 {
+        fleet.retry_now(stranded).await;
+        let _ = second.tick().await;
+    }
+    assert_ne!(fleet.status(stranded).await, "succeeded");
+    for &(_, sandbox) in [&sandboxes[1], &sandboxes[3]] {
+        assert_eq!(fleet.unreleased(sandbox).await, 1);
+    }
+    fleet.assert_single_live_owner().await;
+
+    // B heals; another restarted controller confirms the stop and only then
+    // releases. Nothing was ever started twice on either host.
+    fleet.heal(1).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    drop(second);
+    let mut third = fleet.controller(0).await;
+    assert_eq!(fleet.drive(&mut third, stranded).await, "succeeded");
+    assert_eq!(fleet.unreleased(sandboxes[1].1).await, 0);
+    assert_eq!(fleet.unreleased(sandboxes[3].1).await, 1);
+    assert_eq!(fleet.owner(sandboxes[3].1).await, Some(b));
+    assert_eq!(fleet.fakes[0].total_starts().await, 3);
+    assert_eq!(fleet.fakes[1].total_starts().await, 2);
+    let live: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT host_id,count(*) FROM allocations WHERE released_at IS NULL GROUP BY host_id ORDER BY host_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, vec![(a.uuid(), 1), (b.uuid(), 1)]);
+    fleet.assert_single_live_owner().await;
 }
