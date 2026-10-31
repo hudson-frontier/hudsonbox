@@ -13,7 +13,8 @@ tonic-prost-build = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "time"] }
+rustix = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "time", "sync"] }
 tokio-rustls = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true }

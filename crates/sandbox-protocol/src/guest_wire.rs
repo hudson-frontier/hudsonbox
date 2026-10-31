@@ -20,6 +20,9 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_CONNECTIONS: usize = 32;
 pub const ALPN: &[u8] = b"hudson-guest/1";
+/// Distinct protocol for an unbound warm member's bind channel (#188). Never
+/// negotiated by allocation endpoints, so neither side can be confused.
+pub const MEMBER_ALPN: &[u8] = b"hudson-warm/1";
 
 pub async fn read_frame<T: Message + Default>(io: &mut (impl AsyncRead + Unpin)) -> Result<T> {
     tokio::time::timeout(IO_TIMEOUT, async {
@@ -47,6 +50,10 @@ pub async fn write_frame<T: Message>(io: &mut (impl AsyncWrite + Unpin), value: 
 pub fn guest_name(allocation: AllocationId) -> String {
     format!("allocation-{}.sandbox.internal", allocation.uuid())
 }
+/// Server name of an unbound warm member's bind endpoint.
+pub fn member_name(member: uuid::Uuid) -> String {
+    format!("warm-{member}.sandbox.internal")
+}
 fn certificates(bytes: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_slice_iter(bytes)
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -64,34 +71,81 @@ fn roots(pem: &[u8]) -> Result<rustls::RootCertStore> {
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
+/// Check a newly installed allocation certificate's CA, validity, TLS server
+/// purpose and exact allocation SAN before the guest commits its identity.
+pub(crate) fn validate_server_identity(
+    ca: &[u8],
+    cert: &[u8],
+    allocation: AllocationId,
+    now_ms: i64,
+) -> Result<()> {
+    use rustls::{client::danger::ServerCertVerifier, pki_types::UnixTime};
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots(ca)?),
+        provider(),
+    )
+    .build()?;
+    let chain = certificates(cert)?;
+    let now = if now_ms == 0 {
+        UnixTime::now()
+    } else {
+        ensure!(now_ms > 0, "invalid identity time");
+        UnixTime::since_unix_epoch(Duration::from_millis(now_ms as u64))
+    };
+    verifier.verify_server_cert(
+        &chain[0],
+        &chain[1..],
+        &ServerName::try_from(guest_name(allocation))?,
+        &[],
+        now,
+    )?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ServerTls {
     acceptor: TlsAcceptor,
     peer_pin: [u8; 32],
+    alpn: &'static [u8],
 }
 #[derive(Clone)]
 pub struct ClientTls {
     connector: TlsConnector,
     peer_pin: [u8; 32],
     name: ServerName<'static>,
+    alpn: &'static [u8],
 }
 fn peer(
     certs: Option<&[CertificateDer<'_>]>,
     expected: &[u8; 32],
     alpn: Option<&[u8]>,
+    required: &[u8],
 ) -> Result<()> {
     let first = certs
         .and_then(|v| v.first())
         .context("missing peer certificate")?;
     let actual: [u8; 32] = Sha256::digest(first.as_ref()).into();
     ensure!(
-        actual == *expected && alpn == Some(ALPN),
+        actual == *expected && alpn == Some(required),
         "guest peer identity or ALPN mismatch"
     );
     Ok(())
 }
 impl ServerTls {
     pub fn new(ca: &[u8], cert: &[u8], key: &[u8], host_pin: [u8; 32]) -> Result<Self> {
+        Self::with_alpn(ca, cert, key, host_pin, ALPN)
+    }
+    /// An unbound warm member's bind endpoint ([`MEMBER_ALPN`]).
+    pub fn member(ca: &[u8], cert: &[u8], key: &[u8], host_pin: [u8; 32]) -> Result<Self> {
+        Self::with_alpn(ca, cert, key, host_pin, MEMBER_ALPN)
+    }
+    fn with_alpn(
+        ca: &[u8],
+        cert: &[u8],
+        key: &[u8],
+        host_pin: [u8; 32],
+        alpn: &'static [u8],
+    ) -> Result<Self> {
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
             Arc::new(roots(ca)?),
             provider(),
@@ -104,11 +158,12 @@ impl ServerTls {
                 certificates(cert)?,
                 PrivateKeyDer::from_pem_slice(key).context("invalid private key")?,
             )?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = vec![alpn.to_vec()];
         config.max_early_data_size = 0;
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             peer_pin: host_pin,
+            alpn,
         })
     }
     pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
@@ -122,6 +177,7 @@ impl ServerTls {
             tls.get_ref().1.peer_certificates(),
             &self.peer_pin,
             tls.get_ref().1.alpn_protocol(),
+            self.alpn,
         )?;
         Ok(tls)
     }
@@ -134,6 +190,26 @@ impl ClientTls {
         guest_pin: [u8; 32],
         allocation: AllocationId,
     ) -> Result<Self> {
+        Self::with_alpn(ca, cert, key, guest_pin, guest_name(allocation), ALPN)
+    }
+    /// Connect to an unbound warm member's bind endpoint.
+    pub fn member(
+        ca: &[u8],
+        cert: &[u8],
+        key: &[u8],
+        guest_pin: [u8; 32],
+        member: uuid::Uuid,
+    ) -> Result<Self> {
+        Self::with_alpn(ca, cert, key, guest_pin, member_name(member), MEMBER_ALPN)
+    }
+    fn with_alpn(
+        ca: &[u8],
+        cert: &[u8],
+        key: &[u8],
+        guest_pin: [u8; 32],
+        name: String,
+        alpn: &'static [u8],
+    ) -> Result<Self> {
         let mut config = rustls::ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_root_certificates(roots(ca)?)
@@ -141,12 +217,13 @@ impl ClientTls {
                 certificates(cert)?,
                 PrivateKeyDer::from_pem_slice(key).context("invalid private key")?,
             )?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = vec![alpn.to_vec()];
         config.enable_early_data = false;
         Ok(Self {
             connector: TlsConnector::from(Arc::new(config)),
             peer_pin: guest_pin,
-            name: ServerName::try_from(guest_name(allocation))?,
+            name: ServerName::try_from(name)?,
+            alpn,
         })
     }
     pub async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
@@ -163,6 +240,7 @@ impl ClientTls {
             tls.get_ref().1.peer_certificates(),
             &self.peer_pin,
             tls.get_ref().1.alpn_protocol(),
+            self.alpn,
         )?;
         Ok(tls)
     }

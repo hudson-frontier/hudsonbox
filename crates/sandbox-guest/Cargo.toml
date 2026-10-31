@@ -25,6 +25,8 @@ hex = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+uuid = { workspace = true }
 rcgen = { workspace = true }
 sandbox-supervisor = { workspace = true }
 tempfile = { workspace = true }

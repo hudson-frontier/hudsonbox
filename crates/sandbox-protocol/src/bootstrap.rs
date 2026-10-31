@@ -7,7 +7,7 @@ use std::io::Read;
 pub const DEVICE_BYTES: usize = 128 * 1024;
 pub const MAX_BODY: usize = 64 * 1024;
 const MAGIC: &[u8; 8] = b"HDSBOOT1";
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bootstrap {
     pub version: u32,
@@ -57,31 +57,43 @@ impl Bootstrap {
     }
     pub fn encode_device(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        let body = serde_json::to_vec(self)?;
-        ensure!(body.len() <= MAX_BODY, "bootstrap body too large");
-        let mut bytes = Vec::with_capacity(DEVICE_BYTES);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&body);
-        bytes.resize(DEVICE_BYTES, 0);
-        Ok(bytes)
+        frame(&serde_json::to_vec(self)?)
     }
-    pub fn read_device(mut reader: impl Read) -> Result<Self> {
-        let mut header = [0u8; 12];
-        reader.read_exact(&mut header)?;
-        ensure!(&header[..8] == MAGIC, "unsupported bootstrap device");
-        let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
-        ensure!(
-            length > 0 && length <= MAX_BODY,
-            "invalid bootstrap body size"
-        );
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body)?;
+    /// Version 1 only. A warm member device (version 2) is refused here, so a
+    /// guest without late-binding support never boots as a member.
+    pub fn read_device(reader: impl Read) -> Result<Self> {
+        let body = read_body(reader)?;
         let bootstrap: Self =
             serde_json::from_slice(&body).map_err(|_| anyhow::anyhow!("invalid bootstrap body"))?;
         bootstrap.validate()?;
         Ok(bootstrap)
     }
+}
+/// Device framing shared by every bootstrap body version.
+pub(crate) fn frame(body: &[u8]) -> Result<Vec<u8>> {
+    ensure!(
+        !body.is_empty() && body.len() <= MAX_BODY,
+        "bootstrap body too large"
+    );
+    let mut bytes = Vec::with_capacity(DEVICE_BYTES);
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(body);
+    bytes.resize(DEVICE_BYTES, 0);
+    Ok(bytes)
+}
+pub(crate) fn read_body(mut reader: impl Read) -> Result<Vec<u8>> {
+    let mut header = [0u8; 12];
+    reader.read_exact(&mut header)?;
+    ensure!(&header[..8] == MAGIC, "unsupported bootstrap device");
+    let length = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    ensure!(
+        length > 0 && length <= MAX_BODY,
+        "invalid bootstrap body size"
+    );
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body)?;
+    Ok(body)
 }
 #[cfg(test)]
 mod tests {
