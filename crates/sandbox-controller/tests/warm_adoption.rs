@@ -777,5 +777,121 @@ async fn previous_cleanup_never_destroys_an_adopted_member(pool: PgPool) {
     assert!(f.store.warm_pool_members(policy).await.unwrap()[0]["cleanup_evidence"].is_null());
 }
 
+/// vCPU held on the fixture host by the same rows placement charges:
+/// unreleased allocations plus unassigned warm reservations.
+async fn held_vcpu(f: &Fixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(vcpu),0)::bigint FROM (
+         SELECT vcpu FROM allocations WHERE released_at IS NULL AND host_id=$1
+         UNION ALL SELECT m.vcpu FROM warm_pool_members m
+         LEFT JOIN allocations a ON a.id=m.claimed_allocation_id
+         WHERE m.host_id=$1 AND (m.state IN ('preparing','ready','retiring')
+            OR (m.state='claiming' AND a.released_at IS NOT NULL))) r",
+    )
+    .bind(f.config.host.uuid())
+    .fetch_one(f.store.pool())
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn destroyed_adopted_sandbox_releases_once_and_is_never_repooled(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let policy = warm(&f, 2).await;
+    let mut controller = connect(&f).await;
+    assert_eq!(controller.warm_upkeep(4).await.unwrap().reserved, 2);
+    assert_eq!(held_vcpu(&f).await, 4);
+    let (_, sandbox) = f.admit().await;
+    assert_eq!(controller.tick().await.unwrap(), Tick::Confirmed);
+    assert_eq!(f.fake.warm_adoptions().await, 1);
+    assert_eq!(f.fake.total_starts().await, 0);
+    let (adopted, allocation): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT id,claimed_allocation_id FROM warm_pool_members WHERE state='assigned'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // The adopted reservation moved to the allocation: still 4 vCPU, not 6.
+    assert_eq!(held_vcpu(&f).await, 4);
+    let pass = controller.warm_upkeep(4).await.unwrap();
+    assert!(pass.steps.is_empty(), "host is full: {pass:?}");
+
+    let (status, body) = f
+        .send(
+            "POST",
+            &format!("/v1/sandboxes/{sandbox}/destroy"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, http::StatusCode::ACCEPTED, "{body}");
+    assert_eq!(controller.tick().await.unwrap(), Tick::Confirmed);
+    let released: bool =
+        sqlx::query_scalar("SELECT released_at IS NOT NULL FROM allocations WHERE id=$1")
+            .bind(allocation)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(released);
+    // Released exactly once: through the allocation; the assigned member adds
+    // nothing back and only the other ready member still holds.
+    assert_eq!(held_vcpu(&f).await, 2);
+
+    // Upkeep refills with a brand new member; the used one is never offered.
+    let pass = controller.warm_upkeep(4).await.unwrap();
+    assert_eq!(pass.steps, vec![Step::Prepared], "{pass:?}");
+    let members = f.store.warm_pool_members(policy).await.unwrap();
+    assert_eq!(members.len(), 3);
+    let fresh: Vec<Uuid> = members
+        .iter()
+        .filter(|m| m["claimed_allocation_id"].is_null())
+        .map(|m| m["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(fresh.len(), 2);
+    assert!(!fresh.contains(&adopted));
+    assert_eq!(held_vcpu(&f).await, 4);
+    let old: (String, Option<Uuid>, Option<Value>) = sqlx::query_as(
+        "SELECT state,claimed_allocation_id,cleanup_evidence FROM warm_pool_members WHERE id=$1",
+    )
+    .bind(adopted)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(old, ("assigned".into(), Some(allocation), None));
+    let retires: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM capacity_operations WHERE target_ref=$1 AND kind='warm_retire'",
+    )
+    .bind(adopted.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retires, 0, "an adopted member is never warm-retired");
+
+    // Neither re-readying nor detaching the old member is accepted.
+    for update in [
+        "UPDATE warm_pool_members SET state='ready',lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+        "UPDATE warm_pool_members SET state='ready',claimed_allocation_id=NULL,
+         lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+        "UPDATE warm_pool_members SET state='retiring',claimed_allocation_id=NULL WHERE id=$1",
+    ] {
+        assert!(
+            sqlx::query(update)
+                .bind(adopted)
+                .execute(&pool)
+                .await
+                .is_err(),
+            "{update}"
+        );
+    }
+    let after: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state,claimed_allocation_id FROM warm_pool_members WHERE id=$1")
+            .bind(adopted)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(after, ("assigned".into(), Some(allocation)));
+    assert_eq!(f.fake.warm_adoptions().await, 1);
+    assert_eq!(f.fake.total_starts().await, 0);
+}
+
 #[path = "warm_adoption/cleanup_transport.rs"]
 mod cleanup_transport;
