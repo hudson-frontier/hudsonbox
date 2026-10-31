@@ -152,7 +152,7 @@ impl Controller {
                 .await
                 .is_err()
         {
-            tracing::warn!("host RPC telemetry persistence failed");
+            eprintln!("host RPC telemetry persistence failed");
         }
         result
     }

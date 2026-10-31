@@ -3,12 +3,15 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #[allow(dead_code)]
 mod common;
+use axum::body::Body;
 use common::Fixture;
+use http::Request;
 use sandbox_controller::Tick;
 use sandbox_protocol::{HostId, Id, supervisor::supervisor_server::Supervisor};
 use sandbox_store::{dispatch::DispatchError, fleet::prometheus};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tower::ServiceExt;
 
 async fn host(f: &Fixture, id: HostId) -> Value {
     let mut value = f.store.fleet_status().await.unwrap()["hosts"]
@@ -208,7 +211,18 @@ async fn actual_failed_health_counts_without_fencing_or_cross_host_changes(pool:
     assert_eq!(returned["fresh"], true);
     assert_eq!(returned["rpc_failures"], failed["rpc_failures"]);
     for route in ["/v1/hosts", "/v1/fleet-status", "/v1/metrics"] {
-        let (status, _) = a.send("GET", route, Value::Null).await;
-        assert_eq!(status, 404);
+        for token in [None, Some(&a.token)] {
+            let mut request = Request::builder().uri(route);
+            if let Some(token) = token {
+                request = request.header("authorization", format!("Bearer {token}"));
+            }
+            let response = a
+                .app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404);
+        }
     }
 }
