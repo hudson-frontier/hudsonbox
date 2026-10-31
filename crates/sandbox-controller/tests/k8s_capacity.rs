@@ -308,6 +308,84 @@ fn provision_config(pool: Uuid) -> HostProvision {
     provision(Some(pool))
 }
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn unretired_warm_members_block_pod_retirement_until_cleanup(pg: PgPool) {
+    let (store, pool, request, api, router) = setup(pg.clone()).await;
+    let provision = enqueue_claim(&store, pool, "new", &request).await;
+    router.apply(&store, &provision).await.unwrap();
+    fresh(&store, &request).await;
+    let claim = enqueue_claim(
+        &store,
+        pool,
+        "retire",
+        &Request {
+            action: Action::Retire,
+            ..request.clone()
+        },
+    )
+    .await;
+    let template = Uuid::now_v7();
+    let policy = Uuid::now_v7();
+    let member = Uuid::now_v7();
+    sqlx::query("INSERT INTO sandbox_templates(id,name,version,publication,image_digest,vcpu,memory_mib,disk_mib,boot_config,compatibility) VALUES($1,'k8s-warm',1,'shared',$2,1,512,1024,'{}','{}')")
+        .bind(template).bind(format!("sha256:{}", "a".repeat(64))).execute(&pg).await.unwrap();
+    sqlx::query("INSERT INTO warm_pool_policies(id,template_id,host_pool_id,min_ready,max_total,max_per_host,idle_ttl_seconds,enabled) VALUES($1,$2,$3,0,1,1,600,true)")
+        .bind(policy).bind(template).bind(pool).execute(&pg).await.unwrap();
+    // An expired lease and absent prepare receipt represent an unknown prepare
+    // outcome. No allocation or customer operation accounts for this reservation.
+    sqlx::query("INSERT INTO warm_pool_members(id,pool_id,host_id,supervisor_epoch,template_id,vcpu,memory_mib,disk_mib,state,lease_expires_at) VALUES($1,$2,$3,1,$4,1,512,1024,'preparing',clock_timestamp()-interval '1 minute')")
+        .bind(member).bind(policy).bind(request.host.uuid()).bind(template).execute(&pg).await.unwrap();
+    let initial_calls = api.calls.lock().unwrap().clone();
+    for state in ["preparing", "ready", "retiring"] {
+        sqlx::query("UPDATE hosts SET last_seen_at=clock_timestamp() WHERE id=$1")
+            .bind(request.host.uuid())
+            .execute(&pg)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE warm_pool_members SET state=$2,vm_ref=CASE WHEN $2='preparing' THEN NULL ELSE 'warm-vm' END,prepare_receipt=CASE WHEN $2='preparing' THEN NULL ELSE '{}'::jsonb END,lease_expires_at=CASE WHEN $2='preparing' THEN clock_timestamp()-interval '1 minute' ELSE clock_timestamp()+interval '1 minute' END WHERE id=$1")
+            .bind(member).bind(state).execute(&pg).await.unwrap();
+        let report = store.host_maintenance(request.host, 1).await.unwrap();
+        assert_eq!(report.status, "draining");
+        assert_eq!(report.outstanding_allocations, 0);
+        assert_eq!(report.unfinished_operations, 0);
+        assert_eq!(report.unretired_warm_members, 1);
+        assert!(router.apply(&store, &claim).await.is_err(), "{state}");
+        assert_eq!(*api.calls.lock().unwrap(), initial_calls);
+        let closed: bool =
+            sqlx::query_scalar("SELECT capacity_retired_at IS NOT NULL FROM hosts WHERE id=$1")
+                .bind(request.host.uuid())
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+        assert!(!closed);
+    }
+    sqlx::query("UPDATE warm_pool_members SET state='retired',cleanup_evidence='{}' WHERE id=$1")
+        .bind(member)
+        .execute(&pg)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .host_maintenance(request.host, 1)
+            .await
+            .unwrap()
+            .unretired_warm_members,
+        0
+    );
+    assert_eq!(
+        router.apply(&store, &claim).await.unwrap()["deletion_requested"],
+        true
+    );
+    assert_eq!(
+        api.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| *s == "DELETE")
+            .count(),
+        1
+    );
+}
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
 async fn occupied_unknown_worker_refuses_removal_and_drain_preserves_allocations(pg: PgPool) {
     let (store, pool, request, api, router) = setup(pg.clone()).await;
     let claim = enqueue_claim(&store, pool, "new", &request).await;

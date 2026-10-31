@@ -346,6 +346,7 @@ impl Store {
                         if report.status != "draining"
                             || report.outstanding_allocations != 0
                             || report.unfinished_operations != 0
+                            || report.unretired_warm_members != 0
                             || !fresh
                         {
                             return Err(Error::Conflict);
