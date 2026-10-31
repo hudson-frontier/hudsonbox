@@ -27,7 +27,7 @@ use sandbox_protocol::{
     supervisor::{WarmAdoptRequest, WarmObservation, WarmPrepareRequest, WarmRetireRequest},
     warm_pool::{
         self, CleanupReceipt, HandoffIntent, HandoffOutcome, HandoffReceipt, PrepareIntent,
-        RetireIntent, VERSION, WarmReceipt,
+        PreviousRetireIntent, RetireIntent, VERSION, WarmReceipt,
     },
 };
 
@@ -45,7 +45,7 @@ pub(super) struct Entry {
     /// Inert guardian manifest keyed by `record.slot`.
     pub manifest: Manifest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_retire: Option<crate::warm_cleanup::PreviousRetireIntent>,
+    pub previous_retire: Option<PreviousRetireIntent>,
     #[serde(skip)]
     pub gate: Arc<Mutex<()>>,
 }
@@ -126,8 +126,7 @@ pub(super) fn validate_retained(config: &Config, key: &str, entry: &Entry) -> an
         "retained warm member identity mismatch"
     );
     if let Some(previous) = &entry.previous_retire {
-        previous
-            .admit(r, None, config.host, previous.reporting_epoch)
+        crate::warm_cleanup::admit(previous, r, None, config.host, previous.reporting_epoch)
             .map_err(|_| anyhow::anyhow!("invalid retained previous cleanup fence"))?;
         anyhow::ensure!(
             previous.reporting_epoch <= config.epoch
@@ -601,9 +600,7 @@ impl Host {
         &self,
         request: WarmRetireRequest,
     ) -> Result<WarmObservation, Status> {
-        if let Ok(previous) =
-            warm_pool::decode::<crate::warm_cleanup::PreviousRetireIntent>(&request.intent_json)
-        {
+        if let Ok(previous) = warm_pool::decode::<PreviousRetireIntent>(&request.intent_json) {
             return self.warm_previous_retire(previous);
         }
         let intent: RetireIntent = warm_pool::decode(&request.intent_json)
@@ -674,9 +671,9 @@ impl Host {
 
     fn warm_previous_retire(
         &self,
-        previous: crate::warm_cleanup::PreviousRetireIntent,
+        previous: PreviousRetireIntent,
     ) -> Result<WarmObservation, Status> {
-        previous.validate().map_err(refusal)?;
+        crate::warm_cleanup::validate(&previous).map_err(refusal)?;
         self.this_epoch(previous.original.host_id, previous.reporting_epoch)?;
         let entry = self
             .member_entry(&previous.original.member_id)?
@@ -686,14 +683,14 @@ impl Host {
         let mut entry = self
             .member_entry(&previous.original.member_id)?
             .ok_or_else(|| uncertain("retained warm ownership unavailable"))?;
-        previous
-            .admit(
-                &entry.record,
-                entry.previous_retire.as_ref(),
-                self.inner.config.host,
-                self.inner.config.epoch,
-            )
-            .map_err(refusal)?;
+        crate::warm_cleanup::admit(
+            &previous,
+            &entry.record,
+            entry.previous_retire.as_ref(),
+            self.inner.config.host,
+            self.inner.config.epoch,
+        )
+        .map_err(refusal)?;
         entry
             .record
             .begin_retire(&previous.original, self.inner.config.host)
@@ -721,14 +718,8 @@ impl Host {
             .cleanup_receipt()
             .ok_or_else(|| uncertain("warm member cleanup unconfirmed"))?;
         Ok(WarmObservation {
-            receipt_json: warm_pool::encode(&crate::warm_cleanup::Reply::PreviousCleanup {
-                receipt: crate::warm_cleanup::PreviousCleanupReceipt {
-                    version: VERSION,
-                    request: previous,
-                    cleanup,
-                },
-            })
-            .map_err(|_| Status::internal("warm receipt exceeds bound"))?,
+            receipt_json: warm_pool::encode(&crate::warm_cleanup::reply(previous, cleanup))
+                .map_err(|_| Status::internal("warm receipt exceeds bound"))?,
             simulated: false,
             observed_unix_ms: now_ms()?,
         })
@@ -1080,8 +1071,8 @@ mod tests {
         (host, entry)
     }
 
-    fn previous(entry: &Entry) -> crate::warm_cleanup::PreviousRetireIntent {
-        crate::warm_cleanup::PreviousRetireIntent {
+    fn previous(entry: &Entry) -> PreviousRetireIntent {
+        PreviousRetireIntent {
             version: VERSION,
             reporting_epoch: 4,
             original: RetireIntent {

@@ -1,94 +1,76 @@
-//! Host-local wire adapter for #216 while this PR stacks only on #217.
-//! Keep these JSON shapes identical to #216; no guest/protocol edits here.
+//! Supervisor-side admission for #216 previous-incarnation warm cleanup.
+//! The wire types are the shared [`sandbox_protocol::warm_pool`] ones; this
+//! module only adds the host-local checks against retained member ownership.
 use crate::warm_member::{MemberRecord, MemberState, Refusal};
 use sandbox_protocol::{
     HostId,
-    warm_pool::{self, CleanupReceipt, RetireIntent, VERSION},
+    warm_pool::{
+        CleanupReceipt, PreviousCleanupReceipt, PreviousRetireIntent, VERSION, WarmReceipt,
+    },
 };
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PreviousRetireIntent {
-    pub version: u32,
-    pub original: RetireIntent,
-    pub reporting_epoch: i64,
+/// Shape check of the shared request; every failure is a scope refusal.
+pub(crate) fn validate(previous: &PreviousRetireIntent) -> Result<(), Refusal> {
+    previous.validate().map_err(|_| Refusal::WrongScope)
 }
 
-impl PreviousRetireIntent {
-    pub(crate) fn validate(&self) -> Result<(), Refusal> {
-        let i = &self.original;
-        if self.version != VERSION
-            || i.version != VERSION
-            || i.supervisor_epoch <= 0
-            || self.reporting_epoch <= i.supervisor_epoch
-            || i.operation_revision <= 0
-            || i.operation_id.is_nil()
-            || i.member_id.is_nil()
-            || i.vm_ref
-                .as_deref()
-                .is_some_and(|v| !warm_pool::valid_vm_ref(v))
-        {
-            return Err(Refusal::WrongScope);
-        }
-        Ok(())
+/// Called under the member gate, persisted before touching the guardian.
+/// One cleanup operation per member; a new claim may advance its revision.
+pub(crate) fn admit(
+    previous: &PreviousRetireIntent,
+    record: &MemberRecord,
+    saved: Option<&PreviousRetireIntent>,
+    host: HostId,
+    epoch: i64,
+) -> Result<(), Refusal> {
+    validate(previous)?;
+    let i = &previous.original;
+    if i.host_id != host
+        || record.prepare.host_id != host
+        || epoch != previous.reporting_epoch
+        || i.member_id != record.member()
+        || i.supervisor_epoch != record.epoch()
+        || i.vm_ref.as_ref().is_some_and(|v| v != &record.vm_ref)
+    {
+        return Err(Refusal::WrongScope);
     }
-
-    /// Called under the member gate, persisted before touching the guardian.
-    /// One cleanup operation per member; a new claim may advance its revision.
-    pub(crate) fn admit(
-        &self,
-        record: &MemberRecord,
-        saved: Option<&Self>,
-        host: HostId,
-        epoch: i64,
-    ) -> Result<(), Refusal> {
-        self.validate()?;
-        let i = &self.original;
-        if i.host_id != host
-            || record.prepare.host_id != host
-            || epoch != self.reporting_epoch
-            || i.member_id != record.member()
-            || i.supervisor_epoch != record.epoch()
-            || i.vm_ref.as_ref().is_some_and(|v| v != &record.vm_ref)
-        {
-            return Err(Refusal::WrongScope);
-        }
-        if matches!(record.state, MemberState::Adopted { .. }) {
-            return Err(Refusal::Adopted);
-        }
-        if let Some(saved) = saved {
-            let mut retry = self.clone();
-            retry.original.operation_revision = saved.original.operation_revision;
-            retry.reporting_epoch = saved.reporting_epoch;
-            if retry != *saved
-                || self.original.operation_revision < saved.original.operation_revision
-                || self.reporting_epoch < saved.reporting_epoch
-            {
-                return Err(Refusal::OtherScope);
-            }
-        }
-        Ok(())
+    if matches!(record.state, MemberState::Adopted { .. }) {
+        return Err(Refusal::Adopted);
     }
+    if let Some(saved) = saved {
+        let mut retry = previous.clone();
+        retry.original.operation_revision = saved.original.operation_revision;
+        retry.reporting_epoch = saved.reporting_epoch;
+        if retry != *saved
+            || previous.original.operation_revision < saved.original.operation_revision
+            || previous.reporting_epoch < saved.reporting_epoch
+        {
+            return Err(Refusal::OtherScope);
+        }
+    }
+    Ok(())
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum Reply {
-    PreviousCleanup { receipt: PreviousCleanupReceipt },
-}
-#[derive(Debug, Serialize)]
-pub(crate) struct PreviousCleanupReceipt {
-    pub version: u32,
-    pub request: PreviousRetireIntent,
-    pub cleanup: CleanupReceipt,
+/// The reply for an admitted request whose guardian cleanup is proven. The
+/// request is echoed exactly so the controller can verify it against its own.
+pub(crate) fn reply(request: PreviousRetireIntent, cleanup: CleanupReceipt) -> WarmReceipt {
+    WarmReceipt::PreviousCleanup {
+        receipt: PreviousCleanupReceipt {
+            version: VERSION,
+            request,
+            cleanup,
+        },
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use sandbox_protocol::{AllocationId, Id, warm_pool::PrepareIntent};
+    use sandbox_protocol::{
+        AllocationId, Id,
+        warm_pool::{self, PrepareIntent, RetireIntent},
+    };
     use uuid::Uuid;
 
     fn fixture() -> (MemberRecord, PreviousRetireIntent) {
@@ -110,6 +92,7 @@ mod tests {
             },
             AllocationId::generate(),
         );
+        // Built exactly as the controller builds it for a newer host epoch.
         let p = PreviousRetireIntent {
             version: VERSION,
             reporting_epoch: 2,
@@ -130,7 +113,7 @@ mod tests {
     fn exact_retained_identity_and_reporting_epoch_required_before_effect() {
         let (r, p) = fixture();
         let host = r.prepare.host_id;
-        p.admit(&r, None, host, 2).unwrap();
+        admit(&p, &r, None, host, 2).unwrap();
         let changes: [fn(&mut PreviousRetireIntent); 7] = [
             |p| p.original.member_id = Uuid::now_v7(),
             |p| p.original.host_id = HostId::generate(),
@@ -143,19 +126,19 @@ mod tests {
         for change in changes {
             let mut bad = p.clone();
             change(&mut bad);
-            assert!(bad.admit(&r, None, host, 2).is_err());
+            assert!(admit(&bad, &r, None, host, 2).is_err());
         }
         let mut named = p.clone();
         named.original.vm_ref = Some(r.vm_ref.clone());
-        named.admit(&r, None, host, 2).unwrap();
-        assert!(p.admit(&r, None, HostId::generate(), 2).is_err());
+        admit(&named, &r, None, host, 2).unwrap();
+        assert!(admit(&p, &r, None, HostId::generate(), 2).is_err());
     }
 
     #[test]
     fn lost_cleanup_reply_reclaim_and_restart_keep_claim_fence_and_capacity() {
         let (mut r, p) = fixture();
         let host = r.prepare.host_id;
-        p.admit(&r, None, host, 2).unwrap();
+        admit(&p, &r, None, host, 2).unwrap();
         r.begin_retire(&p.original, host).unwrap();
         assert!(r.holds_capacity());
         assert!(r.cleanup_receipt().is_none());
@@ -165,30 +148,32 @@ mod tests {
         r.validate(host).unwrap();
         let mut retry = saved.clone();
         retry.original.operation_revision += 1;
-        retry.admit(&r, Some(&saved), host, 2).unwrap();
-        assert!(saved.admit(&r, Some(&retry), host, 2).is_err());
+        admit(&retry, &r, Some(&saved), host, 2).unwrap();
+        assert!(admit(&saved, &r, Some(&retry), host, 2).is_err());
         let mut other = retry.clone();
         other.original.operation_id = Uuid::now_v7();
-        assert!(other.admit(&r, Some(&retry), host, 2).is_err());
+        assert!(admit(&other, &r, Some(&retry), host, 2).is_err());
         // A further host incarnation may echo a fresh reporting epoch, but the
         // original operation and exact retained VM ownership cannot change.
         let mut next_epoch = retry.clone();
         next_epoch.reporting_epoch = 3;
-        next_epoch.admit(&r, Some(&retry), host, 3).unwrap();
-        assert!(retry.admit(&r, Some(&next_epoch), host, 3).is_err());
+        admit(&next_epoch, &r, Some(&retry), host, 3).unwrap();
+        assert!(admit(&retry, &r, Some(&next_epoch), host, 3).is_err());
         r.mark_retired().unwrap();
         assert!(!r.holds_capacity());
         assert_eq!(r.cleanup_receipt().unwrap().vm_ref, Some(r.vm_ref.clone()));
         assert!(r.mark_ready("late-prepare").is_err());
-        retry.admit(&r, Some(&retry), host, 2).unwrap();
+        admit(&retry, &r, Some(&retry), host, 2).unwrap();
     }
 
     #[test]
-    fn wire_shape_matches_216_and_rejects_unknown_or_oversized_envelopes() {
-        let (mut r, p) = fixture();
-        let bytes = warm_pool::encode(&p).unwrap();
-        assert!(warm_pool::decode::<RetireIntent>(&bytes).is_err());
-        let mut value = serde_json::to_value(&p).unwrap();
+    fn supervisor_reply_verifies_against_the_controllers_shared_request() {
+        let (mut r, request) = fixture();
+        let host = r.prepare.host_id;
+        // Controller -> supervisor: the shared envelope, bounded and strict.
+        let wire = warm_pool::encode(&request).unwrap();
+        assert!(warm_pool::decode::<RetireIntent>(&wire).is_err());
+        let mut value = serde_json::to_value(&request).unwrap();
         value["extra"] = true.into();
         assert!(
             warm_pool::decode::<PreviousRetireIntent>(&serde_json::to_vec(&value).unwrap())
@@ -198,21 +183,37 @@ mod tests {
             warm_pool::decode::<PreviousRetireIntent>(&vec![b' '; warm_pool::MAX_JSON + 1])
                 .is_err()
         );
-        r.begin_retire(&p.original, r.prepare.host_id).unwrap();
+        let received: PreviousRetireIntent = warm_pool::decode(&wire).unwrap();
+        admit(&received, &r, None, host, 2).unwrap();
+        r.begin_retire(&received.original, host).unwrap();
         r.mark_retired().unwrap();
-        let value = serde_json::to_value(Reply::PreviousCleanup {
-            receipt: PreviousCleanupReceipt {
-                version: VERSION,
-                request: p.clone(),
-                cleanup: r.cleanup_receipt().unwrap(),
-            },
-        })
-        .unwrap();
-        assert_eq!(value["kind"], "previous_cleanup");
-        assert_eq!(
-            value["receipt"]["request"],
-            serde_json::to_value(p).unwrap()
-        );
-        assert_eq!(value["receipt"]["cleanup"]["supervisor_epoch"], 1);
+
+        // Supervisor -> controller: decoded and verified as the controller does.
+        let bytes = warm_pool::encode(&reply(received, r.cleanup_receipt().unwrap())).unwrap();
+        let WarmReceipt::PreviousCleanup { receipt } =
+            warm_pool::decode::<WarmReceipt>(&bytes).unwrap()
+        else {
+            panic!("expected previous cleanup receipt");
+        };
+        receipt.verify(&request).unwrap();
+        assert_eq!(receipt.cleanup.vm_ref, Some(r.vm_ref.clone()));
+
+        // The controller never accepts it for any other member, epoch or operation.
+        let others: [fn(&mut PreviousRetireIntent); 5] = [
+            |p| p.original.member_id = Uuid::now_v7(),
+            |p| p.original.supervisor_epoch += 1,
+            |p| p.reporting_epoch += 1,
+            |p| p.original.operation_id = Uuid::now_v7(),
+            |p| p.original.operation_revision += 1,
+        ];
+        for change in others {
+            let mut expected = request.clone();
+            change(&mut expected);
+            assert!(receipt.verify(&expected).is_err());
+        }
+        // A reply carrying an altered request echo is rejected too.
+        let mut forged = receipt.clone();
+        forged.request.original.operation_id = Uuid::now_v7();
+        assert!(forged.verify(&request).is_err());
     }
 }
