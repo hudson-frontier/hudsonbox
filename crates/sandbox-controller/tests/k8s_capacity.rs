@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use sandbox_controller::{
     capacity::ProviderRouter,
-    host_discovery::HostDiscovery,
+    host_discovery::{DiscoveryError, HostDiscovery, reconcile},
     k8s_capacity::{ApiFuture, KubernetesApi, KubernetesCapacityProvider},
 };
 use sandbox_protocol::{
@@ -117,6 +117,7 @@ async fn setup(pg: PgPool) -> (Store, Uuid, Request, Arc<FakeKubernetes>, Provid
 #[derive(Debug, Default)]
 struct FakeKubernetes {
     pod: Mutex<Option<Value>>,
+    extra: Mutex<Vec<Value>>,
     calls: Mutex<Vec<String>>,
     lose_create: AtomicBool,
     lose_delete: AtomicBool,
@@ -147,7 +148,7 @@ impl KubernetesApi for FakeKubernetes {
                 "GET" if name.is_none() => {
                     assert!(selector.unwrap().contains("hudsonbox.io/pool="));
                     Ok(Some(
-                        json!({"metadata":{},"items":pod.iter().cloned().collect::<Vec<_>>()}),
+                        json!({"metadata":{},"items":pod.iter().cloned().chain(self.extra.lock().unwrap().iter().cloned()).collect::<Vec<_>>()}),
                     ))
                 }
                 "GET" => Ok(pod.clone()),
@@ -640,6 +641,113 @@ async fn admission_mutation_missing_object_and_finalizer_loss_fail_closed(pg: Pg
     )
     .await;
     assert!(router.apply(&store, &status).await.is_err());
+    assert_eq!(
+        api.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| *s == "POST")
+            .count(),
+        1
+    );
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn second_worker_on_same_node_is_not_double_counted(pg: PgPool) {
+    let (store, pool, request, api, router) = setup(pg).await;
+    let claim = enqueue_claim(&store, pool, "worker", &request).await;
+    router.apply(&store, &claim).await.unwrap();
+    let mut second = api.pod.lock().unwrap().clone().unwrap();
+    let other = HostId::generate();
+    second["metadata"]["name"] = json!(format!("hb-{}", other.uuid()));
+    second["metadata"]["uid"] = json!(Uuid::now_v7().to_string());
+    second["metadata"]["annotations"]["hudsonbox.io/host"] = json!(other.to_string());
+    second["metadata"]["annotations"]["hudsonbox.io/certificate-sha256"] = json!("9".repeat(64));
+    api.pod.lock().unwrap().as_mut().unwrap()["spec"]["nodeName"] = json!("node-a");
+    second["spec"]["nodeName"] = json!("node-a");
+    api.extra.lock().unwrap().push(second);
+    let discovery = KubernetesCapacityProvider::new(api.clone());
+    let spec = store.host_pool(pool).await.unwrap().unwrap();
+    // Same node: refused, never two capacity contributions for one node.
+    assert!(matches!(
+        discovery.discover(&spec).await,
+        Err(DiscoveryError::InvalidResult)
+    ));
+    // Distinct nodes: both counted, proving the node is the reason for refusal.
+    api.extra.lock().unwrap()[0]["spec"]["nodeName"] = json!("node-b");
+    assert_eq!(discovery.discover(&spec).await.unwrap().len(), 2);
+    // A terminating predecessor on the node is not an active worker.
+    api.extra.lock().unwrap()[0]["spec"]["nodeName"] = json!("node-a");
+    api.extra.lock().unwrap()[0]["metadata"]["deletionTimestamp"] = json!("2026-10-30T12:00:00Z");
+    let workers = discovery.discover(&spec).await.unwrap();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].host_id, request.host);
+}
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn recreated_pod_with_same_name_gets_new_identity_without_inherited_ownership(pg: PgPool) {
+    let (store, pool, request, api, router) = setup(pg.clone()).await;
+    let provision = enqueue_claim(&store, pool, "new", &request).await;
+    let receipt = router.apply(&store, &provision).await.unwrap();
+    let old_uid = receipt["pod_uid"].as_str().unwrap().to_owned();
+    let name = receipt["name"].as_str().unwrap().to_owned();
+    let retire = Request {
+        action: Action::Retire,
+        ..request.clone()
+    };
+    let retire = enqueue_claim(&store, pool, "remove", &retire).await;
+    fresh(&store, &request).await;
+    router.apply(&store, &retire).await.unwrap();
+    // Named delete completes physically, then a Pod with the same name reappears.
+    let mut recreated = api.pod.lock().unwrap().take().unwrap();
+    let new_uid = Uuid::now_v7().to_string();
+    recreated["metadata"]["uid"] = json!(new_uid);
+    recreated["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("deletionTimestamp");
+    *api.pod.lock().unwrap() = Some(recreated);
+    let discovery = KubernetesCapacityProvider::new(api.clone());
+    let workers = discovery
+        .discover(&store.host_pool(pool).await.unwrap().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(workers.len(), 1);
+    let provider_ref = workers[0].provider_ref.clone().unwrap();
+    assert!(provider_ref.ends_with(&format!("/{name}/{new_uid}")));
+    assert!(!provider_ref.contains(&old_uid));
+    // The registry never treats the new incarnation as the retired host.
+    let registered = store.registered_hosts(Some(pool)).await.unwrap();
+    assert!(
+        !reconcile(&workers, &registered)
+            .matched
+            .contains(&request.host)
+    );
+    // The old identity stays fenced: its stale receipts and re-provision fail.
+    assert!(router.apply(&store, &retire).await.is_err());
+    assert!(router.apply(&store, &provision).await.is_err());
+    assert!(store.finish_host_drain(request.host, 1).await.is_err());
+    assert!(
+        store
+            .enqueue_capacity(
+                pool,
+                "reuse",
+                &Request {
+                    epoch: 2,
+                    ..request.clone()
+                }
+            )
+            .await
+            .is_err()
+    );
+    // Nothing owned by the old incarnation transfers to the new one.
+    for table in ["allocations", "warm_pool_members"] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE host_id=$1"))
+            .bind(request.host.uuid())
+            .fetch_one(&pg)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
     assert_eq!(
         api.calls
             .lock()
