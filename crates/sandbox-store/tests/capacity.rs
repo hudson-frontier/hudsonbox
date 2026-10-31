@@ -262,6 +262,20 @@ async fn upgrade_preserves_existing_host_state_and_is_repeatable(pool: PgPool) {
             .unwrap()
             .is_null()
     );
+    assert_eq!(
+        after.as_object_mut().unwrap().remove("rpc_failures"),
+        Some(serde_json::json!({
+            "unavailable": 0, "deadline_exceeded": 0, "unknown": 0
+        }))
+    );
+    assert!(
+        after
+            .as_object_mut()
+            .unwrap()
+            .remove("rpc_last_failure_at")
+            .unwrap()
+            .is_null()
+    );
     assert_eq!(before, after);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM capacity_operations")
         .fetch_one(&pool)
