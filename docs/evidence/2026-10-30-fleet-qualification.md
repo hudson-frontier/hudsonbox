@@ -49,6 +49,33 @@ Existing suites already provide related coverage, so it is not duplicated here:
 - [Multi-host placement](../../crates/sandbox-store/tests/multi_host_placement.rs): store-level concurrency, quota, tenant-pool denial when a shared pool is full, and the drain race.
 - [Standalone capacity](../../crates/sandbox-store/tests/capacity.rs): retirement of occupied hosts and intents.
 
+### Remaining portable retirement gap: source added, execution pending
+
+`retire_replace_at_pool_max_routes_new_identity_without_inheriting_history`
+adds controller plus standalone-capacity integration coverage in the same
+independent harness. It drives drain/retire/provision intents through the
+controller capacity provider router while keeping the original lifecycle
+controller across replacement. Its assertions cover:
+
+- Retirement refusal for an occupied drained host and for a lost stop reply
+  during partition, with its last reservation and dispatch history retained.
+- Confirmed controller cleanup before retirement; an empty drained host still
+  cannot accept new work. Replacement enrollment is refused at `max_hosts=2`
+  until retirement frees the inventory slot.
+- A replacement with a distinct host ID and mTLS identity starts with no
+  inherited allocations or operation history. Two projects' new allocations,
+  execute dispatches, uploads, file captures and live reads reach that new host.
+- Late health, finish-drain, epoch advance and reprovision cannot reopen the old
+  tombstone. Historical ownership/dispatch receipts stay attached to the old ID;
+  active inventory excludes it, and both original supervisors' counters exclude
+  the replacement work.
+
+**Execution pending:** the original seven tests' results below predate this
+addition. The new eight-test suite and focused Clippy have not been run on this
+head. Issue #197 owns the only heavy-build slot; this follow-up is source/light
+only until the parent grants `CARGO_BUILD_JOBS=2`. Reuse the existing target and
+PostgreSQL when granted; create no additional dependency/service stack.
+
 ### Harness notes
 
 Between ticks, the tests clear one operation's retry backoff and expire its

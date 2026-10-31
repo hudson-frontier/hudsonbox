@@ -18,7 +18,10 @@ use rcgen::{
 use sandbox_api::{
     AppState, files::client::FileClient, router_with_uploads, streams::live::LiveClient,
 };
-use sandbox_controller::{Controller, ControllerConfig, Tick};
+use sandbox_controller::{
+    Controller, ControllerConfig, Tick,
+    capacity::{ProviderRouter, StandaloneStaticProvider},
+};
 use sandbox_fake_host::{FakeConfig, FakeHost};
 use sandbox_protocol::{
     HostId, Id, OperationId, ProjectId, ProjectToken, SandboxId,
@@ -30,6 +33,8 @@ use sandbox_protocol::{
 };
 use sandbox_store::{
     Store,
+    capacity::{Action, Claim, Error as CapacityError, Request as CapacityRequest},
+    host_maintenance::{HostCapacity, HostProvision},
     host_registry::{HostPoolSpec, PlacementPolicy, PoolType, Tenancy},
 };
 use sandbox_supervisor::transport::{self, ControllerIdentity, MAX_MESSAGE_BYTES};
@@ -533,6 +538,47 @@ impl Fleet {
         .unwrap()
     }
 
+    /// Durable operator intent, dispatched through the controller's capacity router.
+    async fn capacity_claim(&self, pool: Uuid, host: HostId, action: Action) -> Claim {
+        let id = self
+            .store
+            .enqueue_capacity(
+                pool,
+                &Uuid::now_v7().to_string(),
+                &CapacityRequest {
+                    host,
+                    epoch: 1,
+                    action,
+                },
+            )
+            .await
+            .unwrap();
+        let claim = self.store.claim_capacity(pool, 300).await.unwrap().unwrap();
+        assert_eq!(claim.id, id);
+        claim
+    }
+
+    /// Ownership and dispatch history, excluding maintenance scheduling metadata.
+    async fn host_history(&self, host: HostId) -> Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'allocations', (SELECT jsonb_agg(jsonb_build_object(
+                    'id',id,'sandbox',sandbox_id,'host',host_id,'epoch',supervisor_epoch,
+                    'generation',generation,'released_at',released_at) ORDER BY id)
+                    FROM allocations WHERE host_id=$1),
+                'operations', (SELECT jsonb_agg(jsonb_build_object(
+                    'id',o.id,'status',o.status,'attempt_count',o.attempt_count,
+                    'execution_allocation',o.execution_allocation_id,
+                    'receipts',o.attempt_receipts) ORDER BY o.id)
+                    FROM operations o WHERE o.sandbox_id IN
+                        (SELECT sandbox_id FROM allocations WHERE host_id=$1)))",
+        )
+        .bind(host.uuid())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// Point a host's registration at a port nobody listens on.
     async fn partition(&self, index: usize) {
         let hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1017,4 +1063,231 @@ async fn drained_host_takes_no_new_placement_but_keeps_routed_cleanup(pool: PgPo
     assert_eq!(fleet.drive(&mut controller, destroy).await, "succeeded");
     assert_eq!(fleet.drive(&mut controller, waiting).await, "succeeded");
     assert_eq!(fleet.owner(queued).await, Some(fleet.hosts[1]));
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn retire_replace_at_pool_max_routes_new_identity_without_inheriting_history(pool: PgPool) {
+    let fleet = Fleet::new(&pool, true).await;
+    let old = fleet.hosts[0];
+    let pool_id: Uuid = sqlx::query_scalar("SELECT host_pool_id FROM hosts WHERE id=$1")
+        .bind(old.uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let spec = HostPoolSpec {
+        version: 1,
+        id: pool_id,
+        name: "qualification-replacement".into(),
+        pool_type: PoolType::Standalone,
+        min_ready_hosts: 0,
+        max_hosts: 2,
+        placement_policy: PlacementPolicy {
+            version: 1,
+            tenancy: Tenancy::Shared,
+        },
+        provider_config: json!({"version": 1}),
+        credential_secret_ref: None,
+    };
+    fleet.store.put_host_pool(&spec).await.unwrap();
+    let router = ProviderRouter::default().with(Arc::new(StandaloneStaticProvider));
+    // Keep this controller across replacement, including its connection to A.
+    let mut controller = fleet.controller(0).await;
+    let sandboxes = fleet.fill(&mut controller).await;
+    for &(project, sandbox) in [&sandboxes[0], &sandboxes[2]] {
+        let command = fleet.execute(project, sandbox).await;
+        assert_eq!(fleet.drive(&mut controller, command).await, "succeeded");
+    }
+    let drain = fleet.capacity_claim(pool_id, old, Action::Drain).await;
+    router.apply(&fleet.store, &drain).await.unwrap();
+    let retire = fleet.capacity_claim(pool_id, old, Action::Retire).await;
+    let occupied_history = fleet.host_history(old).await;
+    assert!(matches!(
+        router.apply(&fleet.store, &retire).await,
+        Err(CapacityError::Conflict)
+    ));
+    assert_eq!(fleet.host_history(old).await, occupied_history);
+
+    // The pool is at its worker limit, independently of free sandbox slots.
+    let new = HostId::generate();
+    let provision = fleet
+        .capacity_claim(
+            pool_id,
+            new,
+            Action::Provision {
+                config: Box::new(HostProvision {
+                    version: 1,
+                    capacity: HostCapacity {
+                        vcpu: 4,
+                        memory_mib: 8192,
+                        disk_mib: 65536,
+                    },
+                    capabilities: capabilities(),
+                    host_pool_id: Some(pool_id),
+                }),
+            },
+        )
+        .await;
+    assert!(router.apply(&fleet.store, &provision).await.is_err());
+    assert!(fleet.store.registered_host(new).await.unwrap().is_none());
+
+    // One A allocation cleans up normally. The other's stop applies, but the
+    // lost reply and partition cannot authorize release or retirement.
+    let destroy = fleet.destroy(sandboxes[2].0, sandboxes[2].1).await;
+    assert_eq!(fleet.drive(&mut controller, destroy).await, "succeeded");
+    fleet.fakes[0].lose_next_stop_reply().await;
+    let destroy = fleet.destroy(sandboxes[0].0, sandboxes[0].1).await;
+    let mut unknown = false;
+    for _ in 0..8 {
+        if controller.tick().await.ok() == Some(Tick::Unknown) {
+            unknown = true;
+            break;
+        }
+        fleet.retry_now(destroy).await;
+    }
+    assert!(unknown);
+    fleet.partition(0).await;
+    let (waiting, queued) = fleet.create(0).await;
+    for _ in 0..4 {
+        fleet.retry_now(destroy).await;
+        fleet.retry_now(waiting).await;
+        let _ = controller.tick().await;
+    }
+    assert_eq!(fleet.status(destroy).await, "unknown");
+    assert_eq!(fleet.unreleased(sandboxes[0].1).await, 1);
+    assert_eq!(fleet.owner(queued).await, None);
+    let uncertain_history = fleet.host_history(old).await;
+    assert!(matches!(
+        router.apply(&fleet.store, &retire).await,
+        Err(CapacityError::Conflict)
+    ));
+    assert_eq!(fleet.host_history(old).await, uncertain_history);
+    assert!(
+        fleet
+            .store
+            .capacity_operation(retire.id)
+            .await
+            .unwrap()
+            .unwrap()["provider_receipt"]
+            .is_null()
+    );
+    assert!(router.apply(&fleet.store, &provision).await.is_err());
+
+    fleet.heal(0).await;
+    assert_eq!(fleet.drive(&mut controller, destroy).await, "succeeded");
+    for &(_, sandbox) in [&sandboxes[0], &sandboxes[2]] {
+        assert_eq!(fleet.unreleased(sandbox).await, 0);
+    }
+    // Empty A is still drained; B is full. Cleanup alone cannot place work.
+    for _ in 0..3 {
+        fleet.retry_now(waiting).await;
+        let _ = controller.tick().await;
+    }
+    assert_eq!(fleet.owner(queued).await, None);
+    let old_history = fleet.host_history(old).await;
+    let receipt = router.apply(&fleet.store, &retire).await.unwrap();
+    assert_eq!(receipt["retired"], true);
+    assert_eq!(receipt["report"]["outstanding_allocations"], 0);
+    assert_eq!(
+        fleet
+            .store
+            .host_pool(pool_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enrolled_hosts,
+        1
+    );
+    router.apply(&fleet.store, &provision).await.unwrap();
+    assert_eq!(
+        fleet
+            .store
+            .host_pool(pool_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enrolled_hosts,
+        2
+    );
+    // A new host starts with no allocations, execution pins or dispatch receipts.
+    let empty_history = fleet.host_history(new).await;
+    assert!(empty_history["allocations"].is_null());
+    assert!(empty_history["operations"].is_null());
+    let replacement = fake(new, 1).await;
+    let supervisor = serve(&fleet.pki, &replacement, new).await;
+    register(&pool, new, &supervisor.endpoint, &supervisor.pin).await;
+    fleet
+        .store
+        .observe_configured_host_with_capabilities(new, 1, &capabilities().to_json().unwrap(), true)
+        .await
+        .unwrap();
+    fleet.store.finish_host_drain(new, 1).await.unwrap();
+
+    // Even a late authenticated observation cannot reopen the old tombstone.
+    fleet
+        .store
+        .observe_configured_host_with_capabilities(old, 1, &capabilities().to_json().unwrap(), true)
+        .await
+        .unwrap();
+    assert!(fleet.store.finish_host_drain(old, 1).await.is_err());
+    assert!(fleet.store.advance_host_epoch(old, 1).await.is_err());
+    let reopen = fleet
+        .capacity_claim(pool_id, old, provision.request.action.clone())
+        .await;
+    assert!(matches!(
+        router.apply(&fleet.store, &reopen).await,
+        Err(CapacityError::Conflict)
+    ));
+    let history = fleet
+        .store
+        .registered_host_history(Some(pool_id), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 3);
+    let tombstone = history.iter().find(|h| h.host_id == old).unwrap();
+    assert!(tombstone.capacity_retired);
+    assert!(!tombstone.admits_new_work());
+    assert_eq!(
+        tombstone.transport.as_ref().unwrap().endpoint,
+        fleet.supervisors[0].endpoint
+    );
+    let active = fleet.store.registered_hosts(Some(pool_id)).await.unwrap();
+    assert_eq!(active.len(), 2);
+    assert!(active.iter().all(|h| h.host_id != old));
+    assert!(active.iter().any(|h| h.host_id == new));
+
+    assert_eq!(fleet.drive(&mut controller, waiting).await, "succeeded");
+    assert_eq!(fleet.owner(queued).await, Some(new));
+    let (create, second) = fleet.create(1).await;
+    assert_eq!(fleet.drive(&mut controller, create).await, "succeeded");
+    assert_eq!(fleet.owner(second).await, Some(new));
+    for (project, sandbox) in [(0, queued), (1, second)] {
+        let command = fleet.execute(project, sandbox).await;
+        assert_eq!(fleet.drive(&mut controller, command).await, "succeeded");
+        let dispatch: (Uuid, i64, i32) = sqlx::query_as(
+            "SELECT a.host_id,a.supervisor_epoch,o.attempt_count FROM operations o
+             JOIN allocations a ON a.id=o.execution_allocation_id WHERE o.id=$1",
+        )
+        .bind(command.uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dispatch, (new.uuid(), 1, 1));
+        let upload = fleet.upload(project, sandbox, b"replacement-only").await;
+        assert_eq!(fleet.drive(&mut controller, upload).await, "succeeded");
+        let (status, body) = fleet.capture(project, sandbox).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["size"], 16);
+        let (status, text) = fleet.stream(project, command).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(!denied(status, &text), "{text}");
+    }
+    assert_eq!(replacement.total_starts().await, 2);
+    assert_eq!(replacement.total_commands().await, 2);
+    assert_eq!(replacement.total_file_commits().await, 2);
+    assert_eq!(fleet.fakes[0].total_starts().await, 2);
+    assert_eq!(fleet.fakes[0].total_commands().await, 2);
+    assert_eq!(fleet.fakes[0].total_file_commits().await, 0);
+    assert_eq!(fleet.fakes[1].total_starts().await, 2);
+    assert_eq!(fleet.fakes[1].total_commands().await, 0);
+    assert_eq!(fleet.host_history(old).await, old_history);
 }
