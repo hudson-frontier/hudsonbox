@@ -93,13 +93,29 @@ pub fn serve() -> Result<()> {
         device.metadata()?.file_type().is_block_device(),
         "bootstrap must be the dedicated block device"
     );
-    let bootstrap = Bootstrap::read_device(device)?;
-    let tls = bootstrap.server_tls(crate::runner::now_ms())?;
+    let device = sandbox_protocol::warm_bind::read_device(device)?;
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)?;
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async move {
+            let mut member_task = None;
+            let bootstrap: Bootstrap = match device {
+                sandbox_protocol::warm_bind::Device::Allocation(b) => b,
+                // An unbound warm member (#188) is inert: no runner, file
+                // service or customer process exists until one allocation
+                // identity is bound over the pinned member channel.
+                sandbox_protocol::warm_bind::Device::Member(member) => {
+                    match serve_member(member, boot_id.clone()).await? {
+                        Some((b, task)) => { member_task = Some(task); b },
+                        None => return Ok(()),
+                    }
+                }
+            };
+            let tls = bootstrap.server_tls(crate::runner::now_ms())?;
             let runner = crate::runner::Runner::open(crate::runner::Config {
                 state_dir: Path::new("/run/hudson/agent").into(),
                 cgroup_root: Path::new("/sys/fs/cgroup/workloads").into(),
@@ -107,9 +123,7 @@ pub fn serve() -> Result<()> {
                 context: crate::model::Context {
                     allocation_id: bootstrap.allocation,
                     generation: bootstrap.generation,
-                    boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-                        .trim()
-                        .into(),
+                    boot_id,
                 },
             })
             .await?;
@@ -129,8 +143,65 @@ pub fn serve() -> Result<()> {
             };
             let files_stopped = files.shutdown().await;
             let commands_stopped = runner.shutdown().await;
+            if let Some(task) = member_task { task.abort(); }
             files_stopped?;
             commands_stopped?;
             served
         })
+}
+
+/// Start the authenticated member listener before opening any workload service.
+/// Keep it alive after activation so lost acknowledgements permit exact retries.
+async fn serve_member(
+    member: sandbox_protocol::warm_bind::MemberBootstrap,
+    boot_id: String,
+) -> Result<Option<(Bootstrap, tokio::task::JoinHandle<Result<()>>)>> {
+    use sandbox_protocol::{guest_wire, warm_bind};
+    use std::sync::Arc;
+    use tokio::signal::unix::{SignalKind, signal};
+    use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener};
+    let tls = member.server_tls(crate::runner::now_ms())?;
+    let remaining = member
+        .valid_until_unix_ms
+        .saturating_sub(crate::runner::now_ms());
+    ensure!(remaining > 0, "member identity expired during boot");
+    fs::create_dir_all("/var/lib/hudson")?;
+    let guest = Arc::new(warm_bind::MemberGuest::open(
+        member,
+        boot_id,
+        Path::new("/var/lib/hudson/member"),
+    )?);
+    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, warm_bind::MEMBER_PORT))?;
+    let capacity = Arc::new(tokio::sync::Semaphore::new(guest_wire::MAX_CONNECTIONS));
+    let serving = guest.clone();
+    let mut task = tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        let expiry = tokio::time::sleep(std::time::Duration::from_millis(remaining as u64));
+        tokio::pin!(expiry);
+        loop {
+            tokio::select! {
+                _ = &mut expiry => return Ok(()),
+                _ = tasks.join_next(), if !tasks.is_empty() => {},
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    if peer.cid() != VMADDR_CID_HOST { continue; }
+                    let Ok(permit) = capacity.clone().try_acquire_owned() else { continue };
+                    let (guest, tls) = (serving.clone(), tls.clone());
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let _ = warm_bind::serve_member_connection(&guest, &tls, stream,
+                            crate::runner::now_ms).await;
+                    });
+                }
+            }
+        }
+    });
+    let mut stop = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        b = guest.wait_bound() => Ok(Some((b, task))),
+        result = &mut task => { result??; Ok(None) },
+        _ = stop.recv() => { task.abort(); Ok(None) },
+        _ = interrupt.recv() => { task.abort(); Ok(None) },
+    }
 }

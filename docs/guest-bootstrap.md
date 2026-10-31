@@ -58,3 +58,58 @@ The fixture invokes `ldd` only on the reviewed, locally built guest binary and `
 The new real-VM cases confirm unbound command-client rejection, durable/repeated boot binding, root execution and output, a command exit code, exact retry without a repeated write, changed-command rejection, same-size bootstrap corruption fencing, read-only bootstrap enforcement against a guest-root write, and two allocations using one unchanged base image with different credentials/boot IDs. A credential from the first allocation cannot authenticate to the second; stopping one leaves the other running. The existing lease expiry, supervisor/guardian death, stop/renew race and cleanup tests remain applicable.
 
 The [recorded evidence](evidence/2026-09-21-aarch64-bootstrap.json) identifies the tested sources, guest binary and host artifacts. It establishes component behavior on the nested aarch64 development host, not x86_64 compatibility, adversarial isolation, API-to-VM execution, network policy, production images or completed Phase 1 release gates.
+
+## Unused warm member late binding
+
+The guest supports a version-2 member bootstrap as a prerequisite for
+[#188](https://github.com/hudson-frontier/hudsonbox/issues/188). Host preparation,
+guardian adoption and real KVM qualification remain separate integration gates.
+This does not enable the real host's currently unsupported warm RPCs.
+
+A member device uses the existing bounded `HDSBOOT1` frame with a strict v2 JSON
+body containing only member UUID, preassigned allocation slot, validity and
+member channel credentials. It contains no project identity, customer process,
+customer secret or executable argv. V1 allocation bootstrap remains unchanged;
+old guests reject v2. The guest opens no runner or file service while unbound.
+
+The member listener is **AF_VSOCK port 53**, not a DNS, TCP or UDP network port.
+It accepts only host CID 2 and TLS 1.3 with exact client certificate pinning,
+mandatory mutual authentication and distinct ALPN `hudson-warm/1`. Its server
+name is `warm-<member UUID>.sandbox.internal`. Allocation commands keep
+`hudson-guest/1` and AF_VSOCK port 52. No unauthenticated bind socket exists.
+The protocol is bounded length-prefixed strict JSON, version 1, one request and
+response per TLS connection, with the existing 15 second connection deadline
+and 32 connection limit. Requests are Hello or Bind; neither runs customer work.
+
+Bind names the authenticated boot and installs freshly issued v1 allocation
+credentials. It carries the full existing `HandoffIntent`, its canonical digest,
+and the exact member, slot, allocation and generation. The guest validates the
+intent and agreement, including project, host, supervisor epoch, claim revision
+and permit serial, and refuses reuse of member credentials. The host must first
+verify the registered database-issued permit and current handoff/guardian
+ownership under its launch authority lock. Guest scope checks do not establish
+permit issuance or authorize adoption independently of that host authority.
+
+Before acknowledging or opening workload services, the guest writes the complete
+binding to private durable rootfs state in `/var/lib/hudson/member`: fsync file,
+fsync directory, atomic rename and fsync directory. A stable file lock excludes
+concurrent agent incarnations. A permanent incarnation marker pins bootstrap and
+boot ID. Partial writes and uncertain persistence fail closed. Restart in the
+same boot retains binding; another boot or changed bootstrap is refused. No
+crash path deletes or resets binding state. The base image must have no retained
+member state, and the host must never repool a VM that has been bound.
+
+The member endpoint remains available for exact scope/identity retries after a
+lost acknowledgement; a changed request ID alone is harmless. Changed ownership
+or credentials are refused after binding. The endpoint expires with its member
+identity; allocation service uses its separate deadline. Ordinary authenticated
+allocation Hello remains required to establish command readiness. Binding is not
+execution or cleanup evidence. Guest root can compromise its own state and keys;
+host ownership and no-repool rules remain authoritative.
+
+Portable adversarial tests are in
+[`sandbox-guest/tests/warm_bind.rs`](../crates/sandbox-guest/tests/warm_bind.rs).
+Compilation and execution are pending at initial draft publication under the
+shared build-slot restriction. Linux compilation, controlled KVM crash/restart,
+vsock routing, host integration and measured cold/warm readiness remain gates;
+no latency or isolation qualification is claimed.

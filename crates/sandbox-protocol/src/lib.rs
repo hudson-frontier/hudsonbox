@@ -57,3 +57,5 @@ pub mod allocation_authority;
 pub mod allocation_retirement;
 
 pub mod warm_pool;
+
+pub mod warm_bind;
