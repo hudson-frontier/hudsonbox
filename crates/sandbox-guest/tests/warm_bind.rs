@@ -413,6 +413,72 @@ async fn authenticated_oversize_and_unknown_actions_do_not_bind() {
 }
 
 #[test]
+fn alternate_der_encoding_cannot_disguise_a_reused_member_key() {
+    use base64::Engine as _;
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
+    // Extract the SEC1 OCTET STRING carried inside the generated PKCS#8 key.
+    fn field<'a>(bytes: &mut &'a [u8], tag: u8) -> &'a [u8] {
+        assert_eq!(bytes[0], tag);
+        let mut offset = 2;
+        let mut len = usize::from(bytes[1]);
+        if len & 128 != 0 {
+            let count = len & 127;
+            len = 0;
+            for byte in &bytes[2..2 + count] {
+                len = (len << 8) | usize::from(*byte);
+            }
+            offset += count;
+        }
+        let value = &bytes[offset..offset + len];
+        *bytes = &bytes[offset + len..];
+        value
+    }
+    let m = member();
+    let (allocation, mut req) = request(&m);
+    let reused = KeyPair::from_pem(&m.bootstrap.guest_key_pem).unwrap();
+    let der = reused.serialize_der();
+    let mut outer = der.as_slice();
+    let mut fields = field(&mut outer, 0x30);
+    field(&mut fields, 0x02);
+    field(&mut fields, 0x30);
+    let sec1 = field(&mut fields, 0x04);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(sec1);
+    req.allocation.guest_key_pem =
+        format!("-----BEGIN EC PRIVATE KEY-----\n{encoded}\n-----END EC PRIVATE KEY-----\n");
+    let mut params =
+        CertificateParams::new(vec![guest_wire::guest_name(m.bootstrap.slot)]).unwrap();
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    req.allocation.guest_cert_pem = params.signed_by(&reused, &allocation.ca).unwrap().pem();
+    assert!(req.allocation.server_tls(now()).is_ok());
+    assert!(matches!(
+        m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),
+        MemberResponse::Rejected { .. }
+    ));
+    assert!(m.guest.bound().is_none());
+}
+
+#[test]
+fn fresh_root_prefix_cannot_hide_member_ca_in_allocation_roots() {
+    let m = member();
+    let (allocation, mut req) = request(&m);
+    let leaf = Leaf::new(
+        &m.fixture.ca,
+        guest_wire::guest_name(m.bootstrap.slot),
+        false,
+    );
+    req.allocation.ca_pem = format!("{}{}", allocation.ca.pem(), m.bootstrap.ca_pem);
+    req.allocation.guest_cert_pem = leaf.cert.pem();
+    req.allocation.guest_key_pem = leaf.key.serialize_pem();
+    assert!(req.allocation.server_tls(now()).is_ok());
+    assert!(matches!(
+        m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),
+        MemberResponse::Rejected { .. }
+    ));
+    assert!(m.guest.bound().is_none());
+}
+
+#[test]
 fn pem_reencoding_cannot_disguise_a_reused_member_key() {
     use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
     let m = member();

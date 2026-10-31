@@ -545,12 +545,22 @@ fn validate_binding(
             && request.scope_sha256 == request.scope.digest()?,
         "binding scope mismatch"
     );
+    let allocation_roots = CertificateDer::pem_slice_iter(a.ca_pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let member_roots = CertificateDer::pem_slice_iter(member.ca_pem.as_bytes())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(
+        allocation_roots.len() == 1
+            && !member_roots
+                .iter()
+                .any(|root| allocation_roots.contains(root)),
+        "allocation roots reused member trust"
+    );
     // New member and allocation channels must have distinct credentials.
     ensure!(
         first_cert(&a.ca_pem)? != first_cert(&member.ca_pem)?
             && first_cert(&a.guest_cert_pem)? != first_cert(&member.guest_cert_pem)?
-            && PrivateKeyDer::from_pem_slice(a.guest_key_pem.as_bytes())?.secret_der()
-                != PrivateKeyDer::from_pem_slice(member.guest_key_pem.as_bytes())?.secret_der()
+            && key_identity(&a.guest_key_pem)? != key_identity(&member.guest_key_pem)?
             && a.host_pin != member.host_pin,
         "allocation identity reused member credentials"
     );
@@ -562,6 +572,15 @@ fn validate_binding(
         now_ms,
     )?;
     Ok(())
+}
+fn key_identity(pem: &str) -> Result<Vec<u8>> {
+    let key = PrivateKeyDer::from_pem_slice(pem.as_bytes())?;
+    let signer = tokio_rustls::rustls::crypto::ring::sign::any_supported_type(&key)?;
+    Ok(signer
+        .public_key()
+        .context("private key has no public identity")?
+        .as_ref()
+        .to_vec())
 }
 fn first_cert(pem: &str) -> Result<CertificateDer<'static>> {
     CertificateDer::pem_slice_iter(pem.as_bytes())
