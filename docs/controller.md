@@ -42,6 +42,18 @@ The [owner-routing tests](../crates/sandbox-controller/tests/owner_routing.rs) r
 
 Fleet placement and owner routing are integrated: one controller can reserve and dispatch new creates on multiple hosts.
 
+The [fleet qualification tests](../crates/sandbox-controller/tests/fleet_qualification.rs) ([#198](https://github.com/hudson-frontier/hudsonbox/issues/198)) use an independent harness with two simulated supervisors, two projects and two allocations per host. They cover the following:
+
+- Upload, execute, file capture, live stream, cancel, lease maintenance and destroy each reach the persisted owner, and the other project is denied.
+- Two controllers ticking concurrently create one allocation and one start per sandbox, and execute each command once.
+- A lost cancel reply followed by a partition leaves the target `unknown` without replay while the other host progresses. On return, a replacement controller inspects the target.
+- After an operator drain and epoch advance on one host, API reads of the old allocation are refused: file capture returns 404 (the file view requires the host's current epoch), and live stream returns 410 `output_missing`. The new incarnation receives no starts or commands, and the old reservation is retained.
+- A lost stop reply on a partitioned host keeps its capacity reserved while new placement uses the other host. The slot is freed only after inspection confirms the stop.
+- An exhausted dedicated pool waits instead of using an idle shared host.
+- A drained host takes no new placement, even when empty, while its cleanup is still routed to and confirmed by that host.
+
+Like the owner-routing tests, this is portable fake-supervisor evidence and not Linux/KVM qualification. See the [qualification record](evidence/2026-10-30-fleet-qualification.md).
+
 ## Completion and uncertainty
 
 A successful RPC is only a candidate observation. Storage verifies the complete host/project/sandbox/allocation/operation tuple, generation, supervisor epoch, current claim revision and deadline, original create operation ID, and a supported observed state. The observation timestamp must be within ten seconds of PostgreSQL time. Readiness must still be inside the allocation's execution lease. Final writes check the claim again after lock waits; expiry rolls back all state changes.
