@@ -274,7 +274,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Test adopted guardian metadata retirement without KVM
+      - name: Test root-only guardian retirement and absence without KVM
         run: |
           cargo test -p sandbox-supervisor --lib --no-run --message-format=json > "$RUNNER_TEMP/guardian-tests.jsonl"
           python3 - <<'PYTHON'
@@ -289,11 +289,14 @@ jobs:
                       if a.get("reason") == "compiler-artifact" and a.get("executable")
                       and a["target"]["name"] == "sandbox_supervisor"]
           assert len(binaries) == 1, binaries
-          subprocess.run([
-              "sudo", "-n", "env", "HUDSON_GUARDIAN_TEST_VM=1", binaries[0],
-              "--exact", "guardian::retirement::tests::adopted_slot_metadata_retirement_resumes_exact_serialized_evidence",
-              "--ignored",
-          ], check=True)
+          for test in [
+              "guardian::retirement::tests::adopted_slot_metadata_retirement_resumes_exact_serialized_evidence",
+              "guardian::retirement::tests::retained_member_absence_requires_free_lifecycle_lock_and_no_runtime_paths",
+          ]:
+              subprocess.run([
+                  "sudo", "-n", "env", "HUDSON_GUARDIAN_TEST_VM=1", binaries[0],
+                  "--exact", test, "--ignored",
+              ], check=True)
           PYTHON
 
       - name: Verify private object storage semantics
