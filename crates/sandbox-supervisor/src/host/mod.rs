@@ -16,6 +16,7 @@ mod previous;
 mod readers;
 mod released_history;
 mod retirement;
+mod warm;
 use crate::guardian::{self, Action, Artifact, Manifest, Receipt, State as GuardianState};
 use journal::{Journal, Record};
 use sandbox_protocol::{
@@ -840,6 +841,38 @@ impl Host {
 }
 #[tonic::async_trait]
 impl Supervisor for Host {
+    async fn prepare_warm_member(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmPrepareRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_prepare_sync(request.into_inner())
+            .map(Response::new)
+    }
+
+    async fn adopt_warm_member(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmAdoptRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_handoff_sync(request.into_inner())
+            .map(Response::new)
+    }
+
+    async fn inspect_warm_handoff(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmAdoptRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_handoff_sync(request.into_inner())
+            .map(Response::new)
+    }
+
+    async fn retire_warm_member(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmRetireRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_retire_sync(request.into_inner())
+            .map(Response::new)
+    }
+
     async fn forget_allocation(
         &self,
         request: Request<sandbox_protocol::supervisor::AllocationForgetRequest>,

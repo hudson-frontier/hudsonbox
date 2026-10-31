@@ -162,6 +162,24 @@ pub struct WarmHandoff {
     pub intent: HandoffIntent,
 }
 
+/// How the controller may contact the supervisor for a claimed member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptMode {
+    /// First dispatch under a still-authorized create: send AdoptWarmMember.
+    Adopt,
+    /// An adopt may already have been sent, or the create is no longer
+    /// authorized: only InspectWarmHandoff, which never adopts and fences an
+    /// unadopted member. A lost acknowledgement is never replayed as Adopt.
+    Inspect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptDispatch {
+    pub handoff: WarmHandoff,
+    pub mode: AdoptMode,
+    pub allocation_expires_unix_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claimed {
     /// A ready member was claimed; persist and inspect its handoff.
@@ -1111,7 +1129,7 @@ impl Store {
         // Time and epoch predicates after every lock. SKIP LOCKED is not used:
         // policy locks already serialize claimers of the same members.
         let member = sqlx::query(
-            "SELECT m.id,m.host_id,m.supervisor_epoch,m.vm_ref,m.claim_revision FROM warm_pool_members m
+            "SELECT m.id,m.host_id,m.supervisor_epoch,m.vm_ref,m.claim_revision,m.template_id FROM warm_pool_members m
              JOIN hosts h ON h.id=m.host_id
              WHERE m.pool_id=ANY($1) AND m.state='ready' AND m.lease_expires_at>clock_timestamp()
              AND m.host_id=ANY($2) AND h.status='ready' AND h.supervisor_epoch=m.supervisor_epoch
@@ -1185,13 +1203,18 @@ impl Store {
             version: VERSION,
             member_id,
             vm_ref,
+            template_id: member.try_get("template_id")?,
             allocation_id: allocation.id,
             project_id: ProjectId::from_uuid(project_id),
             sandbox_id: SandboxId::from_uuid(sandbox_id),
+            create_operation_id: claim.operation_id,
+            generation: 1,
+            permit_serial: u64::try_from(serial).map_err(|_| Error::Conflict)?,
             host_id,
             supervisor_epoch: epoch,
             claim_revision: revision,
         };
+        intent.validate()?;
         let intent_json = serde_json::to_value(&intent).map_err(|_| Error::Invalid)?;
         // Ready -> claiming and allocation insert commit together: the member's
         // reservation moves to the allocation with no gap and no double count.
@@ -1288,7 +1311,7 @@ impl Store {
             return Err(Error::StaleEpoch);
         }
         match &receipt.outcome {
-            HandoffOutcome::Adopted => {
+            HandoffOutcome::Adopted { .. } => {
                 sqlx::query(
                     "UPDATE warm_pool_members SET state='assigned',handoff_receipt=$2,updated_at=clock_timestamp()
                      WHERE id=$1",
@@ -1346,6 +1369,101 @@ impl Store {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Durably mark the handoff dispatched before the first AdoptWarmMember and
+    /// set the allocation's initial lease. Returns [`AdoptMode::Inspect`] when
+    /// an adopt was already dispatched (lost acknowledgement or restart) or the
+    /// create's credential, deadline or sandbox expiry no longer authorizes
+    /// binding project identity: those paths may only inspect and fence.
+    pub async fn begin_warm_adopt(&self, claim: &Claim) -> Result<AdoptDispatch, Error> {
+        let mut tx = self.pool().begin().await?;
+        timeouts(&mut tx).await?;
+        let op = sqlx::query(
+            "SELECT phase,sandbox_id FROM operations WHERE id=$1 AND claim_revision=$2 AND kind='create'
+             AND lease_expires_at>clock_timestamp() AND status IN ('running','unknown') FOR UPDATE",
+        )
+        .bind(claim.operation_id.uuid())
+        .bind(claim.revision)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::LostClaim)?;
+        let phase: Option<String> = op.try_get("phase")?;
+        let sandbox: Uuid = op.try_get("sandbox_id")?;
+        let row = sqlx::query(
+            "SELECT m.handoff_intent,m.state FROM warm_pool_members m JOIN sandboxes s
+             ON s.current_allocation_id=m.claimed_allocation_id
+             JOIN allocation_permits p ON p.allocation_id=m.claimed_allocation_id
+             WHERE s.id=$1 AND p.create_operation_id=$2",
+        )
+        .bind(sandbox)
+        .bind(claim.operation_id.uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::Reconcile)?;
+        if row.try_get::<String, _>("state")? != "claiming" {
+            return Err(Error::Conflict);
+        }
+        let handoff = handoff_from(&row)?;
+        let authorized: bool = sqlx::query_scalar(
+            "SELECT p.status='active' AND o.initiator_kind='project'
+             AND (o.deadline IS NULL OR o.deadline > clock_timestamp())
+             AND (s.expires_at IS NULL OR s.expires_at > clock_timestamp())
+             AND EXISTS (SELECT 1 FROM jsonb_array_elements(p.api_tokens) t
+                WHERE t->>'key_id'=o.initiator_key_id
+                AND (t->>'revoked_at' IS NULL OR (t->>'revoked_at')::timestamptz > clock_timestamp())
+                AND (t->>'expires_at' IS NULL OR (t->>'expires_at')::timestamptz > clock_timestamp()))
+             FROM projects p JOIN operations o ON o.project_id=p.id
+             JOIN sandboxes s ON s.id=o.sandbox_id WHERE o.id=$1",
+        )
+        .bind(claim.operation_id.uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        let mode = match phase.as_deref() {
+            Some("warm_handoff") if authorized => AdoptMode::Adopt,
+            Some("warm_handoff" | "warm_adopt_dispatched") => AdoptMode::Inspect,
+            _ => return Err(Error::Reconcile),
+        };
+        let lease: time::OffsetDateTime = sqlx::query_scalar(
+            "UPDATE allocations SET lease_expires_at=least(clock_timestamp()+interval '60 seconds',
+             (SELECT expires_at FROM sandboxes WHERE id=allocations.sandbox_id)),updated_at=clock_timestamp()
+             WHERE id=$1 AND released_at IS NULL RETURNING lease_expires_at",
+        )
+        .bind(handoff.allocation.id.uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::Conflict)?;
+        if mode == AdoptMode::Adopt {
+            sqlx::query(
+                "UPDATE operations SET phase='warm_adopt_dispatched',updated_at=clock_timestamp(),
+                 attempt_receipts=attempt_receipts||jsonb_build_array($2::jsonb) WHERE id=$1",
+            )
+            .bind(claim.operation_id.uuid())
+            .bind(json!({"phase":"warm_adopt_dispatch_intent","intent_sha256":handoff.intent.digest()?}))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        let millis =
+            i64::try_from(lease.unix_timestamp_nanos() / 1_000_000).map_err(|_| Error::Conflict)?;
+        Ok(AdoptDispatch {
+            handoff,
+            mode,
+            allocation_expires_unix_ms: millis,
+        })
+    }
+
+    /// Policies the upkeep worker visits, in ID order, at most `limit`.
+    pub async fn warm_pool_policy_ids(&self, limit: u32) -> Result<Vec<Uuid>, Error> {
+        if !(1..=256).contains(&limit) {
+            return Err(Error::Invalid);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT id FROM warm_pool_policies ORDER BY id LIMIT $1")
+                .bind(i64::from(limit))
+                .fetch_all(self.pool())
+                .await?,
+        )
     }
 
     /// Durable handoff intent for a create, for restart/lost-ack reconciliation.

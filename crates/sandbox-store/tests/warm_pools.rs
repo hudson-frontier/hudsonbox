@@ -16,7 +16,8 @@ use sandbox_store::{
     host_registry::{HostPoolSpec, PlacementPolicy, PoolType, Tenancy},
     placement::{HostScope, PlacementError, Reservation},
     warm_pool::{
-        Claimed, Error, PolicySpec, Publication, TemplateSpec, WarmClaim, WarmHandoff, WarmWork,
+        AdoptMode, Claimed, Error, PolicySpec, Publication, TemplateSpec, WarmClaim, WarmHandoff,
+        WarmWork,
     },
 };
 use serde_json::json;
@@ -207,7 +208,14 @@ fn handoff(h: &WarmHandoff, outcome: HandoffOutcome) -> HandoffReceipt {
         host_id: i.host_id,
         supervisor_epoch: i.supervisor_epoch,
         claim_revision: i.claim_revision,
+        intent_sha256: i.digest().unwrap(),
         outcome,
+    }
+}
+
+fn adopted() -> HandoffOutcome {
+    HandoffOutcome::Adopted {
+        identity_sha256: "e".repeat(64),
     }
 }
 
@@ -456,7 +464,7 @@ async fn claim_transfers_reservation_exactly_once_on_a_full_host(pool: PgPool) {
     ));
     // Adoption: member assigned, create proceeds as dispatched (inspection
     // establishes readiness); retries of the same receipt are idempotent.
-    let receipt = handoff(&h, HandoffOutcome::Adopted);
+    let receipt = handoff(&h, adopted());
     f.store.record_warm_handoff(&claim, &receipt).await.unwrap();
     f.store.record_warm_handoff(&claim, &receipt).await.unwrap();
     assert_eq!(states(&pool, f.policy).await, ["assigned"]);
@@ -575,7 +583,7 @@ async fn lost_ack_and_restart_resume_the_same_durable_intent(pool: PgPool) {
         .bind(claim.operation_id.uuid()).execute(&pool).await.unwrap();
     assert!(matches!(
         f.store
-            .record_warm_handoff(&claim, &handoff(&h, HandoffOutcome::Adopted))
+            .record_warm_handoff(&claim, &handoff(&h, adopted()))
             .await,
         Err(Error::LostClaim)
     ));
@@ -609,9 +617,63 @@ async fn lost_ack_and_restart_resume_the_same_durable_intent(pool: PgPool) {
     );
     // The inspected receipt (same intent) completes the handoff.
     f.store
-        .record_warm_handoff(&again, &handoff(&h, HandoffOutcome::Adopted))
+        .record_warm_handoff(&again, &handoff(&h, adopted()))
         .await
         .unwrap();
+    assert_accounted(&pool).await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn adopt_is_dispatched_once_then_only_inspected(pool: PgPool) {
+    let f = fixture(&pool, 4, 2).await;
+    stock(&f.store, f.policy, 2).await;
+    let claim = create(&f.store, f.project, &f.token).await;
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim).await.unwrap() else {
+        panic!()
+    };
+    // The scope names the exact registered permit and create operation.
+    let (serial, op): (i64, Uuid) = sqlx::query_as(
+        "SELECT serial,create_operation_id FROM allocation_permits WHERE allocation_id=$1",
+    )
+    .bind(h.intent.allocation_id.uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(h.intent.permit_serial, serial as u64);
+    assert_eq!(op, claim.operation_id.uuid());
+    assert_eq!(h.intent.permit().allocation, h.intent.allocation_id);
+    let first = f.store.begin_warm_adopt(&claim).await.unwrap();
+    assert_eq!(first.mode, AdoptMode::Adopt);
+    assert_eq!(first.handoff, h);
+    // Lost acknowledgement: every later attempt may only inspect.
+    let again = f.store.begin_warm_adopt(&claim).await.unwrap();
+    assert_eq!(again.mode, AdoptMode::Inspect);
+    let phase: String = sqlx::query_scalar("SELECT phase FROM operations WHERE id=$1")
+        .bind(claim.operation_id.uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "warm_adopt_dispatched");
+
+    // A second create whose credential is revoked after its claim never
+    // dispatches adoption of project identity: inspect-and-fence only.
+    let other = create(&f.store, f.project, &f.token).await;
+    let Claimed::Claimed(_) = f.store.claim_warm_member(&other).await.unwrap() else {
+        panic!()
+    };
+    sqlx::query("UPDATE projects SET api_tokens='[]' WHERE id=$1")
+        .bind(f.project.uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let revoked = f.store.begin_warm_adopt(&other).await.unwrap();
+    assert_eq!(revoked.mode, AdoptMode::Inspect);
+    let phase: String = sqlx::query_scalar("SELECT phase FROM operations WHERE id=$1")
+        .bind(other.operation_id.uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase, "warm_handoff");
     assert_accounted(&pool).await;
 }
 
@@ -627,7 +689,7 @@ async fn stale_epoch_receipts_are_refused_and_stale_members_retire(pool: PgPool)
     f.store.advance_host_epoch(f.host, 1).await.unwrap();
     assert!(matches!(
         f.store
-            .record_warm_handoff(&claim, &handoff(&h, HandoffOutcome::Adopted))
+            .record_warm_handoff(&claim, &handoff(&h, adopted()))
             .await,
         Err(Error::StaleEpoch)
     ));

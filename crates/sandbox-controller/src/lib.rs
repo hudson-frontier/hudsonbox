@@ -78,6 +78,8 @@ pub enum ControllerError {
     Placement(#[from] PlacementError),
     #[error(transparent)]
     Dispatch(#[from] DispatchError),
+    #[error(transparent)]
+    WarmPool(#[from] sandbox_store::warm_pool::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +455,10 @@ impl Controller {
 
     async fn create_tick(&mut self, claim: &Claim) -> Result<Tick, ControllerError> {
         if let Some(tick) = self.previous_tick(claim).await? {
+            return Ok(tick);
+        }
+        // A ready warm member is claimed before cold placement (#188).
+        if let Some(tick) = self.warm_create(claim).await? {
             return Ok(tick);
         }
         // A registered bootstrap host opts into fleet placement. NULL transport

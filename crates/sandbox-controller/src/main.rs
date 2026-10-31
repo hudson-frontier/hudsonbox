@@ -45,6 +45,11 @@ struct Args {
     /// Reclaim released physical allocation records after history retirement.
     #[arg(long, requires = "retire_history", conflicts_with = "allow_simulated")]
     retire_allocations: bool,
+    /// Run the bounded warm-pool upkeep loop (#188): replenish and retire
+    /// members of configured policies. Real Firecracker hosts refuse warm
+    /// preparation, so this only serves members on hosts that implement it.
+    #[arg(long)]
+    warm_pool_upkeep: bool,
     /// Private read-only source store for file writes.
     #[arg(long)]
     file_source_config: Option<std::path::PathBuf>,
@@ -122,6 +127,23 @@ async fn main() -> anyhow::Result<()> {
                     biased;
                     _ = stopping.wait() => break,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
+        });
+    }
+    if args.warm_pool_upkeep {
+        let worker = controller.warm_upkeep_worker();
+        workers.spawn_background(|mut stopping| async move {
+            while !stopping.is_stopping() {
+                match worker.warm_upkeep(4).await {
+                    Ok(pass) if pass.steps.is_empty() && pass.reserved == 0 => {}
+                    Ok(pass) => eprintln!("sandbox warm pools: {pass:?}"),
+                    Err(error) => eprintln!("sandbox warm pools: {error}"),
+                }
+                tokio::select! {
+                    biased;
+                    _ = stopping.wait() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 }
             }
         });
