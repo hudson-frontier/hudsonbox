@@ -127,3 +127,30 @@ Strict Clippy passed on the same executable source:
 no executable source changed after the tested SHA above. The sole heavy build
 slot is released, with approximately 21 GiB free disk and no build left running.
 Full workspace and final-head hosted checks are separate, unclaimed results.
+
+
+## Integration onto the current warm-pool branch (2026-10-31)
+
+Replayed only the seven #197 implementation, qualification, startup, retirement
+and evidence commits from old #214 head
+`2b256e75c5650775ceae8d542669be249a4a3802` onto #215
+`dfbb3aa9bf3f519062f26c1e6bb2407def264768`, which includes the merged #209
+and #198 foundation. The old merge commit, merged standalone commits and old
+warm-pool commits were not replayed. Shared status documents preserve the current
+fleet and warm contracts. Migration 0029 remains Kubernetes-only; migration 0030
+is inherited unchanged from #215.
+
+Source inspection retains the regular-file artifact Secret subPath mount and
+actual S3 reader regression, explicit node cgroup v2 prerequisites, and refusal
+to close admission or delete a worker while the shared host report contains
+unretired warm reservations. The adapter/store source and adapter tests are
+unchanged from old #214; the inherited warm runtime and qualification code changed.
+
+Only source/light checks were authorized for this integration: formatting,
+documentation, whitespace and locked Cargo metadata. No Cargo build, Clippy,
+executable test, Kubernetes or KVM qualification was run on the integrated tree.
+The 35 focused tests and strict Clippy above apply only to old executable SHA
+`2af96b735384ea75e234147c6517dc7d1af1f173`, not this rebased source. Prior
+hosted green checks and approval on old #214 head do not validate this head.
+#215 retains the sole heavy build slot; final-head CI and review must be checked
+separately before merge.
