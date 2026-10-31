@@ -4,12 +4,10 @@ use crate::launch_authority::AuthorityFile;
 use sandbox_protocol::{allocation_authority::Permit, allocation_retirement::DomainClosure};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 
-fn fixture() -> (tempfile::TempDir, AuthorityFile, Manifest, Intent) {
-    assert_eq!(std::env::var("HUDSON_GUARDIAN_TEST_VM").as_deref(), Ok("1"));
+fn data() -> (tempfile::TempDir, Manifest, Intent) {
     let temp = tempfile::tempdir().unwrap();
     let host = HostId::generate();
     let root = temp.path().join("a");
-    let authority = AuthorityFile::initialize(root.clone(), host, 1).unwrap();
     let p = Permit {
         host,
         project: ProjectId::generate(),
@@ -20,7 +18,6 @@ fn fixture() -> (tempfile::TempDir, AuthorityFile, Manifest, Intent) {
         original_epoch: 1,
         serial: 1,
     };
-    authority.register(1, std::slice::from_ref(&p)).unwrap();
     let artifact = Artifact {
         path: "/unused".into(),
         sha256: "ab".repeat(32),
@@ -63,6 +60,17 @@ fn fixture() -> (tempfile::TempDir, AuthorityFile, Manifest, Intent) {
         release_evidence_sha256: "cd".repeat(32),
         simulated: false,
     };
+    (temp, manifest, intent)
+}
+fn fixture() -> (tempfile::TempDir, AuthorityFile, Manifest, Intent) {
+    assert_eq!(std::env::var("HUDSON_GUARDIAN_TEST_VM").as_deref(), Ok("1"));
+    let (temp, manifest, intent) = data();
+    let authority =
+        AuthorityFile::initialize(manifest.config.state_root.clone(), intent.permit.host, 1)
+            .unwrap();
+    authority
+        .register(1, std::slice::from_ref(&intent.permit))
+        .unwrap();
     (temp, authority, manifest, intent)
 }
 fn open(m: &Manifest, i: &Intent, plan: Option<&Plan>) -> Result<Session> {
@@ -367,4 +375,217 @@ fn retained_member_absence_requires_free_lifecycle_lock_and_no_runtime_paths() {
     assert!(m.prove_member_absent().is_ok());
     fs::remove_file(m.record_path()).unwrap();
     assert!(m.prove_member_absent().is_err());
+}
+
+// A stopped guardian has no live process or runtime resources. Keep its actual
+// serialized inert manifest and permit-bearing adoption receipt, as production does.
+fn adopted(cold: &Manifest) -> (Manifest, Manifest, Receipt) {
+    let mut original = cold.clone();
+    let member = uuid::Uuid::now_v7();
+    let slot = AllocationId::generate();
+    original.launch_permit = None;
+    original.start.owner = Owner::inert(cold.start.owner.host, member, slot, 1);
+    original.member = Some(Member {
+        member,
+        slot,
+        valid_until_unix_ms: wall_ms() + 60_000,
+        bound_from: None,
+    });
+    let binding = Binding {
+        owner: cold.start.owner.clone(),
+        permit: cold.launch_permit.clone(),
+        intent_sha256: "12".repeat(32),
+        identity_digest: "34".repeat(32),
+        guest_identity_sha256: "56".repeat(32),
+        identity_expires_unix_ms: wall_ms() + 30_000,
+        confirmed: true,
+    };
+    let view = original.bound(&binding).unwrap();
+    let receipt = Receipt {
+        version: 1,
+        owner: original.start.owner.clone(),
+        digest: original.digest().unwrap(),
+        host_boot_id: "dead-test-boot".into(),
+        state: State::Stopped,
+        cleanup_confirmed: true,
+        renewal_revision: 1,
+        expires_unix_ms: original.start.expires_unix_ms,
+        guardian_host_pid: None,
+        guardian_start_ticks: None,
+        firecracker_namespace_pid: None,
+        cgroup_inode: None,
+        reason: Some("stopped_adopted".into()),
+        identity_digest: Some(binding.identity_digest.clone()),
+        identity_expires_unix_ms: Some(binding.identity_expires_unix_ms),
+        guest_boot_id: Some("guest-boot".into()),
+        binding: Some(binding),
+    };
+    (original, view, receipt)
+}
+
+#[test]
+fn adopted_retirement_mapping_rejects_forged_slot_owner_permit_and_manifest() {
+    let (_temp, cold, _) = data();
+    let (original, view, receipt) = adopted(&cold);
+    assert_ne!(view.key(), view.start.owner.allocation);
+    assert_eq!(
+        retirement_manifest(&view, &receipt)
+            .unwrap()
+            .digest()
+            .unwrap(),
+        original.digest().unwrap()
+    );
+    let mut forged = view.clone();
+    forged.member.as_mut().unwrap().slot = AllocationId::generate();
+    assert!(retirement_manifest(&forged, &receipt).is_err());
+    forged = view.clone();
+    forged.config.rootfs.sha256 = "ab".repeat(31) + "cd";
+    assert!(retirement_manifest(&forged, &receipt).is_err());
+    let mut wrong = receipt.clone();
+    wrong
+        .binding
+        .as_mut()
+        .unwrap()
+        .permit
+        .as_mut()
+        .unwrap()
+        .serial += 1;
+    assert!(retirement_manifest(&view, &wrong).is_err());
+    wrong = receipt.clone();
+    wrong.binding.as_mut().unwrap().owner.project = ProjectId::generate();
+    assert!(retirement_manifest(&view, &wrong).is_err());
+    wrong = receipt.clone();
+    wrong.binding.as_mut().unwrap().confirmed = false;
+    assert!(retirement_manifest(&view, &wrong).is_err());
+}
+
+#[test]
+#[ignore = "requires root in the dedicated HUDSON_GUARDIAN_TEST_VM; no KVM needed"]
+fn adopted_slot_metadata_retirement_resumes_exact_serialized_evidence() {
+    let (temp, authority, cold, intent) = fixture();
+    let (original, view, receipt) = adopted(&cold);
+    private_dir(&original.directory()).unwrap();
+    drop(original.lifecycle_lock(true).unwrap());
+    write_json(&original.directory().join("manifest.json"), &original).unwrap();
+    write_json(&original.record_path(), &receipt).unwrap();
+    // A different stopped VM at the allocation-keyed path must survive.
+    cold.fence_unstarted().unwrap();
+    let other_manifest = fs::read(cold.directory().join("manifest.json")).unwrap();
+    let other_receipt = fs::read(cold.record_path()).unwrap();
+    authority
+        .fence(1, &intent.permit, intent.retirement)
+        .unwrap();
+    let mut forged = view.clone();
+    forged.member.as_mut().unwrap().slot = cold.key();
+    assert!(open(&forged, &intent, None).is_err());
+    let receipt_path = original.record_path();
+    let mut wrong = receipt.clone();
+    wrong
+        .binding
+        .as_mut()
+        .unwrap()
+        .permit
+        .as_mut()
+        .unwrap()
+        .serial += 1;
+    write_json(&receipt_path, &wrong).unwrap();
+    assert!(open(&view, &intent, None).is_err());
+    write_json(&receipt_path, &receipt).unwrap();
+    let mut session = open(&view, &intent, None).unwrap();
+    assert_eq!(session.plan.version, 3);
+    let plan_path = temp.path().join("adopted-plan.json");
+    write_json(&plan_path, &session.plan).unwrap();
+    let plan: Plan = read_json(&plan_path).unwrap();
+    match &plan.metadata {
+        Metadata::Stopped {
+            original_manifest,
+            files,
+            receipt: saved,
+            ..
+        } => {
+            assert_eq!(
+                original_manifest.as_ref().unwrap().digest().unwrap(),
+                original.digest().unwrap()
+            );
+            assert_eq!(files["manifest.json"].sha256, original.digest().unwrap());
+            assert_eq!(
+                serde_json::to_vec(saved).unwrap(),
+                serde_json::to_vec(&receipt).unwrap()
+            );
+        }
+        _ => panic!("missing stopped metadata"),
+    }
+    assert!(
+        plan.verify_removed(
+            &view.config.state_root,
+            &view.config.cgroup_parent,
+            &intent,
+            Some(&view)
+        )
+        .is_err()
+    );
+    // Retry after each unlink, including after both JSON files disappear.
+    for _ in 0..3 {
+        assert!(!session.remove_next().unwrap());
+        drop(session);
+        assert!(open(&view, &intent, None).is_err());
+        let retained: Plan = read_json(&plan_path).unwrap();
+        session = open(&view, &intent, Some(&retained)).unwrap();
+    }
+    assert!(session.remove_next().unwrap());
+    drop(session);
+    // Recover at a new authority epoch with the same original immutable scope.
+    authority.advance_epoch(1, 2).unwrap();
+    let retained: Plan = read_json(&plan_path).unwrap();
+    assert!(open(&view, &intent, Some(&retained)).is_err()); // stale reporting epoch
+    assert!(
+        Session::open(
+            &view.config.state_root,
+            &view.config.cgroup_parent,
+            2,
+            2,
+            &intent,
+            Some(&view),
+            Some(&retained)
+        )
+        .is_err()
+    ); // rolled-back frontier
+    let mut resumed = Session::open(
+        &view.config.state_root,
+        &view.config.cgroup_parent,
+        2,
+        1,
+        &intent,
+        Some(&view),
+        Some(&retained),
+    )
+    .unwrap();
+    assert!(resumed.is_removed());
+    assert!(resumed.remove_next().unwrap());
+    drop(resumed);
+    retained
+        .verify_removed(
+            &view.config.state_root,
+            &view.config.cgroup_parent,
+            &intent,
+            Some(&view),
+        )
+        .unwrap();
+    let mut changed = intent.clone();
+    changed.release_evidence_sha256 = "ef".repeat(32);
+    assert!(retained.validate(&changed, Some(&view)).is_err());
+    let mut corrupt = retained.clone();
+    if let Metadata::Stopped {
+        original_manifest, ..
+    } = &mut corrupt.metadata
+    {
+        original_manifest.as_mut().unwrap().start.memory_mib += 128;
+    }
+    assert!(corrupt.validate(&intent, Some(&view)).is_err());
+    assert_eq!(
+        fs::read(cold.directory().join("manifest.json")).unwrap(),
+        other_manifest
+    );
+    assert_eq!(fs::read(cold.record_path()).unwrap(), other_receipt);
+    assert!(!original.directory().exists());
 }
