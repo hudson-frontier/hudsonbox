@@ -1000,15 +1000,17 @@ impl Store {
         receipt.verify(*member_id, vm_ref.as_deref(), *host_id, *supervisor_epoch)?;
         let mut tx = self.pool().begin().await?;
         timeouts(&mut tx).await?;
-        if let Some(previous) = previous {
-            let current: i64 =
-                sqlx::query_scalar("SELECT supervisor_epoch FROM hosts WHERE id=$1 FOR UPDATE")
-                    .bind(host_id.uuid())
-                    .fetch_one(&mut *tx)
-                    .await?;
-            if current != previous.request.reporting_epoch {
-                return Err(Error::Conflict);
-            }
+        let current: i64 =
+            sqlx::query_scalar("SELECT supervisor_epoch FROM hosts WHERE id=$1 FOR UPDATE")
+                .bind(host_id.uuid())
+                .fetch_one(&mut *tx)
+                .await?;
+        let reporting_epoch =
+            previous.map_or(*supervisor_epoch, |receipt| receipt.request.reporting_epoch);
+        if current != reporting_epoch {
+            // Plain old-epoch evidence cannot bypass the current incarnation's
+            // retained-state fence and previous-epoch request echo.
+            return Err(Error::Conflict);
         }
         Self::fenced(&mut tx, claim, "warm_retire").await?;
         // Unlocked read to find the create operation, then lock it before the member.

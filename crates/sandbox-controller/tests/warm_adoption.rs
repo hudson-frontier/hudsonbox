@@ -557,3 +557,222 @@ async fn permit_hosts_adopt_only_registered_permits(pool: PgPool) {
     assert_eq!(f.fake.total_starts().await, 1);
     assert_eq!(f.fake.warm_adoptions().await, 1);
 }
+
+fn next_fake(f: &Fixture, epoch: i64) -> sandbox_fake_host::FakeHost {
+    sandbox_fake_host::FakeHost::new(sandbox_fake_host::FakeConfig {
+        host: f.config.host,
+        epoch,
+        images: images(),
+        capacity: sandbox_protocol::supervisor::Resources {
+            vcpu: 4,
+            memory_mib: 8192,
+            disk_mib: 65536,
+        },
+    })
+    .unwrap()
+}
+
+async fn previous_cleanup(
+    fake: &sandbox_fake_host::FakeHost,
+    request: &warm_pool::PreviousRetireIntent,
+) -> Result<warm_pool::PreviousCleanupReceipt, tonic::Status> {
+    let reply = fake
+        .retire_warm_member(tonic::Request::new(
+            sandbox_protocol::supervisor::WarmRetireRequest {
+                intent_json: warm_pool::encode(request).unwrap(),
+            },
+        ))
+        .await?
+        .into_inner();
+    assert!(reply.simulated);
+    match warm_pool::decode(&reply.receipt_json).unwrap() {
+        WarmReceipt::PreviousCleanup { receipt } => Ok(receipt),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn previous_cleanup_requires_retained_exact_ownership_and_current_claim(pool: PgPool) {
+    use sandbox_store::warm_pool::{Error, WarmWork};
+    let f = Fixture::new(&pool).await;
+    let policy = warm(&f, 1).await;
+    connect(&f).await.warm_upkeep(4).await.unwrap();
+    f.store.drain_host(f.config.host, 1).await.unwrap();
+    assert_eq!(
+        f.store
+            .advance_host_epoch(f.config.host, 1)
+            .await
+            .unwrap()
+            .supervisor_epoch,
+        2
+    );
+    f.store.reconcile_warm_pool(policy, 4).await.unwrap();
+    let claim = f
+        .store
+        .claim_warm_operation(policy, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    let WarmWork::Retire {
+        member_id,
+        vm_ref,
+        host_id,
+        supervisor_epoch,
+    } = &claim.work
+    else {
+        panic!()
+    };
+    let request = warm_pool::PreviousRetireIntent {
+        version: warm_pool::VERSION,
+        original: warm_pool::RetireIntent {
+            version: warm_pool::VERSION,
+            member_id: *member_id,
+            vm_ref: vm_ref.clone(),
+            host_id: *host_id,
+            supervisor_epoch: *supervisor_epoch,
+            operation_id: claim.id,
+            operation_revision: claim.revision,
+        },
+        reporting_epoch: 2,
+    };
+    // A fresh incarnation has no proof, even if every caller field agrees.
+    let restarted = next_fake(&f, 2);
+    assert!(previous_cleanup(&restarted, &request).await.is_err());
+    assert_eq!(member_states(&pool).await, ["retiring"]);
+    assert_eq!(
+        f.store
+            .host_maintenance(f.config.host, 2)
+            .await
+            .unwrap()
+            .unretired_warm_members,
+        1
+    );
+    restarted.retain_warm_members_from(&f.fake).await.unwrap();
+    // The old handle is now fenced, so a delayed old retire cannot apply.
+    assert!(
+        f.fake
+            .retire_warm_member(tonic::Request::new(
+                sandbox_protocol::supervisor::WarmRetireRequest {
+                    intent_json: warm_pool::encode(&request.original).unwrap(),
+                }
+            ))
+            .await
+            .is_err()
+    );
+    for change in 0..4 {
+        let mut wrong = request.clone();
+        match change {
+            0 => wrong.reporting_epoch = 3,
+            1 => wrong.original.member_id = Uuid::now_v7(),
+            2 => wrong.original.vm_ref = Some("other-vm".into()),
+            _ => wrong.original.supervisor_epoch = 0,
+        }
+        assert!(previous_cleanup(&restarted, &wrong).await.is_err());
+    }
+    assert_eq!(restarted.warm_holding().await, 1);
+    // An unnamed request resolves the exact retained member and reports its
+    // actual name. The store still requires the exact named durable intent.
+    let mut unnamed = request.clone();
+    unnamed.original.vm_ref = None;
+    let resolved = previous_cleanup(&restarted, &unnamed).await.unwrap();
+    assert_eq!(resolved.cleanup.vm_ref, request.original.vm_ref);
+    assert!(matches!(
+        f.store
+            .record_previous_warm_cleanup(&claim, &resolved)
+            .await,
+        Err(Error::Receipt(_))
+    ));
+    let receipt = previous_cleanup(&restarted, &request).await.unwrap();
+    receipt.verify(&request).unwrap();
+    assert!(matches!(
+        f.store.record_warm_cleanup(&claim, &receipt.cleanup).await,
+        Err(Error::Conflict)
+    ));
+    let mut forged = receipt.clone();
+    forged.request.original.operation_revision += 1;
+    assert!(matches!(
+        f.store.record_previous_warm_cleanup(&claim, &forged).await,
+        Err(Error::Receipt(_))
+    ));
+    forged = receipt.clone();
+    forged.request.reporting_epoch = 3;
+    assert!(matches!(
+        f.store.record_previous_warm_cleanup(&claim, &forged).await,
+        Err(Error::Conflict)
+    ));
+    assert_eq!(member_states(&pool).await, ["retiring"]);
+    // A lost response does not grant a stale worker database authority.
+    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp()-interval '1 second',available_at=clock_timestamp()-interval '1 second' WHERE id=$1")
+        .bind(claim.id).execute(&pool).await.unwrap();
+    assert!(matches!(
+        f.store.record_previous_warm_cleanup(&claim, &receipt).await,
+        Err(Error::LostClaim)
+    ));
+    let retry = f
+        .store
+        .claim_warm_operation(policy, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut retried = request.clone();
+    retried.original.operation_revision = retry.revision;
+    let evidence = previous_cleanup(&restarted, &retried).await.unwrap();
+    f.store
+        .record_previous_warm_cleanup(&retry, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(member_states(&pool).await, ["retired"]);
+    assert_eq!(
+        f.store
+            .host_maintenance(f.config.host, 2)
+            .await
+            .unwrap()
+            .unretired_warm_members,
+        0
+    );
+    assert_eq!(restarted.warm_holding().await, 0);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn previous_cleanup_never_destroys_an_adopted_member(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let policy = warm(&f, 1).await;
+    let mut controller = connect(&f).await;
+    controller.warm_upkeep(4).await.unwrap();
+    f.admit().await;
+    for _ in 0..6 {
+        controller.tick().await.unwrap();
+        if member_states(&pool).await == ["assigned"] {
+            break;
+        }
+    }
+    assert_eq!(member_states(&pool).await, ["assigned"]);
+    let scope = intent(&pool).await;
+    let restarted = next_fake(&f, 2);
+    restarted.retain_warm_members_from(&f.fake).await.unwrap();
+    let request = warm_pool::PreviousRetireIntent {
+        version: warm_pool::VERSION,
+        original: warm_pool::RetireIntent {
+            version: warm_pool::VERSION,
+            member_id: scope.member_id,
+            vm_ref: Some(scope.vm_ref),
+            host_id: scope.host_id,
+            supervisor_epoch: scope.supervisor_epoch,
+            operation_id: Uuid::now_v7(),
+            operation_revision: 1,
+        },
+        reporting_epoch: 2,
+    };
+    assert!(previous_cleanup(&restarted, &request).await.is_err());
+    assert_eq!(member_states(&pool).await, ["assigned"]);
+    assert_eq!(f.fake.warm_adoptions().await, 1);
+    // This helper models retained member evidence only. Ordinary allocation
+    // recovery remains separate and cannot be bypassed through warm cleanup.
+    assert!(
+        next_fake(&f, 3)
+            .retain_warm_members_from(&f.fake)
+            .await
+            .is_err()
+    );
+    assert!(f.store.warm_pool_members(policy).await.unwrap()[0]["cleanup_evidence"].is_null());
+}
