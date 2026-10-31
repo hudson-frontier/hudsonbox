@@ -156,3 +156,6 @@ admission, DNS, KVM access, cgroup enforcement, eviction, physical termination o
 multiple real guests. Those require a controlled cluster with two compatible
 Linux/KVM nodes, independent control-plane persistence, and explicit evidence of
 no duplicate live owner before this path can be called qualified.
+
+[Portable check evidence](evidence/2026-10-30-kubernetes-capacity.md) records the
+tested source, commands, failures and real-cluster limitations.
