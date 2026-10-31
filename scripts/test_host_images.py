@@ -29,7 +29,7 @@ class HostImageTests(unittest.TestCase):
                 "kernel.bin": {"sha256": "b" * 64},
             },
             "minimum_disk_mib": 256,
-            "guest_version": "0.0.0",
+            "guest_version": guest_image.GUEST_VERSION,
             "bootstrap_version": 1,
             "guest_protocol_version": 1,
             "firecracker_version": "1.17.0",
@@ -150,7 +150,7 @@ class HostImageTests(unittest.TestCase):
                     "rootfs_digest": self.digest,
                     "kernel_digest": "sha256:" + "b" * 64,
                     "minimum_disk_mib": 256,
-                    "guest_version": "0.0.0",
+                    "guest_version": guest_image.GUEST_VERSION,
                     "bootstrap_version": 1,
                     "guest_protocol_version": 1,
                 }

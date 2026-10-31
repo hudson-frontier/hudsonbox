@@ -10,7 +10,7 @@ An operator uses [offline provisioning](host-maintenance.md#initial-host-provisi
 
 - Schema version 1 and explicit `simulated` provenance.
 - Native architecture (`x86_64` or `aarch64`), exact host kernel release, KVM API 12 and cgroup version 2.
-- Supervisor/guest version `0.0.0`, Firecracker/jailer compatibility `1.17.0`, immutable Firecracker and jailer SHA-256 digests.
+- Supervisor/guest version equal to the workspace [version](versioning.md), Firecracker/jailer compatibility `1.17.0`, immutable Firecracker and jailer SHA-256 digests.
 - Maximum per-allocation vCPU, memory MiB and writable disk MiB, bounded by the existing public runtime envelope.
 - One to 64 image descriptors: rootfs and kernel `sha256:` digests, minimum disk MiB, guest version, bootstrap version 1 and guest protocol version 1.
 

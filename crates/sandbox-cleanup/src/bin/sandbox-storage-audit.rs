@@ -13,6 +13,8 @@ mod unix {
 
     #[derive(Parser)]
     #[command(
+        display_name = "sandbox-storage-audit (hudsonbox)",
+        version,
         about = "Verify offline recovery storage evidence without modifying the database or storage"
     )]
     pub(super) struct Args {

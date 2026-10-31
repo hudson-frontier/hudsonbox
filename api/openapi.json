@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Hudsonbox project API",
-    "version": "0.0.0",
+    "version": "0.0.1",
     "description": "Implemented single-host project API only. All operations require project bearer authentication over HTTPS. This contract is not a production-security release claim. Lifecycle admission uses project-wide idempotency keys. Results can remain unknown; never infer completion or replay uncertain work. JSON bodies at the standalone listener are capped at 65536 bytes, except file capture JSON (16384) and binary uploads (8388608)."
   },
   "servers": [

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+import hudsonbox
 from hudsonbox import Client, ClientError
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -117,7 +118,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         self.assertEqual(CORPUS["version"], 1)
-        self.assertEqual(CORPUS["api_version"], "0.0.0")
+        self.assertEqual(CORPUS["api_version"], hudsonbox.__version__)
         for kind in example.KINDS:
             with self.subTest(kind=kind):
                 directory = self.prepare(kind)

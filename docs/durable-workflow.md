@@ -4,7 +4,7 @@ The [version 1 workflow fixture](../api/conformance/workflow.json) and [step rec
 
 ## Version and ownership
 
-The API remains the unpublished `0.0.0` [OpenAPI contract](openapi.md). Fixture `version: 1` fixes mutation mappings, readiness distinctions, binary values and resume/gap examples. Breaking changes require a new version and consumer agreement; API/model changes follow ordinary generation/conformance review.
+The API is the pre-1.0 [OpenAPI contract](openapi.md), versioned with the [product](versioning.md). Fixture `version: 1` fixes mutation mappings, readiness distinctions, binary values and resume/gap examples. Breaking changes require a new version and consumer agreement; API/model changes follow ordinary generation/conformance review.
 
 | Caller state | Authority and recovery |
 | --- | --- |

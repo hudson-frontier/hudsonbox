@@ -9,6 +9,7 @@ use sandbox_store::{
 use std::{io::Read, path::PathBuf};
 
 #[derive(Parser)]
+#[command(display_name = "sandbox-host-manager (hudsonbox)", version)]
 struct Args {
     /// Private owned JSON {"version":1,"database_url":"..."}; never a tool payload.
     #[arg(long)]

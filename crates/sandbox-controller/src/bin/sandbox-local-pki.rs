@@ -29,6 +29,7 @@ mod native {
     };
 
     #[derive(Parser)]
+    #[command(display_name = "sandbox-local-pki (hudsonbox)", version)]
     struct Args {
         /// New absolute destination under an existing private, owned canonical directory.
         #[arg(long)]

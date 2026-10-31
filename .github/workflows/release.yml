@@ -1,0 +1,141 @@
+name: Release
+
+# See docs/versioning.md. Pushes to main publish the version in VERSION once;
+# a manual run prepares a release PR that bumps it.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump (auto reads Conventional Commits since the last v* tag)
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions:
+  contents: read
+
+# One release job at a time, never cancelled midway; tag creation stays ordered.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish tag and release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check product version consistency
+        run: python3 scripts/version.py check
+
+      - name: Create the annotated tag and release when missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(python3 scripts/version.py show)
+          tag="v$version"
+          if gh api "repos/$REPOSITORY/git/ref/tags/$tag" > /dev/null 2>&1; then
+            echo "Tag $tag already exists; it is never moved."
+          else
+            # Annotated tag object, then the ref. Creating an existing ref fails
+            # with 422, so a concurrent or repeated run cannot replace a tag.
+            tag_object=$(gh api "repos/$REPOSITORY/git/tags" \
+              -f tag="$tag" -f message="hudsonbox $tag" \
+              -f object="$COMMIT" -f type=commit --jq .sha)
+            gh api "repos/$REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$tag_object" > /dev/null
+            echo "Created annotated tag $tag at $COMMIT."
+          fi
+          if gh release view "$tag" --repo "$REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $tag already exists."
+            exit 0
+          fi
+          python3 scripts/version.py notes "$version" > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" --repo "$REPOSITORY" --verify-tag \
+            --title "hudsonbox $tag" \
+            --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
+          echo "Published release hudsonbox $tag."
+
+  prepare:
+    name: Prepare release pull request
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      # PRs opened with GITHUB_TOKEN do not trigger required checks; see
+      # docs/versioning.md#release-token.
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run the release preparation from main."
+          exit 1
+
+      - name: Check out main with history and tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Bump version and prepend changelog
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          python3 scripts/version.py check
+          current=$(python3 scripts/version.py show)
+          next=$(python3 scripts/version.py bump "$BUMP")
+          if [[ -z "$next" ]]; then
+            echo "::notice::No feat, fix, perf or breaking commits since the last tag; no release needed."
+            exit 0
+          fi
+          python3 scripts/version.py changelog "$next" --write
+          python3 scripts/version.py check
+          echo "Bumped $current -> $next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Push release branch and open pull request
+        if: steps.bump.outputs.version != ''
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          USING_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          branch="release/v$VERSION"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            echo "::error::Branch $branch already exists; close or delete it first."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "release: hudsonbox v$VERSION"
+          git push origin "$branch"
+          body="Bumps VERSION and every manifest to $VERSION and prepends the generated CHANGELOG.md section.
+
+          Before merging, edit the changelog section for accuracy: breaking changes, upgrade steps and known limitations. After this PR is squash-merged, the Release workflow tags v$VERSION and publishes \"hudsonbox v$VERSION\". See docs/versioning.md."
+          if [[ "$USING_RELEASE_TOKEN" != "true" ]]; then
+            body="$body
+
+          This PR was opened with GITHUB_TOKEN, so required checks will not start on their own. Push a commit to $branch (for example an empty commit) or add a RELEASE_TOKEN secret."
+          fi
+          gh pr create --base main --head "$branch" \
+            --title "release: hudsonbox v$VERSION" --body "$body"

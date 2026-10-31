@@ -58,6 +58,7 @@ def build(destination, arch, no_cache=False):
                 "Cargo.toml",
                 "Cargo.lock",
                 "rust-toolchain.toml",
+                "VERSION",
                 "crates",
                 "proto",
             ],
@@ -72,7 +73,12 @@ def build(destination, arch, no_cache=False):
         guest_image.require(
             all(
                 (context / name).is_file() and (context / name).stat().st_size > 0
-                for name in ("Cargo.lock", "Cargo.toml", "rust-toolchain.toml")
+                for name in (
+                    "Cargo.lock",
+                    "Cargo.toml",
+                    "rust-toolchain.toml",
+                    "VERSION",
+                )
             ),
             "committed build inputs are missing after extraction",
         )

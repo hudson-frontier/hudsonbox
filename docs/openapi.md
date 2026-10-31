@@ -4,7 +4,7 @@ Status: the implemented Project API has a checked [OpenAPI 3.1 document](../api/
 
 The specification owns exact wire shapes for 14 operations: create, execute, destroy, cancel, sandbox/operation reads and lists, retained-output reads, SSE, binary uploads, and capture/read/release downloads. It contains no planned Admin, browser-session, pause/resume or snapshot endpoints. It is a repository artifact; the service does not expose a new discovery endpoint. Replace its reserved example HTTPS origin with your installation's trusted API URL.
 
-[API contract](api-contract.md) owns admission, authorization, idempotency, retry, retention and streaming semantics. [The OpenAPI standard](https://spec.openapis.org/oas/v3.1.0.html) defines the document format. The contract version matches the workspace's current `0.0.0`; it is not a published release or a claim that the runtime is ready for production.
+[API contract](api-contract.md) owns admission, authorization, idempotency, retry, retention and streaming semantics. [The OpenAPI standard](https://spec.openapis.org/oas/v3.1.0.html) defines the document format. The contract version matches the workspace [version](versioning.md); a pre-1.0 version is not a claim that the runtime is ready for production.
 
 ## Change and check the contract
 

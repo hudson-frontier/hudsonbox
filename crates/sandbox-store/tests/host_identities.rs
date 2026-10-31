@@ -22,7 +22,7 @@ fn image(c: char) -> Image {
         rootfs_digest: format!("sha256:{}", c.to_string().repeat(64)),
         kernel_digest: format!("sha256:{}", "b".repeat(64)),
         minimum_disk_mib: 256,
-        guest_version: "0.0.0".into(),
+        guest_version: env!("CARGO_PKG_VERSION").into(),
         bootstrap_version: 1,
         guest_protocol_version: 1,
     }
@@ -36,7 +36,7 @@ fn capabilities(images: Vec<Image>) -> Capabilities {
         host_kernel_release: "6.8.0-fixture".into(),
         kvm_api_version: 12,
         cgroup_version: 2,
-        supervisor_version: "0.0.0".into(),
+        supervisor_version: env!("CARGO_PKG_VERSION").into(),
         firecracker_version: "1.17.0".into(),
         firecracker_digest: format!("sha256:{}", "f".repeat(64)),
         jailer_digest: format!("sha256:{}", "e".repeat(64)),
