@@ -793,3 +793,37 @@ async fn fleet_rpc_counts_are_epoch_fenced_and_history_does_not_exhaust_active_b
     assert_eq!(snapshot["hosts"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["hosts"][0]["host_id"], b.uuid().to_string());
 }
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_rpc_observation_lock_wait_is_cancelled_on_server(pool: PgPool) {
+    use sandbox_protocol::rpc_telemetry::RpcFailure;
+    let store = Store::from_pool(pool.clone());
+    let a = registered(&store, None, 81).await;
+    let b = registered(&store, None, 82).await;
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM hosts WHERE id=$1 FOR UPDATE")
+        .bind(a.uuid())
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let failure = store
+        .record_host_rpc_failure(a, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap_err();
+    let sqlx::Error::Database(database) = failure else {
+        panic!("expected PostgreSQL statement cancellation, got {failure}");
+    };
+    assert_eq!(database.code().as_deref(), Some("57014"));
+    store
+        .record_host_rpc_failure(b, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap();
+    lock.rollback().await.unwrap();
+    assert_eq!(row(&pool, a).await["rpc_failures"]["unavailable"], 0);
+    assert_eq!(row(&pool, b).await["rpc_failures"]["unavailable"], 1);
+    store
+        .record_host_rpc_failure(a, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap();
+    assert_eq!(row(&pool, a).await["rpc_failures"]["unavailable"], 1);
+}
