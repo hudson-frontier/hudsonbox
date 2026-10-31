@@ -292,12 +292,14 @@ mod tests {
         symlink(&target, &link).unwrap();
         assert!(credential("fixture", &link).is_err());
         let fifo = directory.path().join("fifo.json");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::Mode::from_bits_truncate(0o600),
-        )
-        .unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
         assert!(credential("fixture", &fifo).is_err());
         let large = directory.path().join("large.json");
         std::fs::write(&large, vec![b'x'; 4097]).unwrap();
