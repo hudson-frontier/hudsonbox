@@ -62,6 +62,9 @@ pub struct Claim {
 }
 
 pub const MAX_PENDING: i64 = 1000;
+/// Claims per intent. An exhausted intent stays unfinished (blocking pool type
+/// changes) until it succeeds by operator action or is cancelled.
+pub const MAX_ATTEMPTS: i64 = 8;
 impl Store {
     /// Routers validate live ownership before selecting an adapter. Pool type
     /// cannot change while this intent is unfinished (including expired claims).
@@ -119,7 +122,7 @@ impl Store {
             if row.try_get::<Value,_>("request")? != value { return Err(Error::Conflict); }
             let id = row.try_get("id")?; tx.commit().await?; return Ok(id);
         }
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM capacity_operations WHERE host_pool_id=$1 AND status<>'succeeded'")
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running')")
             .bind(pool).fetch_one(&mut *tx).await?;
         if count >= MAX_PENDING {
             return Err(Error::Invalid);
@@ -131,12 +134,15 @@ impl Store {
         Ok(id)
     }
 
+    /// Claims in `available_at` order. Each claim moves the intent's turn to its
+    /// lease end, so an abandoned or retried intent queues behind work that was
+    /// already waiting instead of starving it. At most [`MAX_ATTEMPTS`] claims.
     pub async fn claim_capacity(&self, pool: Uuid, seconds: u32) -> Result<Option<Claim>, Error> {
         if !(1..=300).contains(&seconds) {
             return Err(Error::Invalid);
         }
-        let row = sqlx::query("UPDATE capacity_operations SET status='running',claim_revision=claim_revision+1,lease_expires_at=clock_timestamp()+make_interval(secs=>$2),updated_at=clock_timestamp() WHERE id=(SELECT id FROM capacity_operations WHERE host_pool_id=$1 AND status<>'succeeded' AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,claim_revision,request")
-            .bind(pool).bind(f64::from(seconds)).fetch_optional(self.pool()).await?;
+        let row = sqlx::query("UPDATE capacity_operations SET status='running',claim_revision=claim_revision+1,lease_expires_at=clock_timestamp()+make_interval(secs=>$2),available_at=clock_timestamp()+make_interval(secs=>$2),updated_at=clock_timestamp() WHERE id=(SELECT id FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running') AND claim_revision<$3 AND available_at<=clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,claim_revision,request")
+            .bind(pool).bind(f64::from(seconds)).bind(MAX_ATTEMPTS).fetch_optional(self.pool()).await?;
         row.map(|r| {
             Ok(Claim {
                 id: r.try_get("id")?,
@@ -150,12 +156,45 @@ impl Store {
     }
 
     /// A bounded retry preserves intent and receipt identity. No automatic loop.
+    /// The intent rejoins the back of the claim order.
     pub async fn retry_capacity(&self, claim: &Claim) -> Result<(), Error> {
-        let n=sqlx::query("UPDATE capacity_operations SET status='queued',lease_expires_at=NULL,error='operator_retry',updated_at=clock_timestamp() WHERE id=$1 AND host_pool_id=$2 AND claim_revision=$3 AND status='running' AND lease_expires_at>clock_timestamp()")
+        let n=sqlx::query("UPDATE capacity_operations SET status='queued',lease_expires_at=NULL,available_at=clock_timestamp(),error='operator_retry',updated_at=clock_timestamp() WHERE id=$1 AND host_pool_id=$2 AND claim_revision=$3 AND status='running' AND lease_expires_at>clock_timestamp()")
             .bind(claim.id).bind(claim.pool).bind(claim.revision).execute(self.pool()).await?.rows_affected();
         if n != 1 {
             return Err(Error::LostClaim);
         }
+        Ok(())
+    }
+
+    /// Operator-only cancellation of a stale intent in a standalone pool. Static
+    /// effects commit atomically with their receipt, so an unclaimed (queued or
+    /// lease-expired) intent without a receipt is proven unapplied. Live claims,
+    /// receipts and intents of non-static pools (whose external effects may be
+    /// uncertain) are retained. Idempotent for an already cancelled intent.
+    pub async fn cancel_capacity(&self, pool: Uuid, id: Uuid) -> Result<(), Error> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET LOCAL lock_timeout='1s'")
+            .execute(&mut *tx)
+            .await?;
+        // Pool before intent: same order as apply, so a racing apply either
+        // committed its receipt already or will observe the cancellation.
+        let kind: String = sqlx::query_scalar("SELECT type FROM host_pools WHERE id=$1 FOR UPDATE")
+            .bind(pool)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(Error::Conflict)?;
+        let row = sqlx::query("SELECT status,provider_receipt IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) unclaimed FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 FOR UPDATE")
+            .bind(id).bind(pool).fetch_optional(&mut *tx).await?.ok_or(Error::Conflict)?;
+        let status: String = row.try_get("status")?;
+        if status == "cancelled" {
+            return Ok(());
+        }
+        if kind != "standalone" || status == "succeeded" || !row.try_get::<bool, _>("unclaimed")? {
+            return Err(Error::Conflict);
+        }
+        sqlx::query("UPDATE capacity_operations SET status='cancelled',lease_expires_at=NULL,error='operator_cancelled',updated_at=clock_timestamp() WHERE id=$1")
+            .bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 

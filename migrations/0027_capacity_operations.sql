@@ -18,9 +18,13 @@ CREATE TABLE capacity_operations (
     target_ref text NOT NULL CHECK (length(target_ref) BETWEEN 1 AND 253),
     idempotency_key text NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 128),
     request jsonb NOT NULL CHECK (jsonb_typeof(request)='object'),
-    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','succeeded')),
+    -- 'cancelled' is only reachable for proven-unapplied static intent; it
+    -- never carries a receipt and its idempotency key stays reserved.
+    status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','running','succeeded','cancelled')),
     claim_revision bigint NOT NULL DEFAULT 0 CHECK (claim_revision>=0),
     lease_expires_at timestamptz,
+    -- Fair claim order: a retried or abandoned claim rejoins behind waiting intent.
+    available_at timestamptz NOT NULL DEFAULT now(),
     provider_receipt jsonb CHECK (provider_receipt IS NULL OR jsonb_typeof(provider_receipt)='object'),
     error text CHECK (error IS NULL OR length(error)<=128),
     created_at timestamptz NOT NULL DEFAULT now(),
@@ -29,5 +33,5 @@ CREATE TABLE capacity_operations (
     CHECK ((status='running') = (lease_expires_at IS NOT NULL)),
     CHECK ((status='succeeded') = (provider_receipt IS NOT NULL))
 );
-CREATE INDEX capacity_operations_claim ON capacity_operations(host_pool_id,created_at,id)
-    WHERE status <> 'succeeded';
+CREATE INDEX capacity_operations_claim ON capacity_operations(host_pool_id,available_at,created_at,id)
+    WHERE status IN ('queued','running');

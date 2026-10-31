@@ -42,6 +42,13 @@ enum Action {
         #[arg(long)]
         pool_id: uuid::Uuid,
     },
+    /// Cancel a stale, unclaimed static intent that has no receipt.
+    CapacityCancel {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+        #[arg(long)]
+        operation_id: uuid::Uuid,
+    },
     /// Read a durable intent, status, lease and receipt by ID.
     CapacityStatus {
         #[arg(long)]
@@ -94,10 +101,15 @@ enum Action {
         #[arg(long)]
         project_id: ProjectId,
     },
-    /// Print the registry read model, optionally for one pool.
+    /// Print one page of registry history (retired tombstones included),
+    /// optionally for one pool. Continue with `--after <next_after>`.
     Registry {
         #[arg(long)]
         pool_id: Option<uuid::Uuid>,
+        #[arg(long)]
+        after: Option<HostId>,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
     },
     /// Compare operator-configured standalone addresses with one pool's registry.
     Discover {
@@ -173,6 +185,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             | Action::Discover { .. }
             | Action::CapacityEnqueue { .. }
             | Action::CapacityTick { .. }
+            | Action::CapacityCancel { .. }
             | Action::CapacityStatus { .. }
             | Action::CapacityPlan { .. }
     );
@@ -205,6 +218,13 @@ async fn run(args: Args) -> anyhow::Result<()> {
                 Some(claim) => router.apply(&store, &claim).await?,
                 None => serde_json::json!({"idle":true}),
             }
+        }
+        Action::CapacityCancel {
+            pool_id,
+            operation_id,
+        } => {
+            store.cancel_capacity(pool_id, operation_id).await?;
+            serde_json::json!({"operation_id": operation_id, "status": "cancelled"})
         }
         Action::CapacityStatus { operation_id } => store
             .capacity_operation(operation_id)
@@ -246,8 +266,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "project_id": project_id,
             "host_pool_id": pool_id,
         }),
-        Action::Registry { pool_id } => {
-            serde_json::to_value(store.registered_hosts(pool_id).await?)?
+        Action::Registry {
+            pool_id,
+            after,
+            limit,
+        } => {
+            let hosts = store.registered_host_history(pool_id, after, limit).await?;
+            let next = (hosts.len() as i64 == limit)
+                .then(|| hosts.last().map(|h| h.host_id))
+                .flatten();
+            serde_json::json!({"hosts": hosts, "next_after": next})
         }
         Action::Discover {
             pool_id,

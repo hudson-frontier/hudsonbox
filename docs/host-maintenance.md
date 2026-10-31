@@ -144,8 +144,14 @@ cargo run -p sandbox-controller --bin sandbox-host-manager -- \
 cargo run -p sandbox-controller --bin sandbox-host-manager -- \
   --database-config /private/database.json grant-pool-access --pool-id POOL_UUID --project-id PROJECT_ID
 cargo run -p sandbox-controller --bin sandbox-host-manager -- \
-  --database-config /private/database.json registry [--pool-id POOL_UUID]
+  --database-config /private/database.json registry [--pool-id POOL_UUID] \
+  [--after HOST_ID] [--limit 500]
 ```
+
+`registry` prints one page (1–1000 hosts, ordered by identity) of retained
+history including retired tombstones, plus `next_after` for the following page.
+Runtime health refresh, discovery and capacity planning enumerate only active
+(non-retired) hosts, bounded at 10000; tombstones never exhaust that bound.
 
 Names are unique DNS labels. `max_hosts` is at least `min_ready_hosts`, at most
 100000, never below the enrolled host count, and bounds provisioning into the
@@ -349,6 +355,8 @@ sandbox-host-manager --database-config /private/database.json capacity-enqueue \
   --request-config /private/capacity-request.json
 sandbox-host-manager --database-config /private/database.json capacity-tick --pool-id POOL_UUID
 sandbox-host-manager --database-config /private/database.json capacity-status --operation-id OPERATION_UUID
+sandbox-host-manager --database-config /private/database.json capacity-cancel \
+  --pool-id POOL_UUID --operation-id OPERATION_UUID
 sandbox-host-manager --database-config /private/database.json capacity-plan \
   --pool-id POOL_UUID --waiting-sandboxes 4 --sandboxes-per-host 2 --max-additional-hosts 1
 ```
@@ -377,9 +385,23 @@ Pool type changes still require no active workers or unfinished capacity work.
 Each tick claims at most one intent, with a 30-second lease and no background
 retry loop. On refusal or a lost response, inspect `capacity-status`, resolve the
 host condition and rerun after the lease expires. Claims accept 1–300 seconds;
-the store exposes fenced explicit retry. Outstanding intents are bounded to
+the store exposes fenced explicit retry. Claims are ordered by each intent's
+`available_at` turn, which every claim moves to its lease end and every explicit
+retry moves to now: a repeatedly failing older intent rejoins behind intent that
+was already waiting (for example a later drain its retire depends on) instead
+of starving it. Each intent is claimed at most 8 times; an exhausted intent
+stays unfinished, blocking pool type changes, until cancelled.
+
+`capacity-cancel` marks a stale intent `cancelled` only in a `standalone` pool,
+only while it is unclaimed (queued or lease expired) and has no receipt. Static
+effects commit atomically with their receipt, so such an intent is proven
+unapplied; cancellation takes the pool lock first, serializing with apply.
+Live claims, completed receipts and intents of non-static pools, whose external
+effects may be uncertain, are refused and retained. Cancelled intents keep their
+idempotency key (an exact retry returns the same ID) and no longer block pool
+type changes. Outstanding intents are bounded to
 1000 per pool; completed idempotency records are retained, never automatically
-deleted. Inventory reads retain the registry's 10000-host bound. Demand is an
+deleted. Active inventory reads retain the registry's 10000-host bound. Demand is an
 explicit advisory input (at most 100000 waiting sandboxes, 1–100000 sandboxes per
 host, at most 1000 additional hosts); the plan caps additions by `max_hosts`,
 active inventory, minimum ready workers and the operator's request budget.

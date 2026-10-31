@@ -99,7 +99,7 @@ async fn duplicate_intents_claim_races_and_stale_retry(pool: PgPool) {
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_ne!(a.is_some(), b.is_some());
     let old = a.or(b).unwrap();
-    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp()-interval '1 second',available_at=clock_timestamp()-interval '1 second' WHERE id=$1").bind(id).execute(&pool).await.unwrap();
     let new = store.claim_capacity(p, 30).await.unwrap().unwrap();
     assert!(new.revision > old.revision);
     assert!(matches!(
@@ -452,7 +452,11 @@ async fn retire_then_replace_at_max_preserves_history_without_spending_slot(pool
         .set_host_transport(replacement, 1, &transport)
         .await
         .unwrap();
-    let hosts = store.registered_hosts(Some(p)).await.unwrap();
+    assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 1);
+    let hosts = store
+        .registered_host_history(Some(p), None, 10)
+        .await
+        .unwrap();
     assert_eq!(hosts.len(), 2);
     assert!(
         hosts
@@ -514,7 +518,15 @@ async fn retire_then_replace_at_max_preserves_history_without_spending_slot(pool
         store.put_host_pool(&k8s).await.unwrap().pool_type,
         PoolType::K8s
     );
-    assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 2);
+    assert!(store.registered_hosts(Some(p)).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .registered_host_history(Some(p), None, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
@@ -549,4 +561,226 @@ async fn pending_intent_bound_is_serialized_and_exact_retry_survives_bound(pool:
         store.enqueue_capacity(p, "overflow", &request).await,
         Err(Error::Invalid)
     ));
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn failing_oldest_intent_rejoins_queue_and_attempts_are_bounded(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "fair")).await.unwrap();
+    let host = HostId::generate();
+    store
+        .provision_host(host, 1, &provision(Some(p)))
+        .await
+        .unwrap();
+    store
+        .observe_configured_host_with_capabilities(
+            host,
+            1,
+            &capabilities().to_json().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    store.finish_host_drain(host, 1).await.unwrap();
+    let request = |action| Request {
+        host,
+        epoch: 1,
+        action,
+    };
+    // Retire is enqueued first but can only succeed after the later drain.
+    let retire = store
+        .enqueue_capacity(p, "retire", &request(Action::Retire))
+        .await
+        .unwrap();
+    let drain = store
+        .enqueue_capacity(p, "drain", &request(Action::Drain))
+        .await
+        .unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert_eq!(claim.id, retire);
+    assert!(matches!(
+        store.apply_static_capacity(&claim).await,
+        Err(Error::Conflict)
+    ));
+    store.retry_capacity(&claim).await.unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert_eq!(claim.id, drain);
+    // Abandoned (lease-expired) work also rejoins behind already waiting work.
+    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp(),available_at=clock_timestamp() WHERE id=$1")
+        .bind(drain).execute(&pool).await.unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert_eq!(claim.id, retire);
+    store.retry_capacity(&claim).await.unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert_eq!(claim.id, drain);
+    store.apply_static_capacity(&claim).await.unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert_eq!(claim.id, retire);
+    assert_eq!(
+        store.apply_static_capacity(&claim).await.unwrap()["retired"],
+        true
+    );
+
+    // A permanently failing intent is claimed at most MAX_ATTEMPTS times.
+    let stuck = store
+        .enqueue_capacity(
+            p,
+            "stuck",
+            &Request {
+                host: HostId::generate(),
+                epoch: 1,
+                action: Action::Status,
+            },
+        )
+        .await
+        .unwrap();
+    for _ in 0..sandbox_store::capacity::MAX_ATTEMPTS {
+        let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+        assert_eq!(claim.id, stuck);
+        assert!(store.apply_static_capacity(&claim).await.is_err());
+        store.retry_capacity(&claim).await.unwrap();
+    }
+    assert!(store.claim_capacity(p, 30).await.unwrap().is_none());
+    assert_eq!(
+        store.capacity_operation(stuck).await.unwrap().unwrap()["status"],
+        "queued"
+    );
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn stale_unapplied_static_intent_cancels_and_unblocks_type_change(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "cancel")).await.unwrap();
+    let request = Request {
+        host: HostId::generate(),
+        epoch: 1,
+        action: Action::Status,
+    };
+    let id = store.enqueue_capacity(p, "stale", &request).await.unwrap();
+    let mut k8s = spec(p, "cancel");
+    k8s.pool_type = PoolType::K8s;
+    k8s.provider_config =
+        json!({"version":1,"namespace":"workers","worker_label_selector":"app=supervisor"});
+    assert!(store.put_host_pool(&k8s).await.is_err());
+    // A live claim may be applying: retained.
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    assert!(matches!(
+        store.cancel_capacity(p, id).await,
+        Err(Error::Conflict)
+    ));
+    assert!(matches!(
+        store.cancel_capacity(Uuid::now_v7(), id).await,
+        Err(Error::Conflict)
+    ));
+    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1")
+        .bind(id).execute(&pool).await.unwrap();
+    store.cancel_capacity(p, id).await.unwrap();
+    store.cancel_capacity(p, id).await.unwrap();
+    assert!(matches!(
+        store.apply_static_capacity(&claim).await,
+        Err(Error::LostClaim)
+    ));
+    let row = store.capacity_operation(id).await.unwrap().unwrap();
+    assert_eq!(row["status"], "cancelled");
+    assert!(row["provider_receipt"].is_null());
+    assert_eq!(
+        store.enqueue_capacity(p, "stale", &request).await.unwrap(),
+        id
+    );
+    assert!(store.claim_capacity(p, 30).await.unwrap().is_none());
+
+    // Completed receipts are retained, never cancelled.
+    let host = HostId::generate();
+    store
+        .provision_host(host, 1, &provision(Some(p)))
+        .await
+        .unwrap();
+    let done = store
+        .enqueue_capacity(
+            p,
+            "done",
+            &Request {
+                host,
+                epoch: 1,
+                action: Action::Status,
+            },
+        )
+        .await
+        .unwrap();
+    let claim = store.claim_capacity(p, 30).await.unwrap().unwrap();
+    store.apply_static_capacity(&claim).await.unwrap();
+    assert!(matches!(
+        store.cancel_capacity(p, done).await,
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        store.capacity_operation(done).await.unwrap().unwrap()["status"],
+        "succeeded"
+    );
+
+    // With no active worker or unfinished intent, the type change proceeds.
+    let empty = Uuid::now_v7();
+    store.put_host_pool(&spec(empty, "empty")).await.unwrap();
+    let stale = store
+        .enqueue_capacity(empty, "stale", &request)
+        .await
+        .unwrap();
+    store.cancel_capacity(empty, stale).await.unwrap();
+    let mut k8s = spec(empty, "empty");
+    k8s.pool_type = PoolType::K8s;
+    k8s.provider_config =
+        json!({"version":1,"namespace":"workers","worker_label_selector":"app=supervisor"});
+    store.put_host_pool(&k8s).await.unwrap();
+    // Unfinished intent of a non-static pool may have uncertain effects: retained.
+    let uncertain = store
+        .enqueue_capacity(empty, "uncertain", &request)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.cancel_capacity(empty, uncertain).await,
+        Err(Error::Conflict)
+    ));
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn retired_history_beyond_registry_bound_pages_and_keeps_active_read(pool: PgPool) {
+    use sandbox_store::host_registry::{MAX_HISTORY_PAGE, MAX_REGISTRY_HOSTS};
+    let store = Store::from_pool(pool.clone());
+    let p = Uuid::now_v7();
+    store.put_host_pool(&spec(p, "history")).await.unwrap();
+    let active = HostId::generate();
+    store
+        .provision_host(active, 1, &provision(Some(p)))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch,host_pool_id,capacity_retired_at) SELECT gen_random_uuid(),'draining',4,8192,65536,1,$1,clock_timestamp() FROM generate_series(1,$2)")
+        .bind(p).bind(MAX_REGISTRY_HOSTS + 5).execute(&pool).await.unwrap();
+    let hosts = store.registered_hosts(None).await.unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].host_id, active);
+    assert_eq!(store.registered_hosts(Some(p)).await.unwrap().len(), 1);
+    assert!(
+        store
+            .registered_host_history(None, None, MAX_HISTORY_PAGE + 1)
+            .await
+            .is_err()
+    );
+    assert!(store.registered_host_history(None, None, 0).await.is_err());
+    let (mut after, mut seen, mut retired) = (None, 0_i64, 0_i64);
+    loop {
+        let page = store
+            .registered_host_history(Some(p), after, MAX_HISTORY_PAGE)
+            .await
+            .unwrap();
+        seen += page.len() as i64;
+        retired += page.iter().filter(|h| h.capacity_retired).count() as i64;
+        if (page.len() as i64) < MAX_HISTORY_PAGE {
+            break;
+        }
+        after = page.last().map(|h| h.host_id);
+    }
+    assert_eq!(seen, MAX_REGISTRY_HOSTS + 6);
+    assert_eq!(retired, MAX_REGISTRY_HOSTS + 5);
 }
