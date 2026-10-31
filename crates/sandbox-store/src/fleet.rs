@@ -14,19 +14,25 @@ impl Store {
         epoch: i64,
         failure: RpcFailure,
     ) -> Result<(), sqlx::Error> {
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            let mut tx = self.pool().begin().await?;
+            // Bound server work as well as the caller's wait, including row locks.
+            sqlx::query("SET LOCAL statement_timeout='75ms'")
+                .execute(&mut *tx)
+                .await?;
             sqlx::query(
-                "UPDATE hosts SET rpc_failures=jsonb_set(rpc_failures, ARRAY[$3],
-                to_jsonb(least((rpc_failures->>$3)::numeric+1,9223372036854775807)::bigint)),
+                "UPDATE hosts SET rpc_failures=jsonb_set(rpc_failures, ARRAY[$3::text],
+                to_jsonb(least((rpc_failures->>$3::text)::numeric+1,9223372036854775807)::bigint)),
                 rpc_last_failure_at=clock_timestamp()
              WHERE id=$1 AND supervisor_epoch=$2 AND capacity_retired_at IS NULL",
             )
             .bind(host.uuid())
             .bind(epoch)
             .bind(failure.label())
-            .execute(self.pool()),
-        )
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await
+        })
         .await
         .map_err(|_| sqlx::Error::PoolTimedOut)??;
         Ok(())
