@@ -382,11 +382,19 @@ impl HostDiscovery for KubernetesCapacityProvider {
                 return Err(DiscoveryError::InvalidResult);
             }
             let mut workers = Vec::new();
+            // Node capacity is counted once: a second active worker reporting a
+            // node that already hosts one is refused rather than added.
+            let mut nodes = std::collections::BTreeSet::new();
             for pod in pods {
                 if !pod["metadata"]["deletionTimestamp"].is_null()
                     || pod["status"]["phase"] != "Running"
                 {
                     continue;
+                }
+                if let Some(node) = pod["spec"]["nodeName"].as_str()
+                    && !nodes.insert(node.to_owned())
+                {
+                    return Err(DiscoveryError::InvalidResult);
                 }
                 let meta = &pod["metadata"];
                 let annotations = &meta["annotations"];
