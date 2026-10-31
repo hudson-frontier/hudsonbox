@@ -455,14 +455,13 @@ fn retained_state_rejects_symlink_fifo_oversize_and_public_modes_promptly() {
                 }
                 1 => {
                     std::fs::remove_file(&file).unwrap();
-                    rustix::fs::mknodat(
-                        rustix::fs::CWD,
-                        &file,
-                        rustix::fs::FileType::Fifo,
-                        rustix::fs::Mode::from_raw_mode(0o600),
-                        0,
-                    )
-                    .unwrap();
+                    assert!(
+                        std::process::Command::new("mkfifo")
+                            .arg(&file)
+                            .status()
+                            .unwrap()
+                            .success()
+                    );
                 }
                 2 => std::fs::write(&file, vec![b'x'; 128 * 1024]).unwrap(),
                 3 => {
