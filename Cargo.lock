@@ -2315,7 +2315,7 @@ name = "sandbox-guest"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "clap",
  "hex",
  "prost",
@@ -2341,8 +2341,8 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "prost",
- "rustix",
  "rcgen",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

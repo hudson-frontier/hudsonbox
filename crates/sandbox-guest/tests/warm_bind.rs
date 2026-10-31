@@ -68,15 +68,15 @@ fn client(m: &Member) -> ClientTls {
 }
 fn request(m: &Member) -> (Fixture, BindRequest) {
     let allocation = Fixture::new();
-    // Certificate server name must match slot, although the TLS fixture has a distinct ID.
+    // The allocation is assigned at claim time, independently of the member slot.
     let leaf = Leaf::new(
         &allocation.ca,
-        guest_wire::guest_name(m.bootstrap.slot),
+        guest_wire::guest_name(allocation.allocation),
         false,
     );
     let bootstrap = Bootstrap {
         version: 1,
-        allocation: m.bootstrap.slot,
+        allocation: allocation.allocation,
         generation: 1,
         valid_until_unix_ms: i64::MAX,
         ca_pem: allocation.ca.pem(),
@@ -89,7 +89,7 @@ fn request(m: &Member) -> (Fixture, BindRequest) {
         member_id: m.bootstrap.member,
         vm_ref: "warm-member".into(),
         template_id: Uuid::now_v7(),
-        allocation_id: m.bootstrap.slot,
+        allocation_id: allocation.allocation,
         project_id: ProjectId::generate(),
         sandbox_id: SandboxId::generate(),
         create_operation_id: OperationId::generate(),
@@ -127,6 +127,7 @@ async fn authenticated_binding_persists_and_exact_retry_survives_restart() {
     let mut m = member();
     let (_, req) = request(&m);
     assert!(m.guest.bound().is_none());
+    assert_ne!(req.allocation.allocation, req.slot);
     call(&m, &client(&m), MemberRequest::Bind(Box::new(req.clone())))
         .await
         .unwrap()
@@ -272,7 +273,7 @@ async fn allocation_identity_works_only_on_its_separate_channel() {
         allocation.host.cert.pem().as_bytes(),
         allocation.host.key.serialize_pem().as_bytes(),
         Sha256::digest(cert).into(),
-        m.bootstrap.slot,
+        req.allocation.allocation,
     )
     .unwrap();
     let tls = m.guest.bound().unwrap().server_tls(now()).unwrap();
@@ -446,7 +447,7 @@ fn alternate_der_encoding_cannot_disguise_a_reused_member_key() {
     req.allocation.guest_key_pem =
         format!("-----BEGIN EC PRIVATE KEY-----\n{encoded}\n-----END EC PRIVATE KEY-----\n");
     let mut params =
-        CertificateParams::new(vec![guest_wire::guest_name(m.bootstrap.slot)]).unwrap();
+        CertificateParams::new(vec![guest_wire::guest_name(req.allocation.allocation)]).unwrap();
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     req.allocation.guest_cert_pem = params.signed_by(&reused, &allocation.ca).unwrap().pem();
@@ -464,7 +465,7 @@ fn fresh_root_prefix_cannot_hide_member_ca_in_allocation_roots() {
     let (allocation, mut req) = request(&m);
     let leaf = Leaf::new(
         &m.fixture.ca,
-        guest_wire::guest_name(m.bootstrap.slot),
+        guest_wire::guest_name(req.allocation.allocation),
         false,
     );
     req.allocation.ca_pem = format!("{}{}", allocation.ca.pem(), m.bootstrap.ca_pem);
@@ -485,7 +486,7 @@ fn pem_reencoding_cannot_disguise_a_reused_member_key() {
     let (allocation, mut req) = request(&m);
     let reused = KeyPair::from_pem(&m.bootstrap.guest_key_pem).unwrap();
     let mut params =
-        CertificateParams::new(vec![guest_wire::guest_name(m.bootstrap.slot)]).unwrap();
+        CertificateParams::new(vec![guest_wire::guest_name(req.allocation.allocation)]).unwrap();
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     req.allocation.guest_cert_pem = params.signed_by(&reused, &allocation.ca).unwrap().pem();
@@ -548,8 +549,13 @@ fn retained_state_rejects_symlink_fifo_oversize_and_public_modes_promptly() {
 fn wrong_allocation_san_and_reencoded_member_identity_are_rejected() {
     let m = member();
     let (allocation, mut req) = request(&m);
-    req.allocation.guest_cert_pem = allocation.guest.cert.pem(); // valid CA and key, wrong allocation SAN
-    req.allocation.guest_key_pem = allocation.guest.key.serialize_pem();
+    let wrong = Leaf::new(
+        &allocation.ca,
+        guest_wire::guest_name(sandbox_protocol::AllocationId::generate()),
+        false,
+    );
+    req.allocation.guest_cert_pem = wrong.cert.pem();
+    req.allocation.guest_key_pem = wrong.key.serialize_pem();
     assert!(req.allocation.server_tls(now()).is_ok());
     assert!(matches!(
         m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),

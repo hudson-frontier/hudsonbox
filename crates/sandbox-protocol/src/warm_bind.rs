@@ -3,7 +3,7 @@
 //! Contract (docs/warm-late-binding.md):
 //!
 //! - A member boots from a version-2 bootstrap device ([`MemberBootstrap`]):
-//!   its member ID, its pre-assigned allocation slot, and a member-only channel
+//!   its member ID, an opaque member slot, and a member-only channel
 //!   identity. It carries no project, sandbox, generation, operation, token or
 //!   customer secret. Version-1 guests refuse the device, so a guest without
 //!   this protocol never runs as a member.
@@ -12,7 +12,8 @@
 //!   host's member client certificate. It runs no runner, file service or
 //!   customer process before binding.
 //! - [`BindRequest`] installs a freshly issued version-1 allocation
-//!   [`Bootstrap`] for exactly the member's slot, at a positive generation, for
+//!   [`Bootstrap`] for exactly the allocation in the authenticated handoff scope,
+//!   at a positive generation, for
 //!   the exact scope digest, in the exact boot. It is accepted once; an exact
 //!   retry is acknowledged again and any other scope is refused.
 //! - After durable binding the ordinary allocation agent starts. The member
@@ -170,7 +171,7 @@ pub struct BindRequest {
     pub scope_sha256: String,
     /// Exact host-authorized handoff; guest checks consistency, not issuer authority.
     pub scope: crate::warm_pool::HandoffIntent,
-    /// Freshly issued version-1 allocation bootstrap for `slot`.
+    /// Freshly issued allocation bootstrap matching `scope.allocation_id`.
     pub allocation: Bootstrap,
 }
 
@@ -538,9 +539,8 @@ fn validate_binding(
             && request.slot == member.slot
             && request.boot_id == boot
             && request.scope.member_id == member.member
-            && request.scope.allocation_id == member.slot
+            && request.scope.allocation_id == a.allocation
             && request.scope.generation == a.generation
-            && a.allocation == member.slot
             && valid_sha256(&request.scope_sha256)
             && request.scope_sha256 == request.scope.digest()?,
         "binding scope mismatch"

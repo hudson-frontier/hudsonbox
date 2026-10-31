@@ -67,7 +67,7 @@ guardian adoption and real KVM qualification remain separate integration gates.
 This does not enable the real host's currently unsupported warm RPCs.
 
 A member device uses the existing bounded `HDSBOOT1` frame with a strict v2 JSON
-body containing only member UUID, preassigned allocation slot, validity and
+body containing only member UUID, opaque member slot (not a future allocation ID), validity and
 member channel credentials. It contains no project identity, customer process,
 customer secret or executable argv. V1 allocation bootstrap remains unchanged;
 old guests reject v2. The guest opens no runner or file service while unbound.
@@ -84,6 +84,11 @@ and 32 connection limit. Requests are Hello or Bind; neither runs customer work.
 Bind names the authenticated boot and installs freshly issued v1 allocation
 credentials. It carries the full existing `HandoffIntent`, its canonical digest,
 and the exact member, slot, allocation and generation. The guest validates the
+opaque member slot separately from the allocation assigned at claim time: the
+allocation bootstrap must match `HandoffIntent.allocation_id`, not the slot UUID.
+The allocation uses one fresh CA, disjoint from all member roots, and its signing
+key's public identity must differ even when the key encoding changes.
+The guest also validates the
 intent and agreement, including project, host, supervisor epoch, claim revision
 and permit serial, and refuses reuse of member credentials. The host must first
 verify the registered database-issued permit and current handoff/guardian
