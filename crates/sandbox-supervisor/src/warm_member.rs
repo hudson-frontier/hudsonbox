@@ -828,7 +828,7 @@ mod tests {
         let i = intent(&r);
         r.begin_bind(&i, host).unwrap();
         r.finish_bind(&"a".repeat(64)).unwrap();
-        let previous = crate::warm_cleanup::PreviousRetireIntent {
+        let previous = sandbox_protocol::warm_pool::PreviousRetireIntent {
             version: VERSION,
             reporting_epoch: r.epoch() + 1,
             original: RetireIntent {
@@ -842,13 +842,13 @@ mod tests {
             },
         };
         assert_eq!(
-            previous.admit(&r, None, host, r.epoch() + 1),
+            crate::warm_cleanup::admit(&previous, &r, None, host, r.epoch() + 1),
             Err(Refusal::Adopted)
         );
         let recovered: MemberRecord =
             serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
         assert_eq!(
-            previous.admit(&recovered, None, host, r.epoch() + 1),
+            crate::warm_cleanup::admit(&previous, &recovered, None, host, r.epoch() + 1),
             Err(Refusal::Adopted)
         );
     }
