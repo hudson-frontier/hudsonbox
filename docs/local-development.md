@@ -127,3 +127,6 @@ git diff --check
 The unit tests use mocked tool/platform/KVM results. They need no daemon, network,
 credentials, sudo or running VM. Passing those tests validates diagnostic behavior,
 not the runtime security gates.
+
+Optional Kubernetes capacity now has a [scoped adapter and qualification boundary](kubernetes-capacity.md).
+The adapter manages worker infrastructure only; real cluster/KVM qualification remains unrun.

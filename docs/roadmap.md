@@ -143,3 +143,6 @@ Differential snapshots, lazy loading, and warm pools are deferred to Phase 5, bu
 - `operations.md`: backup recovery, monitoring, host drains, and incident procedures.
 
 These future guides are intentionally not empty placeholders today. [CONTRIBUTING.md](../CONTRIBUTING.md) defines the PR/release process and documentation checks; [SECURITY.md](../SECURITY.md) provides the private reporting channel; [decisions](decisions/README.md) records significant choices as they are made. The repository is released under Apache-2.0. The Rust toolchain and development dependency/artifact versions are pinned or recorded, and executable tests are linked from the implemented contracts. Production guest image/release pins, frontend framework and provider integration remain open.
+
+Optional Kubernetes capacity now has a [scoped adapter and qualification boundary](kubernetes-capacity.md).
+The adapter manages worker infrastructure only; real cluster/KVM qualification remains unrun.

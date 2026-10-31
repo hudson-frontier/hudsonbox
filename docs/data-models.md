@@ -395,3 +395,6 @@ atomically at the current host epoch and while not retired. These operator-only
 observations survive successful health and restart, confer no lifecycle authority
 and contain no error text or endpoint. [Fleet diagnostics](host-maintenance.md#fleet-telemetry-interpretation)
 describe bounded writes, snapshot gauges and incomplete-observation limits.
+
+Optional Kubernetes capacity now has a [scoped adapter and qualification boundary](kubernetes-capacity.md).
+The adapter manages worker infrastructure only; real cluster/KVM qualification remains unrun.

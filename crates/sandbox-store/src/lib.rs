@@ -20,6 +20,7 @@ pub mod history;
 mod host_capabilities;
 pub mod host_maintenance;
 pub mod host_registry;
+pub mod k8s_capacity;
 pub mod leases;
 pub mod lists;
 pub mod output;
