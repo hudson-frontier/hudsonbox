@@ -336,3 +336,35 @@ fn unused_permit_requires_absence_and_cannot_consume_a_guardian_plan() {
     assert!(m.fence_unstarted().is_err());
     assert_eq!(fs::read_dir(m.directory()).unwrap().count(), 0);
 }
+
+#[test]
+#[ignore = "requires root in the dedicated HUDSON_GUARDIAN_TEST_VM; no KVM needed"]
+fn retained_member_absence_requires_free_lifecycle_lock_and_no_runtime_paths() {
+    let (_temp, _authority, mut m, _) = fixture();
+    let slot = m.start.owner.allocation;
+    let member = uuid::Uuid::now_v7();
+    m.launch_permit = None;
+    m.start.owner = Owner::inert(m.start.owner.host, member, slot, 1);
+    m.member = Some(Member {
+        member,
+        slot,
+        valid_until_unix_ms: wall_ms() + 60_000,
+        bound_from: None,
+    });
+    assert!(m.prove_member_absent().is_err());
+    m.fence_unstarted().unwrap();
+    assert!(m.prove_member_absent().unwrap().cleanup_confirmed);
+    let held = m.lifecycle_lock(false).unwrap();
+    assert!(m.prove_member_absent().is_err());
+    drop(held);
+    let run = m.directory().join("run");
+    fs::create_dir(&run).unwrap();
+    assert!(m.prove_member_absent().is_err());
+    fs::remove_dir(&run).unwrap();
+    symlink("/nonexistent", &run).unwrap();
+    assert!(m.prove_member_absent().is_err());
+    fs::remove_file(&run).unwrap();
+    assert!(m.prove_member_absent().is_ok());
+    fs::remove_file(m.record_path()).unwrap();
+    assert!(m.prove_member_absent().is_err());
+}

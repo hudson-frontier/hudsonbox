@@ -59,6 +59,10 @@ pub(super) struct Journal {
     /// before warm members existed; such journals load unchanged.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub warm: BTreeMap<String, super::warm::Entry>,
+    /// Unnamed retire arrived before prepare. Never let a delayed prepare
+    /// resurrect a member whose absence was already acknowledged.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub warm_refusals: std::collections::BTreeSet<uuid::Uuid>,
     #[serde(skip)]
     pub poisoned: bool,
 }
@@ -137,6 +141,7 @@ pub(super) fn open(config: &Config) -> anyhow::Result<(File, Journal)> {
                 epoch: config.epoch,
                 records: BTreeMap::new(),
                 warm: BTreeMap::new(),
+                warm_refusals: Default::default(),
                 poisoned: false,
             }
         }
@@ -152,7 +157,15 @@ pub(super) fn open(config: &Config) -> anyhow::Result<(File, Journal)> {
         "too many host file records"
     );
     anyhow::ensure!(
-        journal.warm.len() <= super::warm::MAX_MEMBERS,
+        journal
+            .warm
+            .len()
+            .saturating_add(journal.warm_refusals.len())
+            <= super::warm::MAX_MEMBERS
+            && journal
+                .warm_refusals
+                .iter()
+                .all(|id| !id.is_nil() && !journal.warm.contains_key(&id.to_string())),
         "too many retained warm members"
     );
     // Retained members never become adoptable at a new epoch: maintenance

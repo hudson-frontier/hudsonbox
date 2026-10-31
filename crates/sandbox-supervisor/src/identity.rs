@@ -256,4 +256,75 @@ mod tests {
         assert!(identity.client_tls(now + 60_000).is_err());
         assert!(!format!("{identity:?}").contains("PRIVATE KEY"));
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_generated_claim_identity_binds_opaque_slot_and_authenticates_exact_san() {
+        use sandbox_protocol::{
+            HostId, OperationId, ProjectId, SandboxId,
+            warm_bind::{BIND_VERSION, BindRequest, MemberGuest, MemberRequest},
+            warm_pool::{HandoffIntent, VERSION},
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        let member = uuid::Uuid::now_v7();
+        let slot = AllocationId::generate();
+        let claim = AllocationId::generate();
+        assert_ne!(slot, claim);
+        let inert = MemberIdentity::issue(member, slot, now + 60_000, now).unwrap();
+        let allocation = Identity::issue(claim, 1, now).unwrap();
+        assert_ne!(inert.guest.ca_pem, allocation.guest.ca_pem);
+        let scope = HandoffIntent {
+            version: VERSION,
+            member_id: member,
+            vm_ref: "warm-test".into(),
+            template_id: uuid::Uuid::now_v7(),
+            allocation_id: claim,
+            project_id: ProjectId::generate(),
+            sandbox_id: SandboxId::generate(),
+            create_operation_id: OperationId::generate(),
+            generation: 1,
+            permit_serial: 1,
+            host_id: HostId::generate(),
+            supervisor_epoch: 1,
+            claim_revision: 1,
+        };
+        let request = BindRequest {
+            version: BIND_VERSION,
+            request_id: uuid::Uuid::now_v7(),
+            member,
+            slot,
+            boot_id: "boot-claim".into(),
+            scope_sha256: scope.digest().unwrap(),
+            scope,
+            allocation: allocation.guest.clone(),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("member");
+        let guest = MemberGuest::open(inert.guest.clone(), "boot-claim".into(), &path).unwrap();
+        guest
+            .handle(MemberRequest::Bind(Box::new(request.clone())), now)
+            .verify_bound(&request)
+            .unwrap();
+        assert_eq!(guest.bound().unwrap().allocation, claim);
+        assert_eq!(guest.bootstrap().slot, slot);
+        drop(guest);
+        // A lost bind reply and agent restart retain the exact credentials.
+        let guest = MemberGuest::open(inert.guest.clone(), "boot-claim".into(), &path).unwrap();
+        guest
+            .handle(MemberRequest::Bind(Box::new(request.clone())), now)
+            .verify_bound(&request)
+            .unwrap();
+        let server = guest.bound().unwrap().server_tls(now).unwrap();
+        let client = allocation.client_tls(now).unwrap();
+        let (a, b) = tokio::io::duplex(65536);
+        let (a, b) = tokio::join!(server.accept(a), client.connect(b));
+        assert!(a.is_ok() && b.is_ok());
+        // Keep the trusted CA and leaf pin, changing only the requested name:
+        // the claim certificate must not authenticate as the opaque slot.
+        let mut wrong_name = allocation.clone();
+        wrong_name.guest.allocation = slot;
+        let wrong = wrong_name.client_tls(now).unwrap();
+        let (a, b) = tokio::io::duplex(65536);
+        let (a, b) = tokio::join!(server.accept(a), wrong.connect(b));
+        assert!(a.is_err() || b.is_err());
+    }
 }

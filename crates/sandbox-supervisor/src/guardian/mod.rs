@@ -916,6 +916,27 @@ impl Manifest {
         write_json(&self.record_path(), &record)?;
         Ok(record)
     }
+    /// Fresh absence proof for retained unused-member cleanup. A historical
+    /// stopped receipt alone is insufficient if runtime paths have reappeared.
+    pub(crate) fn prove_member_absent(&self) -> Result<Receipt> {
+        ensure!(self.is_inert(), "absence proof requires inert ownership");
+        self.validate()?;
+        let (_authority, _) = self.authorize_cleanup()?;
+        let _lock = self.lifecycle_lock(false)?;
+        let receipt = self.receipt()?;
+        ensure!(
+            receipt.state == State::Stopped && receipt.cleanup_confirmed,
+            "member cleanup not confirmed"
+        );
+        for path in [self.group(), self.directory().join("run"), self.socket()] {
+            match fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                _ => anyhow::bail!("retained member runtime absence not proven"),
+            }
+        }
+        Ok(receipt)
+    }
+
     /// Only a free lifecycle lock permits fencing and cleanup. Never signal a saved arbitrary PID.
     pub fn reconcile(&self, reason: &str) -> Result<Receipt> {
         self.validate()?;

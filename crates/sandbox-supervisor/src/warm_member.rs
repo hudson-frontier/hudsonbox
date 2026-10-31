@@ -821,4 +821,35 @@ mod tests {
         }
         assert_eq!(tampered.validate(host), Err(Refusal::State));
     }
+    #[test]
+    fn previous_cleanup_cannot_destroy_adopted_member_even_with_exact_claim() {
+        let host = HostId::generate();
+        let mut r = ready(host);
+        let i = intent(&r);
+        r.begin_bind(&i, host).unwrap();
+        r.finish_bind(&"a".repeat(64)).unwrap();
+        let previous = crate::warm_cleanup::PreviousRetireIntent {
+            version: VERSION,
+            reporting_epoch: r.epoch() + 1,
+            original: RetireIntent {
+                version: VERSION,
+                member_id: r.member(),
+                vm_ref: Some(r.vm_ref.clone()),
+                host_id: host,
+                supervisor_epoch: r.epoch(),
+                operation_id: Uuid::now_v7(),
+                operation_revision: 1,
+            },
+        };
+        assert_eq!(
+            previous.admit(&r, None, host, r.epoch() + 1),
+            Err(Refusal::Adopted)
+        );
+        let recovered: MemberRecord =
+            serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(
+            previous.admit(&recovered, None, host, r.epoch() + 1),
+            Err(Refusal::Adopted)
+        );
+    }
 }

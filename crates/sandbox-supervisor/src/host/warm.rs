@@ -44,6 +44,8 @@ pub(super) struct Entry {
     pub record: MemberRecord,
     /// Inert guardian manifest keyed by `record.slot`.
     pub manifest: Manifest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_retire: Option<crate::warm_cleanup::PreviousRetireIntent>,
     #[serde(skip)]
     pub gate: Arc<Mutex<()>>,
 }
@@ -123,6 +125,16 @@ pub(super) fn validate_retained(config: &Config, key: &str, entry: &Entry) -> an
             && m.start.disk_mib == r.prepare.disk_mib,
         "retained warm member identity mismatch"
     );
+    if let Some(previous) = &entry.previous_retire {
+        previous
+            .admit(r, None, config.host, previous.reporting_epoch)
+            .map_err(|_| anyhow::anyhow!("invalid retained previous cleanup fence"))?;
+        anyhow::ensure!(
+            previous.reporting_epoch <= config.epoch
+                && matches!(r.state, MemberState::Retiring { .. } | MemberState::Retired),
+            "invalid previous cleanup state"
+        );
+    }
     m.validate()
 }
 
@@ -226,12 +238,19 @@ impl Host {
     /// Reserve a new member durably, or return the existing one unchanged.
     fn reserve_member(&self, intent: &PrepareIntent) -> Result<(Entry, bool), Status> {
         let mut j = self.journal()?;
+        if j.warm_refusals.contains(&intent.member_id) {
+            return Err(Status::failed_precondition(
+                "warm member durably retired before prepare",
+            ));
+        }
         if let Some(entry) = j.warm.get(&intent.member_id.to_string()) {
             entry.record.check_prepare_retry(intent).map_err(refusal)?;
             return Ok((entry.clone(), false));
         }
-        if j.warm.len() >= MAX_MEMBERS {
-            return Err(Status::resource_exhausted("warm member journal full"));
+        if j.warm.len().saturating_add(j.warm_refusals.len()) >= MAX_MEMBERS {
+            return Err(Status::resource_exhausted(
+                "warm member lifetime budget exhausted (256 retained identities); drain and reconcile this host before replacing its identity; never delete journal authority",
+            ));
         }
         let slot = AllocationId::generate();
         let manifest = self.member_manifest(intent, slot)?;
@@ -255,6 +274,7 @@ impl Host {
         let entry = Entry {
             record: MemberRecord::new(intent.clone(), slot),
             manifest,
+            previous_retire: None,
             gate: Arc::default(),
         };
         j.warm.insert(intent.member_id.to_string(), entry.clone());
@@ -565,6 +585,9 @@ impl Host {
             Err(error) => return Err(uncertain(error)),
         };
         if receipt.state == GuardianState::Stopped && receipt.cleanup_confirmed {
+            // Check present runtime absence under a fresh lifecycle lock before
+            // releasing even the host-local reservation.
+            m.prove_member_absent().map_err(uncertain)?;
             entry.record.mark_retired().map_err(refusal)?;
             self.save_member(&entry.record)?;
             return Ok(true);
@@ -576,19 +599,44 @@ impl Host {
         &self,
         request: WarmRetireRequest,
     ) -> Result<WarmObservation, Status> {
+        if let Ok(previous) =
+            warm_pool::decode::<crate::warm_cleanup::PreviousRetireIntent>(&request.intent_json)
+        {
+            return self.warm_previous_retire(previous);
+        }
         let intent: RetireIntent = warm_pool::decode(&request.intent_json)
             .map_err(|_| Status::invalid_argument("invalid retire intent"))?;
-        if intent.version != VERSION {
+        if intent.version != VERSION
+            || intent.member_id.is_nil()
+            || intent.operation_id.is_nil()
+            || intent.operation_revision <= 0
+            || intent
+                .vm_ref
+                .as_deref()
+                .is_some_and(|v| !warm_pool::valid_vm_ref(v))
+        {
             return Err(Status::invalid_argument("invalid retire intent"));
         }
-        // Previous-epoch cleanup uses a distinct envelope (#216) that this
-        // host does not accept yet; retained old members stay reserved.
+        // Ordinary retirement cannot acknowledge a previous incarnation.
         self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
         let Some(entry) = self.member_entry(&intent.member_id)? else {
             if intent.vm_ref.is_some() {
-                return Err(Status::failed_precondition("unknown warm member"));
+                return Err(Status::failed_precondition("unknown named warm member"));
             }
-            // Every member is journaled before launch: none was prepared.
+            let mut j = self.journal()?;
+            if j.warm.contains_key(&intent.member_id.to_string()) {
+                return Err(uncertain("concurrent warm prepare; retry retirement"));
+            }
+            if !j.warm_refusals.contains(&intent.member_id) {
+                if j.warm.len().saturating_add(j.warm_refusals.len()) >= MAX_MEMBERS {
+                    return Err(Status::resource_exhausted(
+                        "warm member lifetime budget exhausted",
+                    ));
+                }
+                j.warm_refusals.insert(intent.member_id);
+                self.save(&mut j)?;
+            }
+            // The durable refusal prevents every late prepare from launching.
             return reply(&WarmReceipt::Cleanup {
                 receipt: CleanupReceipt {
                     version: VERSION,
@@ -620,6 +668,68 @@ impl Host {
             .cleanup_receipt()
             .ok_or_else(|| uncertain("warm member cleanup unconfirmed"))?;
         reply(&WarmReceipt::Cleanup { receipt })
+    }
+
+    fn warm_previous_retire(
+        &self,
+        previous: crate::warm_cleanup::PreviousRetireIntent,
+    ) -> Result<WarmObservation, Status> {
+        previous.validate().map_err(refusal)?;
+        self.this_epoch(previous.original.host_id, previous.reporting_epoch)?;
+        let entry = self
+            .member_entry(&previous.original.member_id)?
+            .ok_or_else(|| Status::failed_precondition("retained warm ownership unavailable"))?;
+        let gate = entry.gate.clone();
+        let _gate = lock(&gate)?;
+        let mut entry = self
+            .member_entry(&previous.original.member_id)?
+            .ok_or_else(|| uncertain("retained warm ownership unavailable"))?;
+        previous
+            .admit(
+                &entry.record,
+                entry.previous_retire.as_ref(),
+                self.inner.config.host,
+                self.inner.config.epoch,
+            )
+            .map_err(refusal)?;
+        entry
+            .record
+            .begin_retire(&previous.original, self.inner.config.host)
+            .map_err(refusal)?;
+        // Save claim and retirement together, before stop/absence proof. This
+        // also fences a stale callback after a lost reply and host restart.
+        entry.previous_retire = Some(previous.clone());
+        {
+            let mut j = self.journal()?;
+            j.warm
+                .insert(entry.record.member().to_string(), entry.clone());
+            self.save(&mut j)?;
+        }
+        if !self.cleanup_member(&mut entry)? {
+            return Err(Status::unavailable("warm member cleanup pending"));
+        }
+        // Recheck guardian evidence even for an already-Retired retry. Missing
+        // or partial metadata is never converted to refund authority.
+        let proof = entry.manifest.prove_member_absent().map_err(uncertain)?;
+        if proof.state != GuardianState::Stopped || !proof.cleanup_confirmed {
+            return Err(uncertain("warm member absence unconfirmed"));
+        }
+        let cleanup = entry
+            .record
+            .cleanup_receipt()
+            .ok_or_else(|| uncertain("warm member cleanup unconfirmed"))?;
+        Ok(WarmObservation {
+            receipt_json: warm_pool::encode(&crate::warm_cleanup::Reply::PreviousCleanup {
+                receipt: crate::warm_cleanup::PreviousCleanupReceipt {
+                    version: VERSION,
+                    request: previous,
+                    cleanup,
+                },
+            })
+            .map_err(|_| Status::internal("warm receipt exceeds bound"))?,
+            simulated: false,
+            observed_unix_ms: now_ms()?,
+        })
     }
 
     /// One bounded maintenance step: clean a retiring member, retire an
@@ -775,6 +885,7 @@ mod tests {
             epoch: 2,
             records: BTreeMap::new(),
             warm: BTreeMap::new(),
+            warm_refusals: Default::default(),
             poisoned: false,
         };
         let value = serde_json::to_value(&journal).unwrap();
@@ -865,6 +976,7 @@ mod tests {
             epoch: 3,
             records: BTreeMap::new(),
             warm: BTreeMap::new(),
+            warm_refusals: Default::default(),
             poisoned: false,
         };
         let mut add = |record: MemberRecord| {
@@ -874,6 +986,7 @@ mod tests {
                 Entry {
                     record,
                     manifest,
+                    previous_retire: None,
                     gate: Arc::default(),
                 },
             );
@@ -891,5 +1004,201 @@ mod tests {
         assert_eq!(cpu, 2);
         assert_eq!(memory, 2 * (512 + MEMORY_OVERHEAD));
         assert_eq!(disk, 2 * (1024 + DISK_OVERHEAD));
+    }
+    fn source_fixture(temp: &Path) -> (Host, Entry) {
+        let host = HostId::generate();
+        let record = MemberRecord::new(prepare(host), AllocationId::generate());
+        let mut manifest = inert(host, record.member(), record.slot);
+        manifest.config.state_root = temp.join("a");
+        manifest.config.cgroup_parent = temp.join("cgroups");
+        let entry = Entry {
+            record,
+            manifest,
+            previous_retire: None,
+            gate: Arc::default(),
+        };
+        let config = Config {
+            capabilities: None,
+            launch_permits_required: false,
+            host,
+            epoch: 4,
+            state_root: temp.into(),
+            cgroup_parent: temp.join("cgroups"),
+            guardian_binary: temp.join("unused"),
+            firecracker: artifact(),
+            jailer: artifact(),
+            images: BTreeMap::new(),
+            jail_uid: 65534,
+            jail_gid: 65534,
+            capacity: Capacity {
+                vcpu: 1024,
+                memory_mib: 1_000_000,
+                disk_mib: 1_000_000,
+            },
+        };
+        let journal = Journal {
+            launch_authority: None,
+            version: 1,
+            host,
+            epoch: 4,
+            records: BTreeMap::new(),
+            warm: BTreeMap::from([(entry.record.member().to_string(), entry.clone())]),
+            warm_refusals: Default::default(),
+            poisoned: false,
+        };
+        let host = Host {
+            inner: Arc::new(Inner {
+                authority: None,
+                config,
+                journal: Mutex::new(journal),
+                _lock: fs::File::create(temp.join("test.lock")).unwrap(),
+                workers: Arc::new(tokio::sync::Semaphore::new(1)),
+                artifacts: None,
+                archive_workers: tokio::sync::Semaphore::new(1),
+                output_readers: tokio::sync::Semaphore::new(1),
+                file_readers: crate::file_downloads::Workers::default(),
+                downloads: Mutex::new(crate::file_downloads::Registry::default()),
+                cursor: AtomicUsize::new(0),
+            }),
+        };
+        (host, entry)
+    }
+
+    fn previous(entry: &Entry) -> crate::warm_cleanup::PreviousRetireIntent {
+        crate::warm_cleanup::PreviousRetireIntent {
+            version: VERSION,
+            reporting_epoch: 4,
+            original: RetireIntent {
+                version: VERSION,
+                member_id: entry.record.member(),
+                vm_ref: Some(entry.record.vm_ref.clone()),
+                host_id: entry.record.prepare.host_id,
+                supervisor_epoch: 3,
+                operation_id: uuid::Uuid::now_v7(),
+                operation_revision: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn previous_cleanup_persists_claim_but_never_refunds_missing_guardian_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, entry) = source_fixture(temp.path());
+        let request = previous(&entry);
+        // No guardian/manifest exists. Failure must retain capacity and claim.
+        assert!(host.warm_previous_retire(request.clone()).is_err());
+        let bytes = fs::read(temp.path().join("host.json")).unwrap();
+        let recovered: Journal = serde_json::from_slice(&bytes).unwrap();
+        let saved = &recovered.warm[&entry.record.member().to_string()];
+        assert_eq!(saved.previous_retire.as_ref(), Some(&request));
+        assert!(matches!(saved.record.state, MemberState::Retiring { .. }));
+        assert!(saved.record.holds_capacity());
+        assert!(saved.record.cleanup_receipt().is_none());
+        let mut stale = request.clone();
+        stale.original.operation_revision = 1;
+        assert!(host.warm_previous_retire(stale).is_err());
+        assert_eq!(fs::read(temp.path().join("host.json")).unwrap(), bytes);
+        let mut unknown = request;
+        unknown.original.member_id = uuid::Uuid::now_v7();
+        assert!(host.warm_previous_retire(unknown).is_err());
+        assert_eq!(host.journal().unwrap().warm.len(), 1);
+    }
+
+    #[test]
+    fn failed_cleanup_intent_write_poison_fences_and_keeps_original_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, entry) = source_fixture(temp.path());
+        host.save(&mut host.journal().unwrap()).unwrap();
+        let original = fs::read(temp.path().join("host.json")).unwrap();
+        fs::rename(
+            temp.path().join("host.json"),
+            temp.path().join("before.json"),
+        )
+        .unwrap();
+        fs::create_dir(temp.path().join("host.json")).unwrap();
+        assert!(host.warm_previous_retire(previous(&entry)).is_err());
+        assert!(host.inner.journal.lock().unwrap().poisoned);
+        assert!(host.member_entry(&entry.record.member()).is_err());
+        let recovered: Journal = serde_json::from_slice(&original).unwrap();
+        let before = &recovered.warm[&entry.record.member().to_string()];
+        assert!(before.previous_retire.is_none());
+        assert!(before.record.holds_capacity());
+        assert_eq!(fs::read(temp.path().join("before.json")).unwrap(), original);
+    }
+
+    #[test]
+    fn retired_lifetime_budget_keeps_tombstones_and_refuses_new_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, mut entry) = source_fixture(temp.path());
+        entry.record.retire_locally("test");
+        entry.record.mark_retired().unwrap();
+        {
+            let mut j = host.journal().unwrap();
+            j.warm.clear();
+            for _ in 0..MAX_MEMBERS {
+                let mut e = entry.clone();
+                e.record.prepare.member_id = uuid::Uuid::now_v7();
+                j.warm.insert(e.record.member().to_string(), e);
+            }
+        }
+        let error = host
+            .reserve_member(&prepare(host.inner.config.host))
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(host.journal().unwrap().warm.len(), MAX_MEMBERS);
+        assert_eq!(Host::warm_held(&host.journal().unwrap()), (0, 0, 0));
+        let i = RetireIntent {
+            version: VERSION,
+            member_id: uuid::Uuid::now_v7(),
+            vm_ref: None,
+            host_id: host.inner.config.host,
+            supervisor_epoch: 4,
+            operation_id: uuid::Uuid::now_v7(),
+            operation_revision: 1,
+        };
+        assert!(
+            host.warm_retire_sync(WarmRetireRequest {
+                intent_json: warm_pool::encode(&i).unwrap()
+            })
+            .is_err()
+        );
+    }
+    #[test]
+    fn unnamed_retire_before_prepare_persists_bounded_no_resurrection_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (host, _) = source_fixture(temp.path());
+        let mut prepare = prepare(host.inner.config.host);
+        prepare.supervisor_epoch = 4;
+        let retire = RetireIntent {
+            version: VERSION,
+            member_id: prepare.member_id,
+            vm_ref: None,
+            host_id: prepare.host_id,
+            supervisor_epoch: 4,
+            operation_id: uuid::Uuid::now_v7(),
+            operation_revision: 1,
+        };
+        let reply = host
+            .warm_retire_sync(WarmRetireRequest {
+                intent_json: warm_pool::encode(&retire).unwrap(),
+            })
+            .unwrap();
+        let WarmReceipt::Cleanup { receipt } = warm_pool::decode(&reply.receipt_json).unwrap()
+        else {
+            panic!("cleanup expected")
+        };
+        assert!(receipt.destroyed && receipt.vm_ref.is_none());
+        let bytes = fs::read(temp.path().join("host.json")).unwrap();
+        let recovered: Journal = serde_json::from_slice(&bytes).unwrap();
+        assert!(recovered.warm_refusals.contains(&prepare.member_id));
+        // Denial occurs before image staging or guardian launch, including on
+        // restart when only the persisted journal survives.
+        assert_eq!(
+            host.reserve_member(&prepare).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        *host.inner.journal.lock().unwrap() = recovered;
+        assert!(host.reserve_member(&prepare).is_err());
+        assert_eq!(fs::read(temp.path().join("host.json")).unwrap(), bytes);
     }
 }
