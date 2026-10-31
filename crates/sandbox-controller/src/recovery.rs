@@ -65,9 +65,12 @@ impl Controller {
                 .await
                 .map(Some);
         };
-        let response = match route
-            .client
-            .reconcile_previous_allocation(request.clone())
+        let response = match self
+            .rpc(
+                route.host,
+                route.epoch,
+                route.client.reconcile_previous_allocation(request.clone()),
+            )
             .await
         {
             Ok(r) if r.get_ref().request.as_ref() == Some(&request) => r.into_inner(),

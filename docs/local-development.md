@@ -66,6 +66,12 @@ Follow [authenticated API setup](api-server.md) to provision and run the service
 The [source installer](source-installation.md) builds committed native tools into
 a new private prefix; installation is separate from instance setup and runtime qualification.
 
+Multi-host behavior is exercised locally with two fake supervisors:
+`cargo test -p sandbox-controller --test fleet_qualification` (with PostgreSQL
+running). This portable result is not two-host Linux/KVM evidence; the
+operator procedure in the [fleet qualification record](evidence/2026-10-30-fleet-qualification.md#operator-two-host-linuxkvm-qualification-not-run)
+has not been run.
+
 Use the [Linux guide](linux-development.md) for the nested-aarch64 development
 host and pinned VM artifacts. The supervisor runs on Linux; the guest agent runs
 inside each microVM. Build image artifacts for each supported architecture;

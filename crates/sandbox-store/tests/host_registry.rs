@@ -678,3 +678,176 @@ async fn stale_and_never_seen_hosts_are_not_fresh(pool: PgPool) {
             .is_none()
     );
 }
+
+/// Diagnostics use one read-only snapshot and omit transport/provider identities.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_snapshot_tracks_freshness_without_leaking_registration(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let first = registered(&store, None, 61).await;
+    let second = registered(&store, None, 62).await;
+    observe(&store, first, 1).await;
+    store.finish_host_drain(first, 1).await.unwrap();
+    let before: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(hosts) FROM hosts ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let snapshot = store.fleet_status().await.unwrap();
+    let hosts = snapshot["hosts"].as_array().unwrap();
+    let a = hosts
+        .iter()
+        .find(|h| h["host_id"] == first.uuid().to_string())
+        .unwrap();
+    let b = hosts
+        .iter()
+        .find(|h| h["host_id"] == second.uuid().to_string())
+        .unwrap();
+    assert_eq!(a["ready"], true);
+    assert_eq!(b["ready"], false);
+    assert_eq!(b["status"], "draining");
+    assert_eq!(a["available"]["vcpu"], 4);
+    for h in hosts {
+        for field in [
+            "endpoint",
+            "transport_server_name",
+            "transport_certificate_sha256",
+            "provider_ref",
+            "capabilities",
+        ] {
+            assert!(h.get(field).is_none(), "unexpected private field {field}");
+        }
+    }
+    let after: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(hosts) FROM hosts ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "diagnostics must not refresh or mutate hosts"
+    );
+    sqlx::query(
+        "UPDATE hosts SET last_seen_at=clock_timestamp()-interval '31 seconds' WHERE id=$1",
+    )
+    .bind(first.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale = store.fleet_status().await.unwrap();
+    let a = stale["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["host_id"] == first.uuid().to_string())
+        .unwrap();
+    assert_eq!(a["fresh"], false);
+    assert_eq!(a["ready"], false);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_rpc_counts_are_epoch_fenced_and_history_does_not_exhaust_active_bound(pool: PgPool) {
+    use sandbox_protocol::rpc_telemetry::RpcFailure;
+    let store = Store::from_pool(pool.clone());
+    let a = registered(&store, None, 71).await;
+    let b = registered(&store, None, 72).await;
+    observe(&store, a, 1).await;
+    let before = row(&pool, a).await;
+    store
+        .record_host_rpc_failure(a, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap();
+    store
+        .record_host_rpc_failure(a, 1, RpcFailure::DeadlineExceeded)
+        .await
+        .unwrap();
+    store
+        .record_host_rpc_failure(a, 2, RpcFailure::Unknown)
+        .await
+        .unwrap();
+    let after = row(&pool, a).await;
+    assert_eq!(after["last_seen_at"], before["last_seen_at"]);
+    assert_eq!(after["status"], before["status"]);
+    assert_eq!(
+        after["rpc_failures"],
+        json!({"unavailable":1,"deadline_exceeded":1,"unknown":0})
+    );
+    assert_eq!(row(&pool, b).await["rpc_failures"]["unavailable"], 0);
+    store.advance_host_epoch(a, 1).await.unwrap();
+    store
+        .record_host_rpc_failure(a, 1, RpcFailure::Unknown)
+        .await
+        .unwrap();
+    assert_eq!(row(&pool, a).await["rpc_failures"]["unknown"], 0);
+    sqlx::query("UPDATE hosts SET capacity_retired_at=clock_timestamp() WHERE id=$1")
+        .bind(a.uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    store
+        .record_host_rpc_failure(a, 2, RpcFailure::Unknown)
+        .await
+        .unwrap();
+    assert_eq!(row(&pool, a).await["rpc_failures"]["unknown"], 0);
+    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch,capacity_retired_at)
+        SELECT gen_random_uuid(),'draining',4,8192,65536,1,clock_timestamp() FROM generate_series(1,10001)")
+        .execute(&pool).await.unwrap();
+    let snapshot = store.fleet_status().await.unwrap();
+    assert_eq!(snapshot["hosts"].as_array().unwrap().len(), 1);
+    assert_eq!(snapshot["hosts"][0]["host_id"], b.uuid().to_string());
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_rpc_observation_lock_wait_is_cancelled_on_server(pool: PgPool) {
+    use sandbox_protocol::rpc_telemetry::RpcFailure;
+    let store = Store::from_pool(pool.clone());
+    let a = registered(&store, None, 81).await;
+    let b = registered(&store, None, 82).await;
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM hosts WHERE id=$1 FOR UPDATE")
+        .bind(a.uuid())
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let failure = store
+        .record_host_rpc_failure(a, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap_err();
+    match failure {
+        sqlx::Error::Database(database) => {
+            assert_eq!(database.code().as_deref(), Some("57014"));
+        }
+        // Pool acquisition, scheduling and the transaction setup share the
+        // caller's 100ms bound. Under load that bound may win the race.
+        sqlx::Error::PoolTimedOut => {}
+        other => panic!("expected a bounded telemetry timeout, got {other}"),
+    }
+    // Keep A locked while proving that cancellation left no blocked telemetry
+    // statement on the server, regardless of which deadline the caller saw.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
+                 AND wait_event_type='Lock' AND query LIKE 'UPDATE hosts SET rpc_failures=%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if blocked == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("telemetry update remained blocked after its server deadline");
+    store
+        .record_host_rpc_failure(b, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap();
+    lock.rollback().await.unwrap();
+    assert_eq!(row(&pool, a).await["rpc_failures"]["unavailable"], 0);
+    assert_eq!(row(&pool, b).await["rpc_failures"]["unavailable"], 1);
+    store
+        .record_host_rpc_failure(a, 1, RpcFailure::Unavailable)
+        .await
+        .unwrap();
+    assert_eq!(row(&pool, a).await["rpc_failures"]["unavailable"], 1);
+}

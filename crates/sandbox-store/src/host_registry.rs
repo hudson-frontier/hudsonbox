@@ -19,8 +19,11 @@ use crate::{
 pub const LEGACY_POOL_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0001);
 /// Same freshness window `finish-drain` requires.
 pub const HEARTBEAT_FRESHNESS_SECONDS: i64 = 30;
-/// Bound on one registry read; larger fleets need paging first.
+/// Bound on one active-worker read; larger fleets need paging first. Retired
+/// tombstones never count against it (see [`Store::registered_host_history`]).
 pub const MAX_REGISTRY_HOSTS: i64 = 10_000;
+/// Bound on one page of retained registry history, including tombstones.
+pub const MAX_HISTORY_PAGE: i64 = 1_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -232,6 +235,7 @@ pub struct HostPool {
     pub placement_policy: PlacementPolicy,
     pub provider_config: ProviderConfig,
     pub credential_secret_ref: Option<String>,
+    /// Active workers; retained retired identities do not spend pool slots.
     pub enrolled_hosts: i64,
 }
 
@@ -336,6 +340,7 @@ pub struct RegisteredHost {
     pub host_pool_id: Uuid,
     pub pool_type: PoolType,
     pub status: String,
+    pub capacity_retired: bool,
     pub supervisor_epoch: i64,
     /// `None` for a legacy host still addressed by single-host controller config.
     pub transport: Option<TransportIdentity>,
@@ -383,7 +388,10 @@ impl RegisteredHost {
     /// owner identity and epoch regardless of this flag.
     #[must_use]
     pub fn admits_new_work(&self) -> bool {
-        self.status == "ready" && self.heartbeat_fresh && self.transport.is_some()
+        self.status == "ready"
+            && !self.capacity_retired
+            && self.heartbeat_fresh
+            && self.transport.is_some()
     }
 }
 
@@ -415,7 +423,7 @@ fn pool_from_row(row: &sqlx::postgres::PgRow) -> Result<HostPool, RegistryError>
 }
 
 const POOL_SELECT: &str = "SELECT p.id,p.name,p.type,p.min_ready_hosts,p.max_hosts,p.placement_policy,
-    p.provider_config,p.credential_secret_ref,(SELECT count(*) FROM hosts h WHERE h.host_pool_id=p.id) enrolled_hosts
+    p.provider_config,p.credential_secret_ref,(SELECT count(*) FROM hosts h WHERE h.host_pool_id=p.id AND h.capacity_retired_at IS NULL) enrolled_hosts
     FROM host_pools p";
 
 fn host_from_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredHost, RegistryError> {
@@ -441,6 +449,7 @@ fn host_from_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredHost, Registry
         host_pool_id: row.try_get("host_pool_id")?,
         pool_type: PoolType::parse(row.try_get("type")?)?,
         status: row.try_get("status")?,
+        capacity_retired: row.try_get("capacity_retired")?,
         supervisor_epoch: row.try_get("supervisor_epoch")?,
         transport,
         provider_ref: row.try_get("provider_ref")?,
@@ -458,7 +467,7 @@ fn host_from_row(row: &sqlx::postgres::PgRow) -> Result<RegisteredHost, Registry
     })
 }
 
-const HOST_SELECT: &str = "SELECT h.id,h.host_pool_id,p.type,h.status,h.supervisor_epoch,h.endpoint,
+const HOST_SELECT: &str = "SELECT h.id,h.host_pool_id,p.type,h.status,(h.capacity_retired_at IS NOT NULL) capacity_retired,h.supervisor_epoch,h.endpoint,
     h.transport_server_name,h.transport_certificate_sha256,h.provider_ref,h.cpu_capacity,h.memory_capacity_mib,h.disk_capacity_mib,h.compatibility,h.runtime_capabilities,
     h.runtime_capabilities_epoch,h.last_seen_at,
     (extract(epoch FROM clock_timestamp()-h.last_seen_at)*1000)::bigint AS heartbeat_age_ms,
@@ -467,8 +476,8 @@ const HOST_SELECT: &str = "SELECT h.id,h.host_pool_id,p.type,h.status,h.supervis
 
 impl Store {
     /// Create or update a pool under operator authority. A type change is
-    /// refused while any host is enrolled: hosts carry every reservation and
-    /// unfinished operation, and are never deleted or moved between pools.
+    /// refused while any active worker or unfinished capacity intent remains.
+    /// Retired identities retain their history without spending worker slots.
     pub async fn put_host_pool(&self, spec: &HostPoolSpec) -> Result<HostPool, RegistryError> {
         let config = spec.validate()?.to_value()?;
         let policy =
@@ -488,7 +497,9 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         let current = pool_from_row(&row)?;
-        if current.pool_type != spec.pool_type && current.enrolled_hosts != 0 {
+        let unfinished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running'))")
+            .bind(spec.id).fetch_one(&mut *tx).await?;
+        if current.pool_type != spec.pool_type && (current.enrolled_hosts != 0 || unfinished) {
             return Err(RegistryError::InUse);
         }
         if i64::from(max) < current.enrolled_hosts {
@@ -653,13 +664,15 @@ impl Store {
         row.as_ref().map(host_from_row).transpose()
     }
 
-    /// Every registered host, optionally in one pool, ordered by identity.
+    /// Every active (non-retired) host, optionally in one pool, ordered by
+    /// identity. Runtime health refresh, discovery and planning use this; it is
+    /// bounded by active inventory, so retained tombstones cannot exhaust it.
     pub async fn registered_hosts(
         &self,
         pool: Option<Uuid>,
     ) -> Result<Vec<RegisteredHost>, RegistryError> {
         let rows = sqlx::query(&format!(
-            "{HOST_SELECT} WHERE ($2::uuid IS NULL OR h.host_pool_id=$2) ORDER BY h.id LIMIT $3"
+            "{HOST_SELECT} WHERE ($2::uuid IS NULL OR h.host_pool_id=$2) AND h.capacity_retired_at IS NULL ORDER BY h.id LIMIT $3"
         ))
         .bind(HEARTBEAT_FRESHNESS_SECONDS as f64)
         .bind(pool)
@@ -669,6 +682,29 @@ impl Store {
         if rows.len() as i64 > MAX_REGISTRY_HOSTS {
             return Err(RegistryError::Invalid);
         }
+        rows.iter().map(host_from_row).collect()
+    }
+
+    /// One page of registry history including retired tombstones, ordered by
+    /// identity after the exclusive `after` cursor. Operator listing only.
+    pub async fn registered_host_history(
+        &self,
+        pool: Option<Uuid>,
+        after: Option<HostId>,
+        limit: i64,
+    ) -> Result<Vec<RegisteredHost>, RegistryError> {
+        if !(1..=MAX_HISTORY_PAGE).contains(&limit) {
+            return Err(RegistryError::Invalid);
+        }
+        let rows = sqlx::query(&format!(
+            "{HOST_SELECT} WHERE ($2::uuid IS NULL OR h.host_pool_id=$2) AND ($3::uuid IS NULL OR h.id>$3) ORDER BY h.id LIMIT $4"
+        ))
+        .bind(HEARTBEAT_FRESHNESS_SECONDS as f64)
+        .bind(pool)
+        .bind(after.map(|h| h.uuid()))
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
         rows.iter().map(host_from_row).collect()
     }
 }

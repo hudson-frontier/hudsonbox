@@ -3,6 +3,7 @@
 //! supervisor is trusted only after its certificate, host ID, and epoch match.
 mod allocation_authority;
 pub mod archive;
+pub mod capacity;
 pub mod history;
 pub mod host_discovery;
 mod hosts;
@@ -234,19 +235,24 @@ impl Controller {
         }
         let response = match action {
             DestroyAction::Stop(owner) => {
-                route
-                    .client
-                    .stop(StopRequest {
+                self.rpc(
+                    route.host,
+                    route.epoch,
+                    route.client.stop(StopRequest {
                         ownership: Some(owner),
-                    })
-                    .await
+                    }),
+                )
+                .await
             }
             DestroyAction::Inspect(owner) => {
-                match route
-                    .client
-                    .inspect(InspectRequest {
-                        ownership: Some(owner.clone()),
-                    })
+                match self
+                    .rpc(
+                        route.host,
+                        route.epoch,
+                        route.client.inspect(InspectRequest {
+                            ownership: Some(owner.clone()),
+                        }),
+                    )
                     .await
                 {
                     Ok(response)
@@ -270,12 +276,14 @@ impl Controller {
                         if !route.owns(&owner) {
                             return self.destroy_unknown(claim).await;
                         }
-                        route
-                            .client
-                            .stop(StopRequest {
+                        self.rpc(
+                            route.host,
+                            route.epoch,
+                            route.client.stop(StopRequest {
                                 ownership: Some(owner),
-                            })
-                            .await
+                            }),
+                        )
+                        .await
                     }
                     other => other,
                 }
@@ -354,14 +362,19 @@ impl Controller {
         };
         let response = match action {
             LeaseAction::Cleanup(_) => return Ok(Tick::Maintained),
-            LeaseAction::Renew(request) => route.client.renew_lease(request).await,
-            LeaseAction::Inspect(owner) => {
-                route
-                    .client
-                    .inspect_lease(LeaseInspection {
-                        ownership: Some(owner),
-                    })
+            LeaseAction::Renew(request) => {
+                self.rpc(route.host, route.epoch, route.client.renew_lease(request))
                     .await
+            }
+            LeaseAction::Inspect(owner) => {
+                self.rpc(
+                    route.host,
+                    route.epoch,
+                    route.client.inspect_lease(LeaseInspection {
+                        ownership: Some(owner),
+                    }),
+                )
+                .await
             }
         };
         let observation = match response {
@@ -518,18 +531,21 @@ impl Controller {
                     return self.unknown(claim).await;
                 }
                 request.launch_permit_json = launch_permit;
-                route.client.create(request).await
+                self.rpc(route.host, route.epoch, route.client.create(request))
+                    .await
             }
             CreateAction::Inspect(owner) => {
                 if !route.owns(&owner) {
                     return self.unknown(claim).await;
                 }
-                route
-                    .client
-                    .inspect(InspectRequest {
+                self.rpc(
+                    route.host,
+                    route.epoch,
+                    route.client.inspect(InspectRequest {
                         ownership: Some(owner),
-                    })
-                    .await
+                    }),
+                )
+                .await
             }
         };
         let observation = match response {
@@ -597,31 +613,37 @@ impl Controller {
         };
         let response = match action {
             ExecuteAction::Dispatch { owner, command } => {
-                route
-                    .client
-                    .execute_command(CommandRequest {
+                self.rpc(
+                    route.host,
+                    route.epoch,
+                    route.client.execute_command(CommandRequest {
                         ownership: Some(owner),
                         command: Some((&command).into()),
-                    })
-                    .await
+                    }),
+                )
+                .await
             }
             ExecuteAction::Inspect { owner, digest } => {
-                route
-                    .client
-                    .inspect_command(CommandInspection {
+                self.rpc(
+                    route.host,
+                    route.epoch,
+                    route.client.inspect_command(CommandInspection {
                         ownership: Some(owner),
                         command_digest: digest.to_vec(),
-                    })
-                    .await
+                    }),
+                )
+                .await
             }
             ExecuteAction::Cancel { owner, digest } => {
-                route
-                    .client
-                    .cancel_command(CommandInspection {
+                self.rpc(
+                    route.host,
+                    route.epoch,
+                    route.client.cancel_command(CommandInspection {
                         ownership: Some(owner),
                         command_digest: digest.to_vec(),
-                    })
-                    .await
+                    }),
+                )
+                .await
             }
             ExecuteAction::Rejected => return Ok(Tick::Rejected),
         };

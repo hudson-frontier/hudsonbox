@@ -116,11 +116,17 @@ impl Retirer {
             };
             let observed = tokio::time::timeout(
                 Duration::from_secs(30),
-                route
-                    .client
-                    .retire_allocation_metadata(AllocationMetadataRequest {
-                        request_json: request.encode().map_err(|_| RetirementError::Encoding)?,
-                    }),
+                self.hosts.rpc(
+                    host,
+                    epoch,
+                    route
+                        .client
+                        .retire_allocation_metadata(AllocationMetadataRequest {
+                            request_json: request
+                                .encode()
+                                .map_err(|_| RetirementError::Encoding)?,
+                        }),
+                ),
             )
             .await
             .map_err(|_| {
@@ -167,9 +173,13 @@ impl Retirer {
         };
         let observed = tokio::time::timeout(
             Duration::from_secs(30),
-            route.client.forget_allocation(AllocationForgetRequest {
-                request_json: request.encode().map_err(|_| RetirementError::Encoding)?,
-            }),
+            self.hosts.rpc(
+                host,
+                epoch,
+                route.client.forget_allocation(AllocationForgetRequest {
+                    request_json: request.encode().map_err(|_| RetirementError::Encoding)?,
+                }),
+            ),
         )
         .await
         .map_err(|_| {

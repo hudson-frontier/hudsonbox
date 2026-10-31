@@ -847,3 +847,28 @@ async fn partitioned_dispatched_owner_is_unknown_then_returning_host_is_inspecte
         vec![(fleet.hosts[0].uuid(), 1, 1), (fleet.hosts[1].uuid(), 1, 1)]
     );
 }
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn retired_history_beyond_registry_bound_keeps_active_health_refresh(pool: PgPool) {
+    let fleet = Fleet::new(&pool).await;
+    let mut controller = fleet.controller(0).await;
+    // More retained tombstones than one registry read may hold.
+    sqlx::query("INSERT INTO hosts(id,status,cpu_capacity,memory_capacity_mib,disk_capacity_mib,supervisor_epoch,host_pool_id,capacity_retired_at) SELECT gen_random_uuid(),'draining',4,8192,65536,1,(SELECT host_pool_id FROM hosts WHERE id=$1),clock_timestamp() FROM generate_series(1,$2)")
+        .bind(fleet.hosts[0].uuid())
+        .bind(sandbox_store::host_registry::MAX_REGISTRY_HOSTS + 5)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE hosts SET last_seen_at=NULL WHERE capacity_retired_at IS NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _ = controller.tick().await;
+    let fresh: Vec<(bool,)> = sqlx::query_as(
+        "SELECT last_seen_at IS NOT NULL FROM hosts WHERE capacity_retired_at IS NULL ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fresh, vec![(true,), (true,)]);
+}

@@ -273,3 +273,43 @@ async fn reads_require_a_credential() {
 
     f.cleanup().await;
 }
+
+#[tokio::test]
+async fn project_reads_do_not_expose_operator_fleet_fields() {
+    let Some(f) = fixture(1).await else { return };
+    let (sandbox_id, operation_id) = f.create(0, "fleet-redaction-read").await;
+    for path in [
+        format!("/v1/sandboxes/{sandbox_id}"),
+        format!("/v1/operations/{operation_id}"),
+    ] {
+        let (status, body) = f.get(0, &path).await;
+        assert_eq!(status, StatusCode::OK);
+        fn check(value: &Value) {
+            match value {
+                Value::Object(fields) => {
+                    for (key, value) in fields {
+                        assert!(
+                            ![
+                                "host_id",
+                                "host_pool_id",
+                                "supervisor_epoch",
+                                "endpoint",
+                                "transport_server_name",
+                                "transport_certificate_sha256",
+                                "provider_ref",
+                                "credential_secret_ref"
+                            ]
+                            .contains(&key.as_str()),
+                            "private field {key}"
+                        );
+                        check(value);
+                    }
+                }
+                Value::Array(values) => values.iter().for_each(check),
+                _ => {}
+            }
+        }
+        check(&body);
+    }
+    f.cleanup().await;
+}

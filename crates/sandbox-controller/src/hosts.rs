@@ -137,6 +137,26 @@ impl Drop for Checking<'_> {
 }
 
 impl Controller {
+    /// Observe an attempted RPC without changing its result or ownership policy.
+    pub(crate) async fn rpc<T>(
+        &self,
+        host: HostId,
+        epoch: i64,
+        call: impl std::future::Future<Output = Result<T, tonic::Status>>,
+    ) -> Result<T, tonic::Status> {
+        let result = call.await;
+        if let Some(failure) = sandbox_protocol::rpc_telemetry::RpcFailure::from_result(&result)
+            && self
+                .store
+                .record_host_rpc_failure(host, epoch, failure)
+                .await
+                .is_err()
+        {
+            eprintln!("host RPC telemetry persistence failed");
+        }
+        result
+    }
+
     fn address_of(&self, registered: &RegisteredHost) -> Option<HostAddress> {
         match &registered.transport {
             Some(t) => HostAddress::registered(
@@ -328,8 +348,15 @@ impl Controller {
         lease: Lease,
     ) -> Result<(bool, bool), ControllerError> {
         let mut client = client(&lease);
-        let health = client
-            .health(HealthRequest {})
+        let health = self
+            .rpc(address.host, address.epoch, async {
+                tokio::time::timeout(
+                    HEALTH_DEADLINE - Duration::from_millis(250),
+                    client.health(HealthRequest {}),
+                )
+                .await
+                .unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded("health deadline")))
+            })
             .await
             .map_err(|_| ControllerError::Health)?
             .into_inner();

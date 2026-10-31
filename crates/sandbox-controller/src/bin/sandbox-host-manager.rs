@@ -23,6 +23,48 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Operator-only fleet snapshot; no public administration route.
+    FleetStatus {
+        #[arg(long)]
+        prometheus: bool,
+    },
+    /// Retain a durable static capacity intent from a private Request JSON file.
+    CapacityEnqueue {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+        #[arg(long)]
+        idempotency_key: String,
+        #[arg(long)]
+        request_config: PathBuf,
+    },
+    /// Claim and apply at most one durable intent. Retry after uncertainty.
+    CapacityTick {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+    },
+    /// Cancel a stale, unclaimed static intent that has no receipt.
+    CapacityCancel {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+        #[arg(long)]
+        operation_id: uuid::Uuid,
+    },
+    /// Read a durable intent, status, lease and receipt by ID.
+    CapacityStatus {
+        #[arg(long)]
+        operation_id: uuid::Uuid,
+    },
+    /// Advisory worker demand bounded by pool inventory and operator limits.
+    CapacityPlan {
+        #[arg(long)]
+        pool_id: uuid::Uuid,
+        #[arg(long)]
+        waiting_sandboxes: u32,
+        #[arg(long)]
+        sandboxes_per_host: u32,
+        #[arg(long)]
+        max_additional_hosts: u32,
+    },
     /// Provision a new draining host or inspect an exact retry; never refresh or reopen it.
     Provision {
         /// Private owned JSON containing version, total capacity and approved capabilities.
@@ -59,10 +101,15 @@ enum Action {
         #[arg(long)]
         project_id: ProjectId,
     },
-    /// Print the registry read model, optionally for one pool.
+    /// Print one page of registry history (retired tombstones included),
+    /// optionally for one pool. Continue with `--after <next_after>`.
     Registry {
         #[arg(long)]
         pool_id: Option<uuid::Uuid>,
+        #[arg(long)]
+        after: Option<HostId>,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
     },
     /// Compare operator-configured standalone addresses with one pool's registry.
     Discover {
@@ -131,16 +178,81 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
     let pool_action = matches!(
         args.action,
-        Action::PutPool { .. }
+        Action::FleetStatus { .. }
+            | Action::PutPool { .. }
             | Action::GrantPoolAccess { .. }
             | Action::Registry { .. }
             | Action::Discover { .. }
+            | Action::CapacityEnqueue { .. }
+            | Action::CapacityTick { .. }
+            | Action::CapacityCancel { .. }
+            | Action::CapacityStatus { .. }
+            | Action::CapacityPlan { .. }
     );
     anyhow::ensure!(
         !pool_action || (args.host_id.is_none() && args.host_epoch.is_none()),
         "pool action takes no host"
     );
     let value = match args.action {
+        Action::FleetStatus { prometheus } => {
+            let status = store.fleet_status().await?;
+            if prometheus {
+                print!("{}", sandbox_store::fleet::prometheus(&status));
+                return Ok(());
+            }
+            status
+        }
+        Action::CapacityEnqueue {
+            pool_id,
+            idempotency_key,
+            request_config,
+        } => {
+            let request = serde_json::from_slice(&private_bytes(&request_config)?)?;
+            serde_json::json!({"operation_id": store.enqueue_capacity(pool_id, &idempotency_key, &request).await?})
+        }
+        Action::CapacityTick { pool_id } => {
+            let router = sandbox_controller::capacity::ProviderRouter::default().with(
+                std::sync::Arc::new(sandbox_controller::capacity::StandaloneStaticProvider),
+            );
+            match store.claim_capacity(pool_id, 30).await? {
+                Some(claim) => router.apply(&store, &claim).await?,
+                None => serde_json::json!({"idle":true}),
+            }
+        }
+        Action::CapacityCancel {
+            pool_id,
+            operation_id,
+        } => {
+            store.cancel_capacity(pool_id, operation_id).await?;
+            serde_json::json!({"operation_id": operation_id, "status": "cancelled"})
+        }
+        Action::CapacityStatus { operation_id } => store
+            .capacity_operation(operation_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capacity operation missing"))?,
+        Action::CapacityPlan {
+            pool_id,
+            waiting_sandboxes,
+            sandboxes_per_host,
+            max_additional_hosts,
+        } => {
+            let pool = store
+                .host_pool(pool_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("pool missing"))?;
+            serde_json::to_value(
+                sandbox_controller::capacity::plan(
+                    &store,
+                    &pool,
+                    sandbox_controller::capacity::Demand {
+                        waiting_sandboxes,
+                        sandboxes_per_host,
+                        max_additional_hosts,
+                    },
+                )
+                .await?,
+            )?
+        }
         Action::PutPool { pool_config } => serde_json::to_value(
             store
                 .put_host_pool(&HostPoolSpec::from_json(&private_bytes(&pool_config)?)?)
@@ -154,8 +266,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "project_id": project_id,
             "host_pool_id": pool_id,
         }),
-        Action::Registry { pool_id } => {
-            serde_json::to_value(store.registered_hosts(pool_id).await?)?
+        Action::Registry {
+            pool_id,
+            after,
+            limit,
+        } => {
+            let hosts = store.registered_host_history(pool_id, after, limit).await?;
+            let next = (hosts.len() as i64 == limit)
+                .then(|| hosts.last().map(|h| h.host_id))
+                .flatten();
+            serde_json::json!({"hosts": hosts, "next_after": next})
         }
         Action::Discover {
             pool_id,

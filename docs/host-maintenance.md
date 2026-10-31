@@ -144,8 +144,14 @@ cargo run -p sandbox-controller --bin sandbox-host-manager -- \
 cargo run -p sandbox-controller --bin sandbox-host-manager -- \
   --database-config /private/database.json grant-pool-access --pool-id POOL_UUID --project-id PROJECT_ID
 cargo run -p sandbox-controller --bin sandbox-host-manager -- \
-  --database-config /private/database.json registry [--pool-id POOL_UUID]
+  --database-config /private/database.json registry [--pool-id POOL_UUID] \
+  [--after HOST_ID] [--limit 500]
 ```
+
+`registry` prints one page (1–1000 hosts, ordered by identity) of retained
+history including retired tombstones, plus `next_after` for the following page.
+Runtime health refresh, discovery and capacity planning enumerate only active
+(non-retired) hosts, bounded at 10000; tombstones never exhaust that bound.
 
 Names are unique DNS labels. `max_hosts` is at least `min_ready_hosts`, at most
 100000, never below the enrolled host count, and bounds provisioning into the
@@ -318,3 +324,185 @@ requirements, duplicate requests, stale and overflowing epochs, unhealthy
 recovery, fresh-observation gating, exact retries and retained old-epoch
 allocation/operation records. They exercise database authority with no physical
 host restart.
+
+## Standalone durable capacity operations
+
+The standalone adapter (#196) enrolls **existing operator-supplied** machines;
+it does not purchase, boot, stop or terminate infrastructure. The application
+capacity router dispatches exactly `host_pools.type` (`standalone` or `k8s`);
+an unconfigured Kubernetes adapter fails closed. Sandbox operations, project
+access, placement reservations and supervisor gRPC/mTLS remain unchanged.
+
+Migration 0027 adds `capacity_operations`: pool, optional warm-pool seam (NULL
+only until warm pools ship), kind, target, idempotency key, retained request,
+status, claim revision, database-clock lease, provider receipt and fixed error.
+Pool-scoped exact retries preserve the ID and receipt; changed input conflicts.
+Only one live claim can apply an intent. Expired/replaced claims cannot commit
+host effects or receipts. Static effects and completion commit in one database
+transaction; future external providers must reconcile external receipts and
+fencing before replaying uncertain calls. The router rejects stale claims
+before selecting the adapter. Unfinished intent blocks pool type changes;
+future adapters must also freeze effect-defining configuration/credential
+references and enforce provider-side idempotency or fencing at dispatch.
+A lease check before a network call cannot prevent expiry during that call.
+The trait alone does not supply that protocol. Pending operations prevent pool type changes even with zero hosts.
+
+Use the existing private database configuration and `0600` input-file rules:
+
+```sh
+sandbox-host-manager --database-config /private/database.json capacity-enqueue \
+  --pool-id POOL_UUID --idempotency-key UNIQUE_RETAINED_KEY \
+  --request-config /private/capacity-request.json
+sandbox-host-manager --database-config /private/database.json capacity-tick --pool-id POOL_UUID
+sandbox-host-manager --database-config /private/database.json capacity-status --operation-id OPERATION_UUID
+sandbox-host-manager --database-config /private/database.json capacity-cancel \
+  --pool-id POOL_UUID --operation-id OPERATION_UUID
+sandbox-host-manager --database-config /private/database.json capacity-plan \
+  --pool-id POOL_UUID --waiting-sandboxes 4 --sandboxes-per-host 2 --max-additional-hosts 1
+```
+
+The request is `{"host":"hst_...","epoch":1,"action":{"kind":"status"}}`.
+Kinds are `status`, `drain`, `retire`, or `provision`; provision additionally
+carries `config` with the existing `HostProvision` document and an explicit
+matching `host_pool_id`. Provision reuses ordinary bounded enrollment and starts
+draining with no observation. Set transport identity, authenticate health and
+explicitly finish drain through the existing manager commands. Drain blocks new
+placement and retains running work. Status receipts describe their completion
+snapshot; use registry/status again for current health.
+
+Retire requires draining, zero unreleased allocations and fresh authenticated
+health. Occupied, unhealthy, stale and uncertain hosts fail closed. Recovery must
+first complete the existing verified allocation cleanup/fencing path; a lease
+expiry, provider disappearance or operator assertion never releases capacity.
+Retire records a permanent tombstone while preserving the host, transport,
+histories and foreign keys. It cannot reopen through finish-drain, enrollment
+retry or epoch advancement. It does not authorize physical machine termination.
+Retired tombstones do not count against `max_hosts`, demand inventory or pool
+type-change worker counts. Active-only endpoint/certificate/provider-reference
+uniqueness permits replacement enrollment while retaining historical identity.
+Pool type changes still require no active workers or unfinished capacity work.
+
+Each tick claims at most one intent, with a 30-second lease and no background
+retry loop. On refusal or a lost response, inspect `capacity-status`, resolve the
+host condition and rerun after the lease expires. Claims accept 1–300 seconds;
+the store exposes fenced explicit retry. Claims are ordered by each intent's
+`available_at` turn, which every claim moves to its lease end and every explicit
+retry moves to now: a repeatedly failing older intent rejoins behind intent that
+was already waiting (for example a later drain its retire depends on) instead
+of starving it. Each intent is claimed at most 8 times; an exhausted intent
+stays unfinished, blocking pool type changes, until cancelled.
+
+`capacity-cancel` marks a stale intent `cancelled` only in a `standalone` pool,
+only while it is unclaimed (queued or lease expired) and has no receipt. Static
+effects commit atomically with their receipt, so such an intent is proven
+unapplied; cancellation takes the pool lock first, serializing with apply.
+Live claims, completed receipts and intents of non-static pools, whose external
+effects may be uncertain, are refused and retained. Cancelled intents keep their
+idempotency key (an exact retry returns the same ID) and no longer block pool
+type changes. Outstanding intents are bounded to
+1000 per pool; completed idempotency records are retained, never automatically
+deleted. Active inventory reads retain the registry's 10000-host bound. Demand is an
+explicit advisory input (at most 100000 waiting sandboxes, 1–100000 sandboxes per
+host, at most 1000 additional hosts); the plan caps additions by `max_hosts`,
+active inventory, minimum ready workers and the operator's request budget.
+It cannot infer compatibility, actual packing or resource guarantees from a
+sandbox count and makes no automatic provision or scale-down decision.
+
+Portable PostgreSQL tests are in
+[`sandbox-store/tests/capacity.rs`](../crates/sandbox-store/tests/capacity.rs)
+and [`sandbox-controller/tests/capacity.rs`](../crates/sandbox-controller/tests/capacity.rs).
+They cover upgrade preservation, claims/retries, occupied/uncertain retirement,
+retire-then-replace at `max_hosts`, bounded intent queues, adapter routing and
+advisory demand. The [portable evidence](evidence/2026-10-30-standalone-capacity.md) records
+focused executable validation of the capacity adapter. A light
+psql check of the full migration chain, pre-0027 host preservation and lease/
+receipt constraints passed in an isolated temporary database on the existing
+local PostgreSQL service. No real Linux/KVM drain, retirement, performance or
+isolation evidence is claimed here.
+
+## Fleet diagnostics and incident runbooks
+
+The offline operator command `sandbox-host-manager --database-config <private-file> fleet-status`
+reads one bounded database snapshot. `fleet-status --prometheus` prints fixed-vocabulary
+Prometheus gauges for an operator-managed collector; it starts no listener. Database
+access is the operator authorization boundary. Do not forward this output through a
+project route. Host IDs/epochs remain operator-only; endpoints, certificate identities,
+provider references, credential references, payloads and terminal output are omitted.
+Project operation reads retain project authorization and fixed placement rejection codes.
+
+Reservations include every unreleased allocation, including unknown and previous-epoch
+owners, plus the same VMM memory and artifact disk overhead used by placement. The
+live snapshot enumerates active identities only, bounded by the active registry limit;
+retired inventory history is separate and cannot exhaust this diagnostic bound. Available means accounting
+headroom, not permission to place: readiness, freshness, policy and compatibility still
+apply. Queue age uses database admission time. Renewal lag measures time since the last
+allocation update while a renewal is pending, not supervisor watchdog lateness. Confirmed
+fenced counts require retained `fenced_absent` release evidence; unavailable, stale,
+draining, or a new epoch alone never establishes physical fencing.
+
+- **Drain:** use the existing epoch-bound `drain`, then inspect active reservations,
+  unknown allocations and pending cleanup. Finish existing work or reconcile explicit
+  termination evidence. Never refund reservations because the queue is slow. `finish-drain`
+  reopens only after the existing empty/fresh checks; it does not retire a host.
+- **Host loss:** inspect freshness, epoch and previous-epoch/unknown allocations. Restore
+  authenticated connectivity and reconcile the owner; retain capacity while unreachable.
+  Independent fencing or verified supervisor release evidence must precede replacement.
+  A diagnostic unavailable state must never be interpreted as confirmed fenced.
+- **Capacity exhaustion:** compare reserved and available resources including overhead,
+  active versus retired inventory, queue age and the fixed rejection counts. Check project
+  quota and pool grants before adding operator-managed capacity. No fallback outside an
+  allowed pool, automatic paid provisioning or forced reservation deletion is authorized.
+- **Certificate rotation:** drain first; use epoch-bound `set-transport` with private
+  configuration and the approved CA/server identity. Changing transport invalidates
+  freshness. Confirm authenticated health at the expected epoch before reopening. Failed
+  authentication means unavailable, not stopped or fenced. Keep old reservations until
+  reconciliation; certificate replacement is not allocation termination evidence.
+
+Portable SQL/fake-host tests and Linux/KVM qualification are separate evidence. These
+read models establish neither physical isolation nor cross-host recovery qualification.
+
+### Fleet telemetry interpretation
+
+Placement queue gauges count queued **create** operations and lease-free running
+creates in `awaiting_placement`, only with zero dispatch attempts, empty attempt
+receipts and no allocation. Dispatched running/unknown work, commands, uploads
+and cleanup operations do not represent demand for a new host. Rejection gauges
+count retained failed create records for the fixed placement reason vocabulary,
+including pool-access denial. They are database snapshots, not monotonic counters:
+retention may reduce them. Unknown error text never becomes a metric label.
+
+Host state gauges form an exclusive partition: ready, draining, then unavailable.
+The retained `retired` gauge is zero in the active snapshot. A stale draining host
+remains in the draining bucket; inspect its JSON freshness separately. Capacity
+totals exclude retired inventory tombstones.
+Reserved totals retain every unreleased charge, including runtime overhead and
+uncertain owners; available capacity is accounting headroom and does not promise
+that a host is eligible for placement. Readiness still requires compatible image,
+project pool authorization and request-specific capacity checks at placement.
+
+Validation added for telemetry cardinality, exclusive states, tombstone capacity,
+read-only two-host freshness transitions and project-read field redaction remains
+pending Rust/PostgreSQL execution until the shared heavy build slot is granted.
+Per-host `rpc_failures` and `rpc_last_failure_at` are operator-only observations.
+Controller health, lifecycle, authority, upload, output/history/metadata retirement
+calls and registry-backed API file/live reads record returned gRPC `unavailable`,
+`deadline_exceeded` and `unknown` statuses. These are transport-status failures;
+they do not establish physical host loss. Application rejections, pool admission
+Backoff/Busy, incompatible health metadata, database failures and missing freshness
+do not count. The explicit health network deadline records `deadline_exceeded`;
+cancellation by an enclosing worker deadline can leave an unobserved attempt.
+
+One fixed-size JSON record lives on each existing host row. Writes are atomic,
+epoch-checked, skip retired hosts, saturate at the bigint limit and have a 100 ms
+best-effort deadline. Recording failure emits a generic warning and preserves the
+original RPC result. Counts survive process restart and successful health; late
+old-epoch replies cannot mutate the new incarnation. They never change readiness,
+leases, reservations or release evidence. No error message, endpoint, project or
+request identifier is recorded. Legacy readers without a registry store cannot
+persist observations.
+
+`hudsonbox_fleet_rpc_failures{reason="..."}` sums the three fixed categories over
+active hosts; no host/project label is exported. It is a snapshot gauge, not a
+monotonic counter: retired identities leave the snapshot. Private operator JSON
+provides per-host attribution without creating unbounded metrics series. Transport
+status observations, fresh health and confirmed fencing remain separate evidence.

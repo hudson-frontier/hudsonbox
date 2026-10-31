@@ -117,7 +117,20 @@ impl OwnerRoutes {
     }
 
     /// Transport-level failures back the host off; application statuses do not.
-    pub fn observe<T>(&self, route: &OwnerRoute, result: &Result<T, tonic::Status>) {
+    pub async fn observe<T>(&self, route: &OwnerRoute, result: &Result<T, tonic::Status>) {
+        if let Some(failure) = sandbox_protocol::rpc_telemetry::RpcFailure::from_result(result)
+            && let Some(store) = &self.store
+            && store
+                .record_host_rpc_failure(
+                    route.lease.address.host,
+                    route.lease.address.epoch,
+                    failure,
+                )
+                .await
+                .is_err()
+        {
+            tracing::warn!("host RPC telemetry persistence failed");
+        }
         match result {
             Err(status)
                 if matches!(

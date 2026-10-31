@@ -37,8 +37,8 @@ impl Controller {
             reporting_epoch: epoch,
             permits_json: Vec::new(),
         };
-        let observed = client
-            .allocation_authority(request.clone())
+        let observed = self
+            .rpc(host, epoch, client.allocation_authority(request.clone()))
             .await
             .map_err(|_| ControllerError::Health)?
             .into_inner();
@@ -62,8 +62,8 @@ impl Controller {
         register.permits_json =
             serde_json::to_vec(&batch.permits).map_err(|_| ControllerError::HostIdentity)?;
         // A lost reply ends this attempt. The next tick inspects progress first.
-        let ack = client
-            .allocation_authority(register)
+        let ack = self
+            .rpc(host, epoch, client.allocation_authority(register))
             .await
             .map_err(|_| ControllerError::Health)?
             .into_inner();
