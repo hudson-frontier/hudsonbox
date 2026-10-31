@@ -2329,6 +2329,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-vsock",
+ "uuid",
 ]
 
 [[package]]

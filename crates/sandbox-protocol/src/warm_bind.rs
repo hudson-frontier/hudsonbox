@@ -34,6 +34,7 @@ use std::{
     sync::Mutex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use uuid::Uuid;
 
 /// Bootstrap body version of an unbound warm member.
@@ -360,7 +361,7 @@ impl MemberGuest {
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 ensure!(
-                    fs::read(&incarnation)? == marker,
+                    read_retained(&incarnation)? == marker,
                     "member incarnation changed"
                 );
             }
@@ -370,8 +371,18 @@ impl MemberGuest {
             !directory.join("binding.pending").try_exists()?,
             "uncertain member binding"
         );
-        let bound = if directory.join("binding.json").try_exists()? {
-            let bytes = fs::read(directory.join("binding.json"))?;
+        let attempted = directory.join("binding.attempted").try_exists()?;
+        let committed = directory.join("binding.json").try_exists()?;
+        ensure!(
+            attempted == committed,
+            "missing retained binding or attempt marker"
+        );
+        let bound = if committed {
+            ensure!(
+                read_retained(&directory.join("binding.attempted"))? == b"attempted-v1",
+                "invalid attempt marker"
+            );
+            let bytes = read_retained(&directory.join("binding.json"))?;
             ensure!(bytes.len() <= MAX_FRAME, "oversized retained binding");
             let request: BindRequest = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("invalid retained binding"))?;
@@ -530,18 +541,46 @@ fn validate_binding(
     );
     // New member and allocation channels must have distinct credentials.
     ensure!(
-        a.ca_pem != member.ca_pem
-            && a.guest_cert_pem != member.guest_cert_pem
-            && a.guest_key_pem != member.guest_key_pem
+        first_cert(&a.ca_pem)? != first_cert(&member.ca_pem)?
+            && first_cert(&a.guest_cert_pem)? != first_cert(&member.guest_cert_pem)?
+            && PrivateKeyDer::from_pem_slice(a.guest_key_pem.as_bytes())?.secret_der()
+                != PrivateKeyDer::from_pem_slice(member.guest_key_pem.as_bytes())?.secret_der()
             && a.host_pin != member.host_pin,
         "allocation identity reused member credentials"
     );
     a.server_tls(now_ms)?;
     Ok(())
 }
+fn first_cert(pem: &str) -> Result<CertificateDer<'static>> {
+    CertificateDer::pem_slice_iter(pem.as_bytes())
+        .next()
+        .context("missing certificate")?
+        .context("invalid certificate")
+}
+fn read_retained(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o777 == 0o600,
+        "unsafe retained member state"
+    );
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take((MAX_FRAME + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= MAX_FRAME, "oversized retained member state");
+    Ok(bytes)
+}
 fn persist_binding(directory: &Path, request: &BindRequest) -> Result<()> {
     let bytes = serde_json::to_vec(request)?;
     ensure!(bytes.len() <= MAX_FRAME, "binding too large");
+    let mut attempted = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("binding.attempted"))?;
+    attempted.write_all(b"attempted-v1")?;
+    attempted.sync_all()?;
+    File::open(directory)?.sync_all()?;
     let pending = directory.join("binding.pending");
     let mut file = OpenOptions::new()
         .write(true)

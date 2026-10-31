@@ -248,3 +248,178 @@ fn v2_is_strict_and_cold_v1_remains_readable() {
     bad[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
     assert!(read_device(bad.as_slice()).is_err());
 }
+
+#[tokio::test]
+async fn allocation_identity_works_only_on_its_separate_channel() {
+    use sha2::{Digest, Sha256};
+    use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+    let m = member();
+    let (allocation, req) = request(&m);
+    m.guest
+        .handle(MemberRequest::Bind(req.clone()), now())
+        .verify_bound(&req)
+        .unwrap();
+    let cert = CertificateDer::pem_slice_iter(req.allocation.guest_cert_pem.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap();
+    let host = ClientTls::new(
+        req.allocation.ca_pem.as_bytes(),
+        allocation.host.cert.pem().as_bytes(),
+        allocation.host.key.serialize_pem().as_bytes(),
+        Sha256::digest(cert).into(),
+        m.bootstrap.slot,
+    )
+    .unwrap();
+    let tls = m.guest.bound().unwrap().server_tls(now()).unwrap();
+    let (a, b) = tokio::io::duplex(1 << 17);
+    let (server, client) = tokio::join!(tls.accept(a), host.connect(b));
+    assert!(server.is_ok());
+    assert!(client.is_ok());
+    // Member credential/ALPN cannot access the installed allocation service.
+    let old = client_for_member(&m, &m.fixture.host);
+    let (a, b) = tokio::io::duplex(1 << 17);
+    let (server, client) = tokio::join!(tls.accept(a), old.connect(b));
+    assert!(server.is_err() || client.is_err());
+}
+fn client_for_member(m: &Member, host: &Leaf) -> ClientTls {
+    use sha2::{Digest, Sha256};
+    use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+    let cert = CertificateDer::pem_slice_iter(m.bootstrap.guest_cert_pem.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap();
+    ClientTls::member(
+        m.bootstrap.ca_pem.as_bytes(),
+        host.cert.pem().as_bytes(),
+        host.key.serialize_pem().as_bytes(),
+        Sha256::digest(cert).into(),
+        m.bootstrap.member,
+    )
+    .unwrap()
+}
+#[tokio::test]
+async fn same_ca_unpinned_host_and_wrong_alpn_are_rejected() {
+    let m = member();
+    let (_, req) = request(&m);
+    let unpinned = Leaf::new(&m.fixture.ca, "other-host.internal".into(), true);
+    assert!(
+        call(
+            &m,
+            &client_for_member(&m, &unpinned),
+            MemberRequest::Bind(req)
+        )
+        .await
+        .is_err()
+    );
+    // Same certificates, CA, peer pins and SNI: only the ALPN differs.
+    let wrong_protocol = sandbox_protocol::guest_wire::ServerTls::new(
+        m.bootstrap.ca_pem.as_bytes(),
+        m.bootstrap.guest_cert_pem.as_bytes(),
+        m.bootstrap.guest_key_pem.as_bytes(),
+        m.bootstrap.host_pin,
+    )
+    .unwrap();
+    let host = client(&m);
+    let (a, b) = tokio::io::duplex(1 << 17);
+    let (server, client) = tokio::join!(wrong_protocol.accept(a), host.connect(b));
+    assert!(server.is_err() || client.is_err());
+    assert!(m.guest.bound().is_none());
+}
+#[test]
+fn concurrent_conflicting_binds_install_one_identity() {
+    let m = member();
+    let (_, first) = request(&m);
+    let (_, second) = request(&m);
+    let answers = std::thread::scope(|scope| {
+        let a = scope.spawn(|| m.guest.handle(MemberRequest::Bind(first.clone()), now()));
+        let b = scope.spawn(|| m.guest.handle(MemberRequest::Bind(second.clone()), now()));
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(
+        answers
+            .iter()
+            .filter(|r| matches!(r, MemberResponse::Bound { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        answers
+            .iter()
+            .filter(|r| matches!(r, MemberResponse::Rejected { .. }))
+            .count(),
+        1
+    );
+    let installed = m.guest.bound().unwrap();
+    assert!(installed == first.allocation || installed == second.allocation);
+}
+#[test]
+fn missing_or_corrupt_committed_binding_is_never_unused() {
+    for corrupt in [true, false] {
+        let m = member();
+        let (_, req) = request(&m);
+        m.guest
+            .handle(MemberRequest::Bind(req.clone()), now())
+            .verify_bound(&req)
+            .unwrap();
+        let path = m.directory.path().join("state");
+        drop(m.guest);
+        if corrupt {
+            std::fs::write(path.join("binding.json"), b"corrupt").unwrap();
+        } else {
+            std::fs::remove_file(path.join("binding.json")).unwrap();
+        }
+        assert!(MemberGuest::open(m.bootstrap.clone(), BOOT.into(), &path).is_err());
+    }
+}
+#[tokio::test]
+async fn authenticated_oversize_and_unknown_actions_do_not_bind() {
+    use tokio::io::AsyncWriteExt;
+    for payload in [
+        None,
+        Some(br#"{"kind":"execute","version":1,"argv":["touch","/tmp/work"]}"#.as_slice()),
+    ] {
+        let m = member();
+        let server = m.bootstrap.server_tls(now()).unwrap();
+        let host = client(&m);
+        let (a, b) = tokio::io::duplex(1 << 17);
+        let (served, sent) =
+            tokio::join!(serve_member_connection(&m.guest, &server, a, now), async {
+                let mut stream = host.connect(b).await?;
+                match payload {
+                    None => stream.write_u32(u32::MAX).await?,
+                    Some(bytes) => {
+                        stream.write_u32(bytes.len() as u32).await?;
+                        stream.write_all(bytes).await?;
+                    }
+                }
+                stream.flush().await?;
+                Ok::<_, anyhow::Error>(())
+            });
+        sent.unwrap();
+        assert!(served.is_err());
+        assert!(m.guest.bound().is_none());
+    }
+}
+
+#[test]
+fn pem_reencoding_cannot_disguise_a_reused_member_key() {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, KeyUsagePurpose};
+    let m = member();
+    let (allocation, mut req) = request(&m);
+    let reused = KeyPair::from_pem(&m.bootstrap.guest_key_pem).unwrap();
+    let mut params =
+        CertificateParams::new(vec![guest_wire::guest_name(m.bootstrap.slot)]).unwrap();
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    req.allocation.guest_cert_pem = params.signed_by(&reused, &allocation.ca).unwrap().pem();
+    req.allocation.guest_key_pem = m.bootstrap.guest_key_pem.replace('\n', "\r\n");
+    // This is a valid server key/certificate pair. Only decoded key reuse differs
+    // from a legitimate fresh allocation identity.
+    assert!(req.allocation.server_tls(now()).is_ok());
+    assert!(matches!(
+        m.guest.handle(MemberRequest::Bind(req), now()),
+        MemberResponse::Rejected { .. }
+    ));
+    assert!(m.guest.bound().is_none());
+}
