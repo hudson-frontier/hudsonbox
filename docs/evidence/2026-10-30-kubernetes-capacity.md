@@ -78,3 +78,52 @@ retained deletion request, not stopped processes or safe recovery. Real hardware
 and cluster evidence remain required. Full portable workspace/hosted checks are
 separate from these focused results. No merge, deployment, paid infrastructure,
 release or monitoring was performed.
+
+## Startup and warm-pool safety followup
+
+Tested executable source: `2af96b735384ea75e234147c6517dc7d1af1f173`.
+This preserves #214 startup fix `bade74466f28206619af3c164cd30d6bc653a23e`,
+#209 `9d4624a1bbeb3749e56b7441e31518da69537ce6`, and #215
+`5e77f1224daee55fe5247a51c6fd5685521d1b4d` as ancestors. #214 is now stacked
+on #215; migration 0029 remains Kubernetes-only and 0030 remains warm-pool-only.
+No dependency source branch was rewritten.
+
+Kubernetes retirement now checks the shared host report's
+`unretired_warm_members` before irreversible admission closure or any Kubernetes
+API effect. The new regression isolates warm reservations from customer
+allocations/operations, covers an expired preparing lease without a receipt
+(unknown prepare outcome), ready and retiring members without cleanup evidence,
+checks that no API call or retirement marker occurs, then proves that recorded
+cleanup permits the same retirement claim to proceed. Existing shared warm-pool
+checks also cover stale epochs, drain and cleanup fencing.
+
+Followup validation used Rust 1.92.0, locked dependencies, two build jobs,
+`/tmp/hudsonbox-196-target`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_TEST_DEBUG=0`, and `CARGO_INCREMENTAL=0`. A first invocation using
+line-tables-only debug settings missed the cache profile and was interrupted
+before test execution; the completed runs below used the settings just listed.
+SQLx used fresh isolated test databases on existing PostgreSQL port 55432, without
+shared reset, new secrets or a new service stack. Free disk stayed approximately
+21-23 GiB during the followup.
+
+| Check | Result |
+| --- | --- |
+| `cargo test --locked -p sandbox-controller --test k8s_capacity --test capacity --test warm_pool` | 12 passed (9 Kubernetes including projected-Secret/S3 reader and warm retirement, 2 capacity, 1 warm seam) |
+| `cargo test --locked -p sandbox-store --test capacity --test host_maintenance --test warm_pools -- --test-threads=1` | 23 passed (11 capacity/upgrade, 1 maintenance, 11 warm pools) |
+
+Total distinct followup tests: **35 passed**. Earlier 40-test evidence above is
+historical; registry/provisioning suites were not rerun in this followup.
+The artifact mount regression exercises the actual S3 private-config reader on
+macOS with symlink projection and a regular inode modeling the subPath mount.
+Real Kubernetes bind mounting, Linux-only typed supervisor configuration, cgroup
+preparation/enforcement and real KVM were **NOT RUN**. The node preparation guide
+explicitly requires delegated cgroup v2 controllers before the KVM node label.
+No merge, deployment, paid infrastructure or PR watch was performed.
+
+Strict Clippy passed on the same executable source:
+`cargo clippy --locked -p sandbox-controller -p sandbox-store --lib --bin sandbox-host-manager --test k8s_capacity --test capacity --test warm_pool --test warm_pools --test host_maintenance -- -D warnings`.
+`cargo fmt --all -- --check`, `python3 scripts/check_docs.py`, and
+`git diff --check` passed. The final followup commit changes documentation only;
+no executable source changed after the tested SHA above. The sole heavy build
+slot is released, with approximately 21 GiB free disk and no build left running.
+Full workspace and final-head hosted checks are separate, unclaimed results.

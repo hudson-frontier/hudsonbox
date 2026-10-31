@@ -139,7 +139,9 @@ implement warm pools or a continuous automatic demand loop.
 Drain persists placement closure without stopping or refunding any allocation.
 Cleanup continues through the allocation's original owner. Retirement requires
 completed provisioning, a draining worker, zero unreleased allocations/unfinished
-operations, the expected epoch and fresh authenticated health. Occupied, unknown,
+operations, zero unretired warm members (including preparing, ready, claiming
+and retiring members with uncertain cleanup), the expected epoch and fresh
+authenticated health. Occupied, unknown,
 stale or missing owners refuse voluntary deletion. Before DELETE, retirement
 irreversibly closes admission in PostgreSQL. A lost reply leaves an unfinished
 intent and occupied inventory slot; retry observes the same UID/deletionTimestamp.
