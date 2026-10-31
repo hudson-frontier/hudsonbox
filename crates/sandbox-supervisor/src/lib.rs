@@ -11,6 +11,8 @@ pub mod guest;
 pub mod guardian;
 pub mod lease;
 
+pub mod warm_member;
+
 pub mod identity;
 
 #[cfg(target_os = "linux")]
