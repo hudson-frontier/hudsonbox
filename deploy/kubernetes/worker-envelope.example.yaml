@@ -1,0 +1,77 @@
+# Structural review example ONLY. The adapter generates the complete frozen Pod
+# (including private host.json environment value) from WorkerConfig. Do not apply
+# this sample or wrap workers in a Deployment/StatefulSet that recreates identities.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hb-01996110-7c00-7000-8000-000000000001
+  namespace: hudsonbox-workers
+  labels:
+    hudsonbox.io/worker: "true"
+    hudsonbox.io/pool: 01996110-7c00-7000-8000-000000000002
+  annotations:
+    hudsonbox.io/host: host_01996110-7c00-7000-8000-000000000001
+    hudsonbox.io/epoch: "1"
+  finalizers: [hudsonbox.io/capacity-tombstone]
+spec:
+  hostname: hb-01996110-7c00-7000-8000-000000000001
+  subdomain: hudsonbox-workers
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 120
+  nodeSelector:
+    hudsonbox.io/kvm: "true"
+    kubernetes.io/os: linux
+    kubernetes.io/arch: amd64
+  tolerations:
+    - key: hudsonbox.io/kvm
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchLabels:
+              hudsonbox.io/worker: "true"
+          namespaceSelector: {}
+          topologyKey: kubernetes.io/hostname
+  containers:
+    - name: supervisor
+      # Replace through a reviewed WorkerConfig, not a mutable image tag.
+      image: registry.invalid/worker@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      command: [/usr/local/bin/sandbox-host]
+      args: [--config, /var/lib/hudsonbox/host.json]
+      securityContext:
+        privileged: true
+        runAsUser: 0
+        readOnlyRootFilesystem: true
+      resources:
+        requests:
+          cpu: "5"
+          memory: 8448Mi
+          ephemeral-storage: 66048Mi
+        limits:
+          cpu: "5"
+          memory: 8448Mi
+          ephemeral-storage: 66048Mi
+      ports:
+        - name: grpc
+          containerPort: 7443
+      volumeMounts:
+        - {name: identity, mountPath: /identity, readOnly: true}
+        - {name: state, mountPath: /var/lib/hudsonbox}
+        - {name: tmp, mountPath: /tmp}
+        - {name: kvm, mountPath: /dev/kvm}
+        - {name: cgroup, mountPath: /sys/fs/cgroup}
+  volumes:
+    - name: identity
+      secret: {secretName: reviewed-worker-identity-v1, defaultMode: 256}
+    - name: state
+      emptyDir: {sizeLimit: 65536Mi}
+    - name: tmp
+      emptyDir: {sizeLimit: 512Mi}
+    - name: kvm
+      hostPath: {path: /dev/kvm, type: CharDevice}
+    - name: cgroup
+      hostPath: {path: /sys/fs/cgroup, type: Directory}

@@ -1,0 +1,99 @@
+# Review-only skeleton. No worker image, credentials, node provisioning or deployment.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hudsonbox-workers
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: capacity-adapter
+  namespace: hudsonbox-workers
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: capacity-adapter
+  namespace: hudsonbox-workers
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, create, delete]
+# No patch/update/finalizer removal, exec, secrets, nodes, deployments or CRDs.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: capacity-adapter
+  namespace: hudsonbox-workers
+subjects:
+  - kind: ServiceAccount
+    name: capacity-adapter
+    namespace: hudsonbox-workers
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: capacity-adapter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hudsonbox-workers
+  namespace: hudsonbox-workers
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    hudsonbox.io/worker: "true"
+  ports:
+    - name: grpc
+      port: 7443
+      targetPort: grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hudsonbox-workers
+  namespace: hudsonbox-workers
+spec:
+  minAvailable: 100%
+  selector:
+    matchLabels:
+      hudsonbox.io/worker: "true"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: supervisor-management
+  namespace: hudsonbox-workers
+spec:
+  podSelector:
+    matchLabels:
+      hudsonbox.io/worker: "true"
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: hudsonbox-control
+          podSelector:
+            matchLabels:
+              hudsonbox.io/supervisor-client: "true"
+      ports:
+        - protocol: TCP
+          port: 7443
+  # No outbound network in the initial no-NIC guest configuration. Add only
+  # reviewed artifact-store/DNS destinations when enabling those capabilities.
+  egress: []
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: bounded-worker-objects
+  namespace: hudsonbox-workers
+spec:
+  hard:
+    count/pods: "1000"

@@ -7,6 +7,7 @@ pub mod capacity;
 pub mod history;
 pub mod host_discovery;
 mod hosts;
+pub mod k8s_capacity;
 mod recovery;
 pub mod retirement;
 mod uploads;
