@@ -74,7 +74,7 @@ impl LiveReader for LiveClient {
                 .max_decoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES);
             let response = client.read(request).await;
-            self.routes.observe(&route, &response);
+            self.routes.observe(&route, &response).await;
             let reply = response
                 .map_err(|e| match e.code() {
                     tonic::Code::NotFound | tonic::Code::FailedPrecondition => {

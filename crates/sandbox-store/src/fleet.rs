@@ -2,9 +2,36 @@
 //! customer payload is selected. This module grants no placement/release authority.
 use crate::Store;
 use sandbox_protocol::resources::{ARTIFACT_DISK_OVERHEAD_MIB, VMM_MEMORY_OVERHEAD_MIB};
+use sandbox_protocol::{HostId, Id, rpc_telemetry::RpcFailure};
 use serde_json::Value;
 
 impl Store {
+    /// Observed RPC status only. Epoch fencing rejects late replies; retired
+    /// identities cannot accumulate new samples. This never changes health or leases.
+    pub async fn record_host_rpc_failure(
+        &self,
+        host: HostId,
+        epoch: i64,
+        failure: RpcFailure,
+    ) -> Result<(), sqlx::Error> {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sqlx::query(
+                "UPDATE hosts SET rpc_failures=jsonb_set(rpc_failures, ARRAY[$3],
+                to_jsonb(least((rpc_failures->>$3)::numeric+1,9223372036854775807)::bigint)),
+                rpc_last_failure_at=clock_timestamp()
+             WHERE id=$1 AND supervisor_epoch=$2 AND capacity_retired_at IS NULL",
+            )
+            .bind(host.uuid())
+            .bind(epoch)
+            .bind(failure.label())
+            .execute(self.pool()),
+        )
+        .await
+        .map_err(|_| sqlx::Error::PoolTimedOut)??;
+        Ok(())
+    }
+
     /// One database snapshot, bounded by the registry limit and a statement timeout.
     /// Database access is operator authority; never return this from a project route.
     pub async fn fleet_status(&self) -> Result<Value, sqlx::Error> {
@@ -15,9 +42,10 @@ impl Store {
         sqlx::query("SET LOCAL statement_timeout='2s'")
             .execute(&mut *tx)
             .await?;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM hosts")
-            .fetch_one(&mut *tx)
-            .await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM hosts WHERE capacity_retired_at IS NULL")
+                .fetch_one(&mut *tx)
+                .await?;
         if count > crate::host_registry::MAX_REGISTRY_HOSTS {
             return Err(sqlx::Error::Protocol(
                 "fleet exceeds diagnostic host bound".into(),
@@ -26,7 +54,8 @@ impl Store {
         let hosts: Vec<Value> = sqlx::query_scalar(
             "SELECT jsonb_build_object(
                 'host_id',h.id,'epoch',h.supervisor_epoch,'status',h.status,
-                'retired',h.capacity_retired_at IS NOT NULL,
+                'retired',false,
+                'rpc_failures',h.rpc_failures,'rpc_last_failure_at',h.rpc_last_failure_at,
                 'capacity',jsonb_build_object('vcpu',h.cpu_capacity,'memory_mib',h.memory_capacity_mib,'disk_mib',h.disk_capacity_mib),
                 'heartbeat_age_seconds',greatest(0,extract(epoch FROM (now()-h.last_seen_at))),
                 'fresh',COALESCE(h.last_seen_at>now()-interval '30 seconds',false),
@@ -53,7 +82,7 @@ impl Store {
                     COALESCE(sum(a.memory_mib+$1) FILTER (WHERE released_at IS NULL),0) memory,
                     COALESCE(sum(a.disk_mib+$2) FILTER (WHERE released_at IS NULL),0) disk
                 FROM allocations a JOIN sandboxes s ON s.id=a.sandbox_id WHERE a.host_id=h.id
-             ) a ORDER BY h.id")
+             ) a WHERE h.capacity_retired_at IS NULL ORDER BY h.id")
             .bind(VMM_MEMORY_OVERHEAD_MIB).bind(ARTIFACT_DISK_OVERHEAD_MIB)
             .fetch_all(&mut *tx).await?;
         let queue: Value = sqlx::query_scalar(
@@ -110,6 +139,16 @@ pub fn prometheus(status: &Value) -> String {
         ));
     }
     if let Some(hosts) = status["hosts"].as_array() {
+        for reason in ["unavailable", "deadline_exceeded", "unknown"] {
+            let total: u128 = hosts
+                .iter()
+                .filter_map(|h| h["rpc_failures"][reason].as_u64())
+                .map(u128::from)
+                .sum();
+            out.push_str(&format!(
+                "hudsonbox_fleet_rpc_failures{{reason=\"{reason}\"}} {total}\n"
+            ));
+        }
         for key in [
             "active_allocations",
             "previous_epoch_allocations",

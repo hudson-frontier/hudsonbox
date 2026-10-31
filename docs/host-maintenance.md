@@ -408,8 +408,9 @@ provider references, credential references, payloads and terminal output are omi
 Project operation reads retain project authorization and fixed placement rejection codes.
 
 Reservations include every unreleased allocation, including unknown and previous-epoch
-owners, plus the same VMM memory and artifact disk overhead used by placement. Retired
-identities remain visible but have zero available capacity. Available means accounting
+owners, plus the same VMM memory and artifact disk overhead used by placement. The
+live snapshot enumerates active identities only, bounded by the active registry limit;
+retired inventory history is separate and cannot exhaust this diagnostic bound. Available means accounting
 headroom, not permission to place: readiness, freshness, policy and compatibility still
 apply. Queue age uses database admission time. Renewal lag measures time since the last
 allocation update while a renewal is pending, not supervisor watchdog lateness. Confirmed
@@ -445,9 +446,10 @@ count retained failed create records for the fixed placement reason vocabulary,
 including pool-access denial. They are database snapshots, not monotonic counters:
 retention may reduce them. Unknown error text never becomes a metric label.
 
-Host state gauges form an exclusive partition: retired, ready, draining, then
-unavailable. A stale draining host remains in the draining bucket; inspect its
-JSON freshness separately. Capacity totals exclude retired inventory tombstones.
+Host state gauges form an exclusive partition: ready, draining, then unavailable.
+The retained `retired` gauge is zero in the active snapshot. A stale draining host
+remains in the draining bucket; inspect its JSON freshness separately. Capacity
+totals exclude retired inventory tombstones.
 Reserved totals retain every unreleased charge, including runtime overhead and
 uncertain owners; available capacity is accounting headroom and does not promise
 that a host is eligible for placement. Readiness still requires compatible image,
@@ -456,5 +458,26 @@ project pool authorization and request-specific capacity checks at placement.
 Validation added for telemetry cardinality, exclusive states, tombstone capacity,
 read-only two-host freshness transitions and project-read field redaction remains
 pending Rust/PostgreSQL execution until the shared heavy build slot is granted.
-The snapshot does not record per-host RPC failure history; missing freshness must
-not be presented as an RPC failure counter or as physical fencing evidence.
+Per-host `rpc_failures` and `rpc_last_failure_at` are operator-only observations.
+Controller health, lifecycle, authority, upload, output/history/metadata retirement
+calls and registry-backed API file/live reads record returned gRPC `unavailable`,
+`deadline_exceeded` and `unknown` statuses. These are transport-status failures;
+they do not establish physical host loss. Application rejections, pool admission
+Backoff/Busy, incompatible health metadata, database failures and missing freshness
+do not count. The explicit health network deadline records `deadline_exceeded`;
+cancellation by an enclosing worker deadline can leave an unobserved attempt.
+
+One fixed-size JSON record lives on each existing host row. Writes are atomic,
+epoch-checked, skip retired hosts, saturate at the bigint limit and have a 100 ms
+best-effort deadline. Recording failure emits a generic warning and preserves the
+original RPC result. Counts survive process restart and successful health; late
+old-epoch replies cannot mutate the new incarnation. They never change readiness,
+leases, reservations or release evidence. No error message, endpoint, project or
+request identifier is recorded. Legacy readers without a registry store cannot
+persist observations.
+
+`hudsonbox_fleet_rpc_failures{reason="..."}` sums the three fixed categories over
+active hosts; no host/project label is exported. It is a snapshot gauge, not a
+monotonic counter: retired identities leave the snapshot. Private operator JSON
+provides per-host attribution without creating unbounded metrics series. Transport
+status observations, fresh health and confirmed fencing remain separate evidence.

@@ -385,3 +385,13 @@ Capacity accounting includes unreleased customer allocations **and** unassigned 
 Multi-host implementation is tracked by [#187](https://github.com/hudson-frontier/hudsonbox/issues/187) and its subissues. Host discovery/routing and atomic placement precede deployment adapters; warm pools extend the fast-startup scope in [#188](https://github.com/hudson-frontier/hudsonbox/issues/188). Checkpoints remain separately tracked in [#178](https://github.com/hudson-frontier/hudsonbox/issues/178).
 
 Before shipping, test double claims, quota and tenant-pool denial, capacity transfer races, lost acknowledgements, worker replacement, stale epochs, controller restart, drain and failed cleanup. Fake/PostgreSQL tests and real Linux/KVM evidence must be reported separately. This baseline changes no deployment, release or infrastructure-purchase authorization.
+
+### Host RPC diagnostic observations
+
+Migration `0028_host_rpc_failures.sql` adds fixed-shape `hosts.rpc_failures`
+(`unavailable`, `deadline_exceeded`, `unknown` nonnegative bigint counts) and nullable
+`rpc_last_failure_at`. Only attempted RPC transport statuses increment them,
+atomically at the current host epoch and while not retired. These operator-only
+observations survive successful health and restart, confer no lifecycle authority
+and contain no error text or endpoint. [Fleet diagnostics](host-maintenance.md#fleet-telemetry-interpretation)
+describe bounded writes, snapshot gauges and incomplete-observation limits.
