@@ -40,9 +40,15 @@ pub(super) struct Fixture {
     pub(super) cert: String,
     pub(super) key: String,
     pub(super) fake: FakeHost,
+    // Only the warm-adoption target starts a second authenticated incarnation;
+    // other integration targets compile this shared fixture independently.
+    #[allow(dead_code)]
     server_cert: String,
+    #[allow(dead_code)]
     server_key: String,
+    #[allow(dead_code)]
     controller_pin: [u8; 32],
+    #[allow(dead_code)]
     server_pin: String,
     task: JoinHandle<()>,
 }
@@ -158,6 +164,7 @@ impl Fixture {
         }
     }
     /// A second incarnation using the same test trust roots and host identity.
+    #[allow(dead_code)]
     pub(super) async fn serve_supervisor(
         &self,
         supervisor: impl sandbox_protocol::supervisor::supervisor_server::Supervisor,
