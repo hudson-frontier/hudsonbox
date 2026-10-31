@@ -996,3 +996,67 @@ async fn crash_on_final_prepare_attempt_is_retired_by_upkeep_with_reservation_he
     );
     assert_accounted(&pool).await;
 }
+
+async fn fleet_host(store: &Store, host: HostId) -> serde_json::Value {
+    store.fleet_status().await.unwrap()["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["host_id"] == host.uuid().to_string())
+        .unwrap()
+        .clone()
+}
+
+/// Fleet diagnostics charge unadopted warm reservations exactly as placement
+/// does, and a claim moves the charge to the allocation without double counting.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_available_charges_warm_reservations_like_placement(pool: PgPool) {
+    let f = fixture(&pool, 2, 1).await;
+    let empty = fleet_host(&f.store, f.host).await;
+    assert_eq!(
+        empty["warm_held"],
+        json!({"members":0,"vcpu":0,"memory_mib":0,"disk_mib":0})
+    );
+    assert_eq!(empty["available"], empty["capacity"]);
+    stock(&f.store, f.policy, 1).await;
+    assert_eq!(states(&pool, f.policy).await, ["ready"]);
+    let slot = json!({"vcpu":SLOT.0,"memory_mib":SLOT.1,"disk_mib":SLOT.2});
+    let warm = fleet_host(&f.store, f.host).await;
+    assert_eq!(warm["warm_held"]["members"], 1);
+    assert_eq!(warm["reserved"], slot);
+    assert_eq!(
+        warm["available"], slot,
+        "one of two slots is held by the ready member"
+    );
+    assert_eq!(warm["active_allocations"], 0);
+    // Placement agrees: exactly the one advertised slot fits, then none.
+    let first = create(&f.store, f.project, &f.token).await;
+    assert!(matches!(
+        f.store.place_create(&first, HostScope::Fleet).await,
+        Ok(Reservation::Reserved(_))
+    ));
+    let full = fleet_host(&f.store, f.host).await;
+    assert_eq!(
+        full["available"],
+        json!({"vcpu":0,"memory_mib":0,"disk_mib":0})
+    );
+    assert_eq!(full["reserved"], full["capacity"]);
+    let second = create(&f.store, f.project, &f.token).await;
+    assert!(matches!(
+        f.store.place_create(&second, HostScope::Fleet).await,
+        Err(PlacementError::Capacity)
+    ));
+    // Claiming transfers the reservation to the allocation exactly once.
+    let Claimed::Claimed(_) = f.store.claim_warm_member(&second, &images()).await.unwrap() else {
+        panic!("ready member must be claimable")
+    };
+    let claimed = fleet_host(&f.store, f.host).await;
+    assert_eq!(claimed["warm_held"]["members"], 0);
+    assert_eq!(claimed["active_allocations"], 2);
+    assert_eq!(claimed["reserved"], full["reserved"]);
+    assert_eq!(claimed["available"], full["available"]);
+    let metrics = sandbox_store::fleet::prometheus(&f.store.fleet_status().await.unwrap());
+    assert!(metrics.contains("hudsonbox_fleet_warm_held_members 0\n"));
+    assert!(!metrics.contains(&f.host.uuid().to_string()));
+    assert_accounted(&pool).await;
+}

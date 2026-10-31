@@ -1,6 +1,6 @@
 //! Offline operator diagnostics. No endpoint, credential, provider reference or
 //! customer payload is selected. This module grants no placement/release authority.
-use crate::Store;
+use crate::{Store, placement::WARM_HELD};
 use sandbox_protocol::resources::{ARTIFACT_DISK_OVERHEAD_MIB, VMM_MEMORY_OVERHEAD_MIB};
 use sandbox_protocol::{HostId, Id, rpc_telemetry::RpcFailure};
 use serde_json::Value;
@@ -57,7 +57,16 @@ impl Store {
                 "fleet exceeds diagnostic host bound".into(),
             ));
         }
-        let hosts: Vec<Value> = sqlx::query_scalar(
+        // Retired tombstones are counted, never enumerated, so retained history
+        // cannot exhaust the active diagnostic bound.
+        let retired: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM hosts WHERE capacity_retired_at IS NOT NULL")
+                .fetch_one(&mut *tx)
+                .await?;
+        // Held capacity is exactly what placement charges (`placement::held`):
+        // unreleased allocations plus [`WARM_HELD`] reservations, with the same
+        // runtime overhead. `warm_held` attributes the warm share.
+        let hosts: Vec<Value> = sqlx::query_scalar(&format!(
             "SELECT jsonb_build_object(
                 'host_id',h.id,'epoch',h.supervisor_epoch,'status',h.status,
                 'retired',false,
@@ -71,11 +80,12 @@ impl Store {
                 'pending_cleanup',a.cleanup,'unknown_allocations',a.unknown,
                 'confirmed_fenced_allocations',a.fenced,
                 'renewal_pending',a.renewals,'renewal_lag_seconds',a.renewal_lag,
-                'reserved',jsonb_build_object('vcpu',a.cpu,'memory_mib',a.memory,'disk_mib',a.disk),
+                'warm_held',jsonb_build_object('members',w.members,'vcpu',w.cpu,'memory_mib',w.memory,'disk_mib',w.disk),
+                'reserved',jsonb_build_object('vcpu',a.cpu+w.cpu,'memory_mib',a.memory+w.memory,'disk_mib',a.disk+w.disk),
                 'available',jsonb_build_object(
-                    'vcpu',CASE WHEN h.capacity_retired_at IS NULL THEN greatest(0,h.cpu_capacity-a.cpu) ELSE 0 END,
-                    'memory_mib',CASE WHEN h.capacity_retired_at IS NULL THEN greatest(0,h.memory_capacity_mib-a.memory) ELSE 0 END,
-                    'disk_mib',CASE WHEN h.capacity_retired_at IS NULL THEN greatest(0,h.disk_capacity_mib-a.disk) ELSE 0 END))
+                    'vcpu',CASE WHEN h.capacity_retired_at IS NULL THEN greatest(0,h.cpu_capacity-a.cpu-w.cpu) ELSE 0 END,
+                    'memory_mib',CASE WHEN h.capacity_retired_at IS NULL THEN greatest(0,h.memory_capacity_mib-a.memory-w.memory) ELSE 0 END,
+                    'disk_mib',CASE WHEN h.capacity_retired_at IS NULL THEN greatest(0,h.disk_capacity_mib-a.disk-w.disk) ELSE 0 END))
              FROM hosts h CROSS JOIN LATERAL (
                 SELECT count(*) FILTER (WHERE released_at IS NULL) active,
                     count(*) FILTER (WHERE released_at IS NULL AND a.supervisor_epoch<>h.supervisor_epoch) previous,
@@ -88,7 +98,11 @@ impl Store {
                     COALESCE(sum(a.memory_mib+$1) FILTER (WHERE released_at IS NULL),0) memory,
                     COALESCE(sum(a.disk_mib+$2) FILTER (WHERE released_at IS NULL),0) disk
                 FROM allocations a JOIN sandboxes s ON s.id=a.sandbox_id WHERE a.host_id=h.id
-             ) a WHERE h.capacity_retired_at IS NULL ORDER BY h.id")
+             ) a CROSS JOIN LATERAL (
+                SELECT count(*) members,COALESCE(sum(w.vcpu),0) cpu,
+                    COALESCE(sum(w.memory_mib+$1),0) memory,COALESCE(sum(w.disk_mib+$2),0) disk
+                FROM ({WARM_HELD}) w WHERE w.host_id=h.id
+             ) w WHERE h.capacity_retired_at IS NULL ORDER BY h.id"))
             .bind(VMM_MEMORY_OVERHEAD_MIB).bind(ARTIFACT_DISK_OVERHEAD_MIB)
             .fetch_all(&mut *tx).await?;
         let queue: Value = sqlx::query_scalar(
@@ -114,7 +128,9 @@ impl Store {
              FROM operations WHERE kind='create' AND status='failed'")
             .fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok(serde_json::json!({"version":1,"hosts":hosts,"queue":queue,"rejections":rejections}))
+        Ok(
+            serde_json::json!({"version":1,"hosts":hosts,"retired_hosts":retired,"queue":queue,"rejections":rejections}),
+        )
     }
 }
 
@@ -182,13 +198,28 @@ pub fn prometheus(status: &Value) -> String {
                 ));
             }
         }
+        let warm: i64 = hosts
+            .iter()
+            .filter_map(|h| h["warm_held"]["members"].as_i64())
+            .sum();
+        out.push_str(&format!("hudsonbox_fleet_warm_held_members {warm}\n"));
+        for resource in ["vcpu", "memory_mib", "disk_mib"] {
+            let total: i64 = hosts
+                .iter()
+                .filter_map(|h| h["warm_held"][resource].as_i64())
+                .sum();
+            out.push_str(&format!(
+                "hudsonbox_fleet_warm_held{{resource=\"{resource}\"}} {total}\n"
+            ));
+        }
         let lag = hosts
             .iter()
             .filter_map(|h| h["renewal_lag_seconds"].as_f64())
             .fold(0.0_f64, f64::max);
         out.push_str(&format!("hudsonbox_fleet_renewal_lag_seconds {lag}\n"));
+        let tombstones = status["retired_hosts"].as_u64().unwrap_or(0);
         for state in ["ready", "unavailable", "retired", "draining"] {
-            let count = hosts
+            let listed = hosts
                 .iter()
                 .filter(|h| match state {
                     "retired" => h["retired"] == true,
@@ -196,7 +227,12 @@ pub fn prometheus(status: &Value) -> String {
                     "draining" => h["retired"] == false && h["status"] == "draining",
                     _ => h["retired"] == false && h["ready"] == false && h["status"] != "draining",
                 })
-                .count();
+                .count() as u64;
+            let count = if state == "retired" {
+                listed.saturating_add(tombstones)
+            } else {
+                listed
+            };
             out.push_str(&format!(
                 "hudsonbox_fleet_hosts{{state=\"{state}\"}} {count}\n"
             ));
@@ -216,9 +252,11 @@ mod tests {
             "queue":{"queued":0,"oldest_age_seconds":0,"insufficient_capacity":0,
                 "project_quota_exceeded":0,"no_ready_host":0,"no_compatible_host":0},
             "rejections":{"host_pool_access_denied":3,"private-user-value":99},
+            "retired_hosts":2,
             "hosts":[
                 {"host_id":"private-host","status":"draining","ready":false,"retired":false,
-                 "capacity":{"vcpu":4},"reserved":{"vcpu":2},"available":{"vcpu":2}},
+                 "capacity":{"vcpu":4},"reserved":{"vcpu":2},"available":{"vcpu":2},
+                 "warm_held":{"members":1,"vcpu":1,"memory_mib":640,"disk_mib":1425}},
                 {"host_id":"private-tombstone","status":"draining","ready":false,"retired":true,
                  "capacity":{"vcpu":8},"reserved":{"vcpu":0},"available":{"vcpu":0}},
                 {"status":"ready","ready":true,"retired":false,"capacity":{"vcpu":4}},
@@ -226,9 +264,13 @@ mod tests {
             ]
         });
         let text = prometheus(&status);
-        for state in ["ready", "unavailable", "retired", "draining"] {
+        for state in ["ready", "unavailable", "draining"] {
             assert!(text.contains(&format!("hudsonbox_fleet_hosts{{state=\"{state}\"}} 1\n")));
         }
+        // One listed fixture tombstone plus two counted retained tombstones.
+        assert!(text.contains("hudsonbox_fleet_hosts{state=\"retired\"} 3\n"));
+        assert!(text.contains("hudsonbox_fleet_warm_held_members 1\n"));
+        assert!(text.contains("hudsonbox_fleet_warm_held{resource=\"memory_mib\"} 640\n"));
         assert!(text.contains("hudsonbox_fleet_capacity{resource=\"vcpu\"} 12\n"));
         assert!(text.contains("hudsonbox_fleet_reserved{resource=\"vcpu\"} 2\n"));
         assert!(

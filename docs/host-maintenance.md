@@ -432,7 +432,12 @@ provider references, credential references, payloads and terminal output are omi
 Project operation reads retain project authorization and fixed placement rejection codes.
 
 Reservations include every unreleased allocation, including unknown and previous-epoch
-owners, plus the same VMM memory and artifact disk overhead used by placement. The
+owners, plus unassigned [warm-pool](warm-pools.md) member reservations, with the same
+VMM memory and artifact disk overhead used by placement. Diagnostics reuse placement's
+warm-held predicate (`placement::WARM_HELD`), so a ready, preparing or retiring member
+reduces `available` by exactly what placement charges, and a claimed member is charged
+once through its allocation. Per-host `warm_held` attributes the warm share (member
+count and resources) in operator JSON. The
 live snapshot enumerates active identities only, bounded by the active registry limit;
 retired inventory history is separate and cannot exhaust this diagnostic bound. Available means accounting
 headroom, not permission to place: readiness, freshness, policy and compatibility still
@@ -473,9 +478,14 @@ including pool-access denial. They are database snapshots, not monotonic counter
 retention may reduce them. Unknown error text never becomes a metric label.
 
 Host state gauges form an exclusive partition: ready, draining, then unavailable.
-The retained `retired` gauge is zero in the active snapshot. A stale draining host
+The `retired` gauge counts retained retired-host tombstones (`retired_hosts` in the
+JSON snapshot); tombstones are counted, never enumerated, so history cannot exhaust
+the active host bound. A stale draining host
 remains in the draining bucket; inspect its JSON freshness separately. Capacity
 totals exclude retired inventory tombstones.
+`hudsonbox_fleet_warm_held_members` and `hudsonbox_fleet_warm_held{resource="..."}`
+sum unassigned warm reservations over active hosts; they are already included in
+`hudsonbox_fleet_reserved`, not additional to it.
 Reserved totals retain every unreleased charge, including runtime overhead and
 uncertain owners; available capacity is accounting headroom and does not promise
 that a host is eligible for placement. Readiness still requires compatible image,
