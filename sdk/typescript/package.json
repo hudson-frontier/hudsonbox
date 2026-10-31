@@ -1,6 +1,6 @@
 {
   "name": "@hudson-frontier/hudsonbox-client",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "private": true,
   "description": "Project-scoped HTTPS client for Hudsonbox",
   "license": "Apache-2.0",

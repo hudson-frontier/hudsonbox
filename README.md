@@ -28,7 +28,9 @@ plane have executable tests. Real VM readiness, execution, and destruction have
 controlled aarch64 Linux/KVM evidence. Supported x86_64 isolation/performance
 qualification and a complete operator installation remain pending.
 Pause/resume and the management UI are planned. The [roadmap](docs/roadmap.md)
-records the delivery gates.
+records the delivery gates. The current version is in [VERSION](VERSION) and
+[CHANGELOG.md](CHANGELOG.md); see [versioning](docs/versioning.md) for SemVer
+rules and the release flow.
 
 ## Get started
 
@@ -140,6 +142,7 @@ exercises an operator-provisioned instance with recovery and explicit teardown.
 | [Operator recovery](docs/operator-recovery.md) | Upgrade compatibility and private recovery sets |
 | [Threat model](docs/threat-model.md) | Security promises, assumptions, and validation |
 | [Roadmap](docs/roadmap.md) | Implemented work and remaining release evidence |
+| [Versioning](docs/versioning.md) | SemVer scheme, version bumps and releases |
 
 ## Contributing
 

@@ -11,7 +11,11 @@ use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, time::Duration}
 use tonic::transport::Server;
 
 #[derive(Debug, Parser)]
-#[command(about = "Simulated supervisor over mTLS; never starts a VM or process")]
+#[command(
+    display_name = "sandbox-fake-host (hudsonbox)",
+    version,
+    about = "Simulated supervisor over mTLS; never starts a VM or process"
+)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1:7443")]
     listen: SocketAddr,

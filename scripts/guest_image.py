@@ -19,6 +19,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS_PATH = ROOT / "dev/guest-image/pins.json"
+# Guest and supervisor versions must equal the product version (docs/versioning.md).
+GUEST_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 MAX_METADATA = 65536
 DISK_MIB = 256
 ARCHES = {"x86_64": 62, "aarch64": 183}
@@ -436,7 +438,7 @@ def assemble(arch, revision, rootfs, output):
         "version": 1,
         "architecture": arch,
         "source_revision": revision,
-        "guest_version": "0.0.0",
+        "guest_version": GUEST_VERSION,
         "bootstrap_version": 1,
         "guest_protocol_version": 1,
         "kernel_version": pins["kernel_version"],
@@ -504,7 +506,7 @@ def verify(directory, expected, arch):
         "unsupported image format/architecture",
     )
     require(
-        manifest["guest_version"] == "0.0.0"
+        manifest["guest_version"] == GUEST_VERSION
         and type(manifest["bootstrap_version"]) is int
         and manifest["bootstrap_version"] == 1
         and type(manifest["guest_protocol_version"]) is int

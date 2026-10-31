@@ -36,7 +36,12 @@ reset-db: ## Drop and recreate the development schema
 	docker compose exec -T postgres psql -U sandbox -d sandbox -q \
 		-c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
 
-check: runtime-artifacts-test guest-image-check host-image-check api sdk-check mcp-check lint test docs doctor-check source-install-check ## Everything CI checks
+check: version-check runtime-artifacts-test guest-image-check host-image-check api sdk-check mcp-check lint test docs doctor-check source-install-check ## Everything CI checks
+
+.PHONY: version-check
+version-check: ## Check every manifest matches VERSION and test the version tool
+	python3 scripts/version.py check
+	python3 -m unittest discover -s scripts -p test_version.py
 
 .PHONY: source-install-check
 source-install-check: ## Test native source installation without compiling or starting services

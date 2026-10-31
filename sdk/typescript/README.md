@@ -6,4 +6,4 @@ Import `Client`, `ClientError`, types and `stringify` from `@hudson-frontier/hud
 
 Typed 64-bit response fields use `bigint`; safe numeric integer inputs are accepted, and unsafe numbers are rejected. Use the exported `stringify` for results. Save mutation keys and exact payloads before submitting; there are no implicit retries.
 
-See the [client guide](https://github.com/hudson-frontier/hudsonbox/blob/main/docs/language-clients.md) for configuration, examples, streaming and verified files. Version 0.0.0 is a development version, not a production release.
+See the [client guide](https://github.com/hudson-frontier/hudsonbox/blob/main/docs/language-clients.md) for configuration, examples, streaming and verified files. Pre-1.0 versions are development versions, not production releases.

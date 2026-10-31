@@ -11,6 +11,8 @@ use std::{
 #[derive(Parser)]
 #[command(
     name = "sandbox-api-test-client",
+    // `--version` prints the product: `hudsonbox X.Y.Z`.
+    display_name = "hudsonbox",
     version,
     about = "Private Hudsonbox API test client; operators should use `hudson sandbox`"
 )]

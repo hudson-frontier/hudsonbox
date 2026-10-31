@@ -815,5 +815,5 @@ export const schema: Schema = {
     "unavailable",
     "internal"
   ],
-  "version": "0.0.0"
+  "version": "0.0.1"
 };
