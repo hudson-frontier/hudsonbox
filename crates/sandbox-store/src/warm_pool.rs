@@ -5,8 +5,8 @@
 //! prepared, unused microVM reservation on one host at one supervisor epoch.
 //! This module never starts, adopts or destroys a VM. It persists intent,
 //! verifies supervisor receipts against that intent and moves reservations.
-//! The deployed supervisor implements none of the prepare/adopt/cleanup RPCs,
-//! so the controller does not route creates here yet (see docs/warm-pools.md).
+//! The controller routes creates here before cold placement; only hosts that
+//! implement warm adoption ever produce ready members (see docs/warm-pools.md).
 //!
 //! Lock order: create operation -> project -> sandbox -> policies (ascending)
 //! -> hosts (ascending) -> members. Receipt recording takes the capacity
@@ -580,7 +580,7 @@ impl Store {
             let template: Uuid = p.try_get("template_id")?;
             let fresh: Vec<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM hosts WHERE host_pool_id=$1 AND status='ready' AND supervisor_epoch>0
-                 AND capacity_retired_at IS NULL AND endpoint IS NOT NULL AND runtime_capabilities IS NOT NULL
+                 AND capacity_retired_at IS NULL AND runtime_capabilities IS NOT NULL
                  AND COALESCE(last_seen_at>clock_timestamp()-interval '30 seconds',false)",
             )
             .bind(host_pool)
@@ -1133,7 +1133,7 @@ impl Store {
              JOIN hosts h ON h.id=m.host_id
              WHERE m.pool_id=ANY($1) AND m.state='ready' AND m.lease_expires_at>clock_timestamp()
              AND m.host_id=ANY($2) AND h.status='ready' AND h.supervisor_epoch=m.supervisor_epoch
-             AND h.capacity_retired_at IS NULL AND h.endpoint IS NOT NULL
+             AND h.capacity_retired_at IS NULL
              AND COALESCE(h.last_seen_at>clock_timestamp()-interval '30 seconds',false)
              AND m.vcpu=$3 AND m.memory_mib=$4 AND m.disk_mib=$5
              ORDER BY m.created_at,m.id LIMIT 1 FOR UPDATE OF m",

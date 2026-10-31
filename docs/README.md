@@ -10,7 +10,7 @@ capabilities. Supported-host isolation and operational qualification remain inco
 | --- | --- |
 | [Architecture v1](arch-v1.md) | End-to-end standalone and Kubernetes deployment paths |
 | [Data models](data-models.md) | Existing records and the accepted fleet/warm-pool model |
-| [Warm pools](warm-pools.md) | Implemented warm-pool records and seams; unfinished runtime gates |
+| [Warm pools](warm-pools.md) | Warm-pool records, adoption protocol and routing; real-host blocker and unfinished gates |
 | [Local development](local-development.md) | Prerequisites, build, dependencies and tests |
 | [API and SDKs](api-contract.md) | Customer-facing behavior and retries |
 | [Roadmap](roadmap.md) | Delivery gates and current limitations |
