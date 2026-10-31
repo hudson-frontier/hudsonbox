@@ -479,17 +479,6 @@ impl Fleet {
             .unwrap();
     }
 
-    /// Hold one operation away from retries, as long backoff would.
-    async fn hold(&self, operation: OperationId) {
-        sqlx::query(
-            "UPDATE operations SET next_retry_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
-        )
-        .bind(operation.uuid())
-        .execute(&self.pool)
-        .await
-        .unwrap();
-    }
-
     async fn drive(&self, controller: &mut Controller, operation: OperationId) -> String {
         for _ in 0..24 {
             let _ = controller.tick().await;
@@ -502,16 +491,25 @@ impl Fleet {
         self.status(operation).await
     }
 
-    /// Tick until `operation` reaches `status`, retrying it between ticks.
-    async fn until(&self, controller: &mut Controller, operation: OperationId, status: &str) {
-        for _ in 0..12 {
+    /// Drive a cancellation. The held target's claim lease is expired between
+    /// ticks, as it would lapse in a running controller, so the target is
+    /// reclaimed and its cancel action reaches the owner.
+    async fn drive_cancel(
+        &self,
+        controller: &mut Controller,
+        cancel: OperationId,
+        target: OperationId,
+    ) -> String {
+        for _ in 0..24 {
             let _ = controller.tick().await;
-            if self.status(operation).await == status {
-                return;
+            let status = self.status(cancel).await;
+            if matches!(status.as_str(), "succeeded" | "failed") {
+                return status;
             }
-            self.retry_now(operation).await;
+            self.retry_now(cancel).await;
+            self.retry_now(target).await;
         }
-        assert_eq!(self.status(operation).await, status);
+        self.status(cancel).await
     }
 
     async fn owner(&self, sandbox: SandboxId) -> Option<HostId> {
@@ -602,7 +600,7 @@ async fn two_projects_on_two_hosts_route_every_lifecycle_surface_to_its_owner(po
         assert_eq!(fleet.drive(&mut controller, command).await, "succeeded");
         // File and live-output reads route to the owner that holds the file.
         let (status, body) = fleet.capture(*project, *sandbox).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(status, StatusCode::CREATED, "{body}");
         assert_eq!(body["size"], bytes.len(), "{body}");
         let (status, text) = fleet.stream(*project, command).await;
         assert_eq!(status, StatusCode::OK, "{text}");
@@ -620,8 +618,7 @@ async fn two_projects_on_two_hosts_route_every_lifecycle_surface_to_its_owner(po
         assert_eq!(fake.total_file_commits().await, 2);
     }
     // Cancel a running command on each host through the same controller.
-    for host in 0..2 {
-        let (project, sandbox) = sandboxes[host];
+    for (host, &(project, sandbox)) in sandboxes.iter().take(2).enumerate() {
         fleet.fakes[host].hold_next_command().await;
         let target = fleet.execute(project, sandbox).await;
         for _ in 0..8 {
@@ -632,7 +629,10 @@ async fn two_projects_on_two_hosts_route_every_lifecycle_surface_to_its_owner(po
         }
         assert_eq!(fleet.fakes[host].total_commands().await, 3);
         let cancel = fleet.cancel(project, target).await;
-        assert_eq!(fleet.drive(&mut controller, cancel).await, "succeeded");
+        assert_eq!(
+            fleet.drive_cancel(&mut controller, cancel, target).await,
+            "succeeded"
+        );
         assert_eq!(fleet.status(target).await, "cancelled");
         assert_eq!(
             fleet.fakes[1 - host].total_commands().await,
@@ -763,12 +763,14 @@ async fn partitioned_cancel_stays_unknown_without_replay_while_other_host_progre
             break;
         }
         fleet.retry_now(cancel).await;
+        fleet.retry_now(target).await;
     }
     assert!(unknown);
     assert_eq!(fleet.status(target).await, "unknown");
     fleet.partition(1).await;
     for _ in 0..3 {
         fleet.retry_now(cancel).await;
+        fleet.retry_now(target).await;
         let _ = controller.tick().await;
     }
     assert!(!matches!(
@@ -784,7 +786,10 @@ async fn partitioned_cancel_stays_unknown_without_replay_while_other_host_progre
     fleet.heal(1).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
     let mut replacement = fleet.controller(0).await;
-    assert_eq!(fleet.drive(&mut replacement, cancel).await, "succeeded");
+    assert_eq!(
+        fleet.drive_cancel(&mut replacement, cancel, target).await,
+        "succeeded"
+    );
     let result: Value = sqlx::query_scalar("SELECT result FROM operations WHERE id=$1")
         .bind(cancel.uuid())
         .fetch_one(&pool)
@@ -808,7 +813,7 @@ async fn restarted_host_denies_old_epoch_api_reads_while_other_host_progresses(p
     let command = fleet.execute(project, on_b).await;
     assert_eq!(fleet.drive(&mut controller, command).await, "succeeded");
     let (status, body) = fleet.capture(project, on_b).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
     let (status, text) = fleet.stream(project, command).await;
     assert!(!denied(status, &text), "{text}");
     // Operator restart of B: drain, issue epoch 2, start a fresh supervisor
@@ -823,11 +828,11 @@ async fn restarted_host_denies_old_epoch_api_reads_while_other_host_progresses(p
     fleet.fakes[1] = restarted;
     // Reads scoped to the epoch-1 allocation are never served by epoch 2.
     let (status, body) = fleet.capture(project, on_b).await;
-    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(body.get("capture").is_none(), "{body}");
     let (status, text) = fleet.stream(project, command).await;
-    assert!(denied(status, &text), "{status} {text}");
-    assert!(!text.contains("\"complete\":true"), "{text}");
+    assert_eq!(status, StatusCode::GONE, "{text}");
+    assert!(text.contains("output_missing"), "{text}");
     // A progresses; B's new incarnation starts and runs nothing it never received.
     let (project_a, on_a) = sandboxes[0];
     let healthy = fleet.execute(project_a, on_a).await;
