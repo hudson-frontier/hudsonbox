@@ -13,7 +13,8 @@ use sandbox_protocol::{
     },
     warm_pool::{
         self, CleanupReceipt, HandoffIntent, HandoffOutcome, HandoffReceipt, PrepareIntent,
-        PrepareReceipt, RetireIntent, VERSION, WarmReceipt,
+        PrepareReceipt, PreviousCleanupReceipt, PreviousRetireIntent, RetireIntent, VERSION,
+        WarmReceipt,
     },
 };
 use sha2::{Digest, Sha256};
@@ -42,6 +43,16 @@ pub(crate) enum Member {
 }
 
 impl Member {
+    fn epoch(&self) -> i64 {
+        match self {
+            Self::Ready(receipt) => receipt.supervisor_epoch,
+            Self::Adopted { receipt, .. } | Self::Refused { receipt, .. } => {
+                receipt.supervisor_epoch
+            }
+            Self::Destroyed(receipt) => receipt.supervisor_epoch,
+        }
+    }
+
     /// Capacity held outside allocation records.
     pub(crate) fn held(&self) -> Option<(u64, u64, u64)> {
         let prepared = match self {
@@ -96,6 +107,38 @@ impl FakeHost {
             return Err(Status::failed_precondition(
                 "wrong host or supervisor epoch",
             ));
+        }
+        Ok(())
+    }
+
+    /// Test-only simulated restart with explicitly retained member evidence.
+    /// Fences the old handle before copying records. A fresh FakeHost without
+    /// this transfer has no previous-epoch evidence and cannot attest cleanup.
+    /// This does not simulate durable disk or allocation recovery.
+    pub async fn retain_warm_members_from(&self, prior: &FakeHost) -> Result<(), Status> {
+        if self.config.host != prior.config.host
+            || self.config.epoch <= prior.config.epoch
+            || std::sync::Arc::ptr_eq(&self.state, &prior.state)
+        {
+            return Err(Status::failed_precondition(
+                "invalid retained warm incarnation",
+            ));
+        }
+        let mut old = prior.state.lock().await;
+        let mut current = self.state.lock().await;
+        if !current.warm.is_empty() || current.warm_epoch_fenced || old.warm_epoch_fenced {
+            return Err(Status::failed_precondition(
+                "warm state already used or fenced",
+            ));
+        }
+        old.warm_epoch_fenced = true;
+        current.warm = old.warm.clone();
+        Ok(())
+    }
+
+    fn warm_live(state: &State) -> Result<(), Status> {
+        if state.warm_epoch_fenced {
+            return Err(Status::failed_precondition("warm incarnation fenced"));
         }
         Ok(())
     }
@@ -171,6 +214,7 @@ impl FakeHost {
             vm_ref: format!("warm-{}", intent.member_id),
         };
         let mut state = self.state.lock().await;
+        Self::warm_live(&state)?;
         Self::expire(&mut state);
         match state.warm.get(&intent.member_id) {
             // Idempotent on member identity; any changed input is refused.
@@ -247,6 +291,16 @@ impl FakeHost {
             .digest()
             .map_err(|_| Status::invalid_argument("invalid handoff intent"))?;
         let mut state = self.state.lock().await;
+        Self::warm_live(&state)?;
+        if state
+            .warm
+            .get(&intent.member_id)
+            .is_some_and(|member| member.epoch() != intent.supervisor_epoch)
+        {
+            return Err(Status::failed_precondition(
+                "warm member belongs to another epoch",
+            ));
+        }
         // Agreement with the intent is not proof of issuance: on a host that
         // requires permits, only the registered permit may bind or fence.
         state
@@ -376,6 +430,34 @@ impl FakeHost {
         &self,
         request: WarmRetireRequest,
     ) -> Result<WarmObservation, Status> {
+        if let Ok(previous) = warm_pool::decode::<PreviousRetireIntent>(&request.intent_json) {
+            previous
+                .validate()
+                .map_err(|_| Status::invalid_argument("invalid previous retire intent"))?;
+            self.this_epoch(previous.original.host_id, previous.reporting_epoch)?;
+            let mut state = self.state.lock().await;
+            Self::warm_live(&state)?;
+            // Presence is mandatory for an older epoch: a fresh fake cannot
+            // turn discarded state into absence evidence. The retained epoch
+            // and the optional name must both match before any mutation.
+            if state
+                .warm
+                .get(&previous.original.member_id)
+                .is_none_or(|member| member.epoch() != previous.original.supervisor_epoch)
+            {
+                return Err(Status::failed_precondition(
+                    "retained warm ownership unavailable",
+                ));
+            }
+            let cleanup = Self::retire_member(&mut state, &previous.original)?;
+            return reply(&WarmReceipt::PreviousCleanup {
+                receipt: PreviousCleanupReceipt {
+                    version: VERSION,
+                    request: previous,
+                    cleanup,
+                },
+            });
+        }
         let intent: RetireIntent = warm_pool::decode(&request.intent_json)
             .map_err(|_| Status::invalid_argument("invalid retire intent"))?;
         if intent.version != VERSION
@@ -388,6 +470,21 @@ impl FakeHost {
         }
         self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
         let mut state = self.state.lock().await;
+        Self::warm_live(&state)?;
+        if state
+            .warm
+            .get(&intent.member_id)
+            .is_some_and(|member| member.epoch() != intent.supervisor_epoch)
+        {
+            return Err(Status::failed_precondition(
+                "warm member belongs to another epoch",
+            ));
+        }
+        let receipt = Self::retire_member(&mut state, &intent)?;
+        reply(&WarmReceipt::Cleanup { receipt })
+    }
+
+    fn retire_member(state: &mut State, intent: &RetireIntent) -> Result<CleanupReceipt, Status> {
         let prepared_ref = match state.warm.get(&intent.member_id) {
             Some(Member::Adopted { .. }) => {
                 return Err(Status::failed_precondition(
@@ -397,9 +494,7 @@ impl FakeHost {
             Some(Member::Destroyed(existing)) => {
                 // Exact retry, including an unnamed retry of a named destroy.
                 return if existing.vm_ref == intent.vm_ref || intent.vm_ref.is_none() {
-                    reply(&WarmReceipt::Cleanup {
-                        receipt: existing.clone(),
-                    })
+                    Ok(existing.clone())
                 } else {
                     Err(Status::already_exists(
                         "member destroyed under another name",
@@ -431,6 +526,6 @@ impl FakeHost {
         state
             .warm
             .insert(intent.member_id, Member::Destroyed(receipt.clone()));
-        reply(&WarmReceipt::Cleanup { receipt })
+        Ok(receipt)
     }
 }

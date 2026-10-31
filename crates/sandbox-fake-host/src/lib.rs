@@ -74,6 +74,7 @@ struct State {
     archive_delay: Duration,
     archives_started: u64,
     warm: HashMap<uuid::Uuid, warm::Member>,
+    warm_epoch_fenced: bool,
     warm_prepares: u64,
     warm_adoptions: u64,
     lose_next_adopt_reply: bool,

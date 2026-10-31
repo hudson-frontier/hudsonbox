@@ -40,6 +40,16 @@ pub(super) struct Fixture {
     pub(super) cert: String,
     pub(super) key: String,
     pub(super) fake: FakeHost,
+    // Only the warm-adoption target starts a second authenticated incarnation;
+    // other integration targets compile this shared fixture independently.
+    #[allow(dead_code)]
+    server_cert: String,
+    #[allow(dead_code)]
+    server_key: String,
+    #[allow(dead_code)]
+    controller_pin: [u8; 32],
+    #[allow(dead_code)]
+    server_pin: String,
     task: JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -146,8 +156,42 @@ impl Fixture {
             cert: controller_cert.pem(),
             key: controller_key.serialize_pem(),
             fake,
+            server_cert: server_cert.pem(),
+            server_key: server_key.serialize_pem(),
+            controller_pin: Sha256::digest(controller_cert.der()).into(),
+            server_pin: hex::encode(Sha256::digest(server_cert.der())),
             task,
         }
+    }
+    /// A second incarnation using the same test trust roots and host identity.
+    #[allow(dead_code)]
+    pub(super) async fn serve_supervisor(
+        &self,
+        supervisor: impl sandbox_protocol::supervisor::supervisor_server::Supervisor,
+    ) -> (String, String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
+        let service = InterceptedService::new(
+            SupervisorServer::new(supervisor)
+                .max_decoding_message_size(MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_MESSAGE_BYTES),
+            ControllerIdentity::new(vec![self.controller_pin]).unwrap(),
+        );
+        let tls = transport::server_tls(
+            self.ca.as_bytes(),
+            self.server_cert.as_bytes(),
+            self.server_key.as_bytes(),
+        );
+        let task = tokio::spawn(async move {
+            Server::builder()
+                .tls_config(tls)
+                .unwrap()
+                .add_service(service)
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        (endpoint, self.server_pin.clone(), task)
     }
     pub(super) async fn controller(&self) -> Controller {
         Controller::connect(

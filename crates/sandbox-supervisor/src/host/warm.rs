@@ -901,6 +901,20 @@ mod tests {
         cold.member = None;
         let encoded = serde_json::to_value(&cold).unwrap();
         assert!(encoded.get("member").is_none());
+        // Inert placeholders round-trip internally without admitting nil or
+        // non-v7 identities through the public identifier parser.
+        assert!(
+            cold.start
+                .owner
+                .project
+                .to_string()
+                .parse::<ProjectId>()
+                .is_err()
+        );
+        let mut invalid = encoded.clone();
+        invalid["start"]["owner"]["project"] =
+            serde_json::json!(format!("prj_{}", uuid::Uuid::max()));
+        assert!(serde_json::from_value::<Manifest>(invalid).is_err());
         let reloaded: Manifest = serde_json::from_value(encoded.clone()).unwrap();
         assert_eq!(serde_json::to_value(&reloaded).unwrap(), encoded);
         let receipt = serde_json::json!({

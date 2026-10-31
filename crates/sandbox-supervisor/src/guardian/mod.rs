@@ -18,12 +18,32 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Owner {
     pub host: HostId,
+    #[serde(deserialize_with = "inert_project")]
     pub project: ProjectId,
+    #[serde(deserialize_with = "inert_sandbox")]
     pub sandbox: SandboxId,
     pub allocation: AllocationId,
     pub create_operation: OperationId,
     pub generation: i64,
     pub epoch: i64,
+}
+// Only the root-owned guardian journal uses nil placeholders for an inert
+// member. Public identifier parsing remains UUIDv7-only.
+fn inert_project<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ProjectId, D::Error> {
+    let value = String::deserialize(d)?;
+    if value == format!("prj_{}", uuid::Uuid::nil()) {
+        Ok(ProjectId::from_uuid(uuid::Uuid::nil()))
+    } else {
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+fn inert_sandbox<'de, D: serde::Deserializer<'de>>(d: D) -> Result<SandboxId, D::Error> {
+    let value = String::deserialize(d)?;
+    if value == format!("sbx_{}", uuid::Uuid::nil()) {
+        Ok(SandboxId::from_uuid(uuid::Uuid::nil()))
+    } else {
+        value.parse().map_err(serde::de::Error::custom)
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
