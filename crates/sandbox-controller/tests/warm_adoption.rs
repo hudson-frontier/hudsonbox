@@ -776,3 +776,6 @@ async fn previous_cleanup_never_destroys_an_adopted_member(pool: PgPool) {
     );
     assert!(f.store.warm_pool_members(policy).await.unwrap()[0]["cleanup_evidence"].is_null());
 }
+
+#[path = "warm_adoption/cleanup_transport.rs"]
+mod cleanup_transport;
