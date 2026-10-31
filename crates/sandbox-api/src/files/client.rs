@@ -75,7 +75,7 @@ impl FileClient {
         .max_decoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(sandbox_supervisor::transport::MAX_MESSAGE_BYTES);
         let response = call(client).await;
-        self.routes.observe(&route, &response);
+        self.routes.observe(&route, &response).await;
         self.response(response)
     }
     fn response(

@@ -111,7 +111,11 @@ impl Retirer {
                 .map_err(|_| HistoryError::Rpc)?;
             let observed = tokio::time::timeout(
                 Duration::from_secs(30),
-                route.client.retire_released_history(prepared.request),
+                self.hosts.rpc(
+                    host,
+                    epoch,
+                    route.client.retire_released_history(prepared.request),
+                ),
             )
             .await
             .map_err(|_| HistoryError::Rpc)?
@@ -144,7 +148,8 @@ impl Retirer {
             Preparation::Binding { request, .. } => {
                 let observed = tokio::time::timeout(
                     Duration::from_secs(30),
-                    route.client.history_binding(request),
+                    self.hosts
+                        .rpc(host, epoch, route.client.history_binding(request)),
                 )
                 .await
                 .map_err(|_| HistoryError::Rpc)?
@@ -158,7 +163,8 @@ impl Retirer {
         };
         let observed = tokio::time::timeout(
             Duration::from_secs(30),
-            route.client.retire_history(request),
+            self.hosts
+                .rpc(host, epoch, route.client.retire_history(request)),
         )
         .await
         .map_err(|_| HistoryError::Rpc)?

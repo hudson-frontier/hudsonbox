@@ -10,6 +10,7 @@ pub mod ids;
 pub mod images;
 pub mod network_policy;
 pub mod resources;
+pub mod rpc_telemetry;
 pub mod token;
 
 pub use idempotency::{DIGEST_VERSION, IdempotencyKey, KeyError, RequestDigest};

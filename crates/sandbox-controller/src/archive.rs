@@ -120,7 +120,11 @@ impl Archiver {
         if work.plans.is_none() {
             let response = tokio::time::timeout(
                 Duration::from_secs(30),
-                route.client.prepare_output(request.clone()),
+                self.hosts.rpc(
+                    owner.0,
+                    owner.1,
+                    route.client.prepare_output(request.clone()),
+                ),
             )
             .await
             .map_err(|_| ArchiveError::Rpc)?
@@ -139,7 +143,11 @@ impl Archiver {
         request.plans_json = encode(&plans).map_err(|_| ArchiveError::Evidence)?;
         let response = tokio::time::timeout(
             Duration::from_secs(80),
-            route.client.archive_output(request.clone()),
+            self.hosts.rpc(
+                owner.0,
+                owner.1,
+                route.client.archive_output(request.clone()),
+            ),
         )
         .await
         .map_err(|_| ArchiveError::Rpc)?

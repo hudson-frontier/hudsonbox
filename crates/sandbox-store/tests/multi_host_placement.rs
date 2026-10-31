@@ -812,3 +812,54 @@ async fn create_claims_take_turns_across_projects(pool: PgPool) {
     }
     assert_eq!(order, vec![busy, quiet, busy, busy]);
 }
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_queue_tracks_real_placement_wait_and_excludes_dispatched_work(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let shared = host_pool(&store, "queue", Tenancy::Shared).await;
+    let only = host(&pool, shared, 1).await;
+    let (id, token) = project(&pool).await;
+    store.grant_host_pool_access(id, shared).await.unwrap();
+    let holder = create(&store, id, &token).await;
+    store.place_create(&holder, HostScope::Fleet).await.unwrap();
+    store
+        .prepare_create_dispatch(&holder, &std::collections::BTreeSet::from([image()]))
+        .await
+        .unwrap();
+    let waiting = create(&store, id, &token).await;
+    sqlx::query(
+        "UPDATE operations SET created_at=clock_timestamp()-interval '120 seconds' WHERE id=$1",
+    )
+    .bind(waiting.operation_id.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = store
+        .place_create(&waiting, HostScope::Fleet)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.wait_reason(),
+        Some(PlacementWait::InsufficientCapacity)
+    );
+    assert_eq!(
+        store
+            .await_placement(&waiting, error.wait_reason().unwrap())
+            .await
+            .unwrap(),
+        WaitOutcome::Waiting
+    );
+    let snapshot = store.fleet_status().await.unwrap();
+    assert_eq!(snapshot["queue"]["queued"], 1);
+    assert_eq!(snapshot["queue"]["insufficient_capacity"], 1);
+    assert!(snapshot["queue"]["oldest_age_seconds"].as_f64().unwrap() >= 120.0);
+    store.record_create_unknown(&holder).await.unwrap();
+    let unknown = store.fleet_status().await.unwrap();
+    assert_eq!(
+        unknown["queue"]["queued"], 1,
+        "unknown dispatch is never placement demand"
+    );
+    admit(&store, id, &token).await;
+    assert_eq!(store.fleet_status().await.unwrap()["queue"]["queued"], 2);
+    assert_eq!(snapshot["hosts"][0]["host_id"], only.uuid().to_string());
+}

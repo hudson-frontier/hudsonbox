@@ -77,13 +77,23 @@ impl Controller {
                 },
                 Err(_) => return self.upload_uncertain(claim).await,
             },
-            UploadAction::Begin(request) => route?.client.begin_file(request).await,
-            UploadAction::Commit(request) => route?.client.commit_file(request).await,
+            UploadAction::Begin(request) => {
+                self.rpc(host, epoch, route?.client.begin_file(request))
+                    .await
+            }
+            UploadAction::Commit(request) => {
+                self.rpc(host, epoch, route?.client.commit_file(request))
+                    .await
+            }
             UploadAction::Abort(request) => {
                 self.file_cache = None;
-                route?.client.abort_file(request).await
+                self.rpc(host, epoch, route?.client.abort_file(request))
+                    .await
             }
-            UploadAction::Inspect(request) => route?.client.inspect_file(request).await,
+            UploadAction::Inspect(request) => {
+                self.rpc(host, epoch, route?.client.inspect_file(request))
+                    .await
+            }
             UploadAction::Write {
                 request,
                 source,
@@ -139,14 +149,16 @@ impl Controller {
                     };
                 }
                 written = Some(end as u64);
-                route?
-                    .client
-                    .write_file(FileWriteRequest {
+                self.rpc(
+                    host,
+                    epoch,
+                    route?.client.write_file(FileWriteRequest {
                         request: Some(request),
                         offset,
                         data: chunk,
-                    })
-                    .await
+                    }),
+                )
+                .await
             }
         };
         let observation = match result {
