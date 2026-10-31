@@ -391,7 +391,8 @@ Portable PostgreSQL tests are in
 and [`sandbox-controller/tests/capacity.rs`](../crates/sandbox-controller/tests/capacity.rs).
 They cover upgrade preservation, claims/retries, occupied/uncertain retirement,
 retire-then-replace at `max_hosts`, bounded intent queues, adapter routing and
-advisory demand. Their Rust execution is pending the shared build slot. A light
+advisory demand. The [portable evidence](evidence/2026-10-30-standalone-capacity.md) records
+focused executable validation of the capacity adapter. A light
 psql check of the full migration chain, pre-0027 host preservation and lease/
 receipt constraints passed in an isolated temporary database on the existing
 local PostgreSQL service. No real Linux/KVM drain, retirement, performance or
