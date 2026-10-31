@@ -17,8 +17,8 @@ use crate::{Controller, ControllerError, Tick};
 use sandbox_protocol::{
     supervisor::{Ownership, WarmAdoptRequest, WarmPrepareRequest, WarmRetireRequest},
     warm_pool::{
-        self, CleanupReceipt, HandoffOutcome, PrepareIntent, PrepareReceipt, RetireIntent, VERSION,
-        WarmReceipt,
+        self, CleanupReceipt, HandoffOutcome, PrepareIntent, PrepareReceipt,
+        PreviousCleanupReceipt, PreviousRetireIntent, RetireIntent, VERSION, WarmReceipt,
     },
 };
 use sandbox_store::{
@@ -41,11 +41,18 @@ pub enum WarmRpcError {
 
 pub type WarmFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, WarmRpcError>> + Send + 'a>>;
 
+/// Exact cleanup evidence, distinguishing the original and reporting epochs.
+#[derive(Debug)]
+pub enum CleanupEvidence {
+    Current(CleanupReceipt),
+    Previous(PreviousCleanupReceipt),
+}
+
 /// Upkeep RPCs. Implementations must be idempotent on member identity and
-/// reject a stale supervisor epoch. Handoff is driven by the create path.
+/// reject a stale reporting epoch. Handoff is driven by the create path.
 pub trait WarmSupervisor: Send + Sync + std::fmt::Debug {
     fn prepare<'a>(&'a self, intent: &'a PrepareIntent) -> WarmFuture<'a, PrepareReceipt>;
-    fn cleanup<'a>(&'a self, intent: &'a RetireIntent) -> WarmFuture<'a, CleanupReceipt>;
+    fn cleanup<'a>(&'a self, intent: &'a RetireIntent) -> WarmFuture<'a, CleanupEvidence>;
 }
 
 /// A host without warm RPCs: always fails closed.
@@ -56,7 +63,7 @@ impl WarmSupervisor for UnsupportedWarmSupervisor {
     fn prepare<'a>(&'a self, _: &'a PrepareIntent) -> WarmFuture<'a, PrepareReceipt> {
         Box::pin(async { Err(WarmRpcError::Unsupported) })
     }
-    fn cleanup<'a>(&'a self, _: &'a RetireIntent) -> WarmFuture<'a, CleanupReceipt> {
+    fn cleanup<'a>(&'a self, _: &'a RetireIntent) -> WarmFuture<'a, CleanupEvidence> {
         Box::pin(async { Err(WarmRpcError::Unsupported) })
     }
 }
@@ -98,15 +105,35 @@ impl WarmSupervisor for RpcWarmSupervisor<'_> {
         })
     }
 
-    fn cleanup<'a>(&'a self, intent: &'a RetireIntent) -> WarmFuture<'a, CleanupReceipt> {
+    fn cleanup<'a>(&'a self, intent: &'a RetireIntent) -> WarmFuture<'a, CleanupEvidence> {
         Box::pin(async move {
+            let epoch = self
+                .0
+                .store
+                .registered_host(intent.host_id)
+                .await
+                .map_err(|_| WarmRpcError::NotApplied)?
+                .map(|host| host.supervisor_epoch)
+                .unwrap_or(intent.supervisor_epoch);
+            if epoch < intent.supervisor_epoch {
+                return Err(WarmRpcError::NotApplied);
+            }
+            let previous = (epoch > intent.supervisor_epoch).then(|| PreviousRetireIntent {
+                version: VERSION,
+                original: intent.clone(),
+                reporting_epoch: epoch,
+            });
             let mut route = self
                 .0
-                .route(intent.host_id, intent.supervisor_epoch, false)
+                .route(intent.host_id, epoch, false)
                 .await
                 .map_err(|_| WarmRpcError::NotApplied)?;
             let request = WarmRetireRequest {
-                intent_json: warm_pool::encode(intent).map_err(|_| WarmRpcError::NotApplied)?,
+                intent_json: match &previous {
+                    Some(previous) => warm_pool::encode(previous),
+                    None => warm_pool::encode(intent),
+                }
+                .map_err(|_| WarmRpcError::NotApplied)?,
             };
             let reply = self
                 .0
@@ -119,7 +146,14 @@ impl WarmSupervisor for RpcWarmSupervisor<'_> {
                 .map_err(|_| WarmRpcError::Unknown)?
                 .into_inner();
             match decode(&reply.receipt_json)? {
-                WarmReceipt::Cleanup { receipt } => Ok(receipt),
+                WarmReceipt::Cleanup { receipt } if previous.is_none() => {
+                    Ok(CleanupEvidence::Current(receipt))
+                }
+                WarmReceipt::PreviousCleanup { receipt }
+                    if previous.as_ref().is_some_and(|p| receipt.verify(p).is_ok()) =>
+                {
+                    Ok(CleanupEvidence::Previous(receipt))
+                }
                 _ => Err(WarmRpcError::Unknown),
             }
         })
@@ -190,7 +224,14 @@ async fn drive(
             };
             match supervisor.cleanup(&intent).await {
                 Ok(receipt) => {
-                    store.record_warm_cleanup(claim, &receipt).await?;
+                    match receipt {
+                        CleanupEvidence::Current(receipt) => {
+                            store.record_warm_cleanup(claim, &receipt).await?
+                        }
+                        CleanupEvidence::Previous(receipt) => {
+                            store.record_previous_warm_cleanup(claim, &receipt).await?
+                        }
+                    }
                     Ok(Step::Cleaned)
                 }
                 // Absence of a receipt is never cleanup evidence: keep the intent.
