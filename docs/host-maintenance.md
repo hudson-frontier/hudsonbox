@@ -481,9 +481,9 @@ uncertain owners; available capacity is accounting headroom and does not promise
 that a host is eligible for placement. Readiness still requires compatible image,
 project pool authorization and request-specific capacity checks at placement.
 
-Validation added for telemetry cardinality, exclusive states, tombstone capacity,
-read-only two-host freshness transitions and project-read field redaction remains
-pending Rust/PostgreSQL execution until the shared heavy build slot is granted.
+Telemetry cardinality, exclusive states, tombstone capacity, read-only two-host
+freshness transitions and project-read field redaction are covered by
+Rust/PostgreSQL integration tests that ran in hosted CI for PR #209.
 Per-host `rpc_failures` and `rpc_last_failure_at` are operator-only observations.
 Controller health, lifecycle, authority, upload, output/history/metadata retirement
 calls and registry-backed API file/live reads record returned gRPC `unavailable`,

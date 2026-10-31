@@ -69,7 +69,7 @@ Until both exist, the real host refuses `PrepareWarmMember` (nothing boots), ans
 - **Network policy at adoption.** Network policy is bound with the allocation and is not implemented for warm members.
 - **Real Linux/KVM validation.** None of this work ran on Linux/KVM; the real-host warm module compiles only on Linux and is checked there by CI. Cold vs warm create-to-ready must be measured on real KVM before any latency claim.
 - **Real stale-epoch cleanup.** The controller can request verified cleanup at the host's current incarnation using the previous-epoch envelope described below. The real supervisor still rejects that envelope until its retained-state cleanup implementation exists. Unsupported, unknown and failed cleanup keep reservations held.
-- **Kubernetes.** The #197/#214 Kubernetes retire path must also refuse hosts with `unretired_warm_members`.
+- **Kubernetes.** Done in portable code: the #197/#214 Kubernetes retire path refuses hosts with `unretired_warm_members` (`crates/sandbox-store/src/k8s_capacity.rs`; `unretired_warm_members_block_pod_retirement_until_cleanup` in `crates/sandbox-controller/tests/k8s_capacity.rs`). Not qualified on a real cluster.
 - **Snapshots** wait for #178. No billing, pricing, plans or entitlements were added.
 
 ## Tests
