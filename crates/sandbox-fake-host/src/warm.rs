@@ -114,6 +114,18 @@ impl FakeHost {
         self.state.lock().await.lose_next_adopt_reply = true;
     }
 
+    /// Fault injection: apply the next `n` prepares (or exact retries) and
+    /// lose each acknowledgement.
+    pub async fn lose_prepare_replies(&self, n: u32) {
+        self.state.lock().await.lose_prepare_replies = n;
+    }
+
+    /// Simulated members holding capacity outside allocations (test observation).
+    pub async fn warm_holding(&self) -> usize {
+        let state = self.state.lock().await;
+        state.warm.values().filter(|m| m.held().is_some()).count()
+    }
+
     /// Successful simulated adoptions (each is one allocation record).
     pub async fn warm_adoptions(&self) -> u64 {
         self.state.lock().await.warm_adoptions
@@ -163,6 +175,10 @@ impl FakeHost {
         match state.warm.get(&intent.member_id) {
             // Idempotent on member identity; any changed input is refused.
             Some(Member::Ready(existing)) if *existing == receipt => {
+                if let Some(n) = state.lose_prepare_replies.checked_sub(1) {
+                    state.lose_prepare_replies = n;
+                    return Err(Status::unavailable("injected lost prepare acknowledgement"));
+                }
                 return reply(&WarmReceipt::Prepared { receipt });
             }
             Some(_) => {
@@ -198,6 +214,10 @@ impl FakeHost {
             .warm
             .insert(intent.member_id, Member::Ready(receipt.clone()));
         state.warm_prepares += 1;
+        if let Some(n) = state.lose_prepare_replies.checked_sub(1) {
+            state.lose_prepare_replies = n;
+            return Err(Status::unavailable("injected lost prepare acknowledgement"));
+        }
         reply(&WarmReceipt::Prepared { receipt })
     }
 
@@ -227,6 +247,11 @@ impl FakeHost {
             .digest()
             .map_err(|_| Status::invalid_argument("invalid handoff intent"))?;
         let mut state = self.state.lock().await;
+        // Agreement with the intent is not proof of issuance: on a host that
+        // requires permits, only the registered permit may bind or fence.
+        state
+            .permits
+            .admit(&request.launch_permit_json, &owner, true)?;
         Self::expire(&mut state);
         Self::fence(&mut state, &owner)?;
         let current = state.warm.get(&intent.member_id).cloned();
@@ -362,14 +387,6 @@ impl FakeHost {
             return Err(Status::invalid_argument("invalid retire intent"));
         }
         self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
-        let receipt = CleanupReceipt {
-            version: VERSION,
-            member_id: intent.member_id,
-            vm_ref: intent.vm_ref.clone(),
-            host_id: intent.host_id,
-            supervisor_epoch: intent.supervisor_epoch,
-            destroyed: true,
-        };
         let mut state = self.state.lock().await;
         let prepared_ref = match state.warm.get(&intent.member_id) {
             Some(Member::Adopted { .. }) => {
@@ -378,8 +395,11 @@ impl FakeHost {
                 ));
             }
             Some(Member::Destroyed(existing)) => {
-                return if *existing == receipt {
-                    reply(&WarmReceipt::Cleanup { receipt })
+                // Exact retry, including an unnamed retry of a named destroy.
+                return if existing.vm_ref == intent.vm_ref || intent.vm_ref.is_none() {
+                    reply(&WarmReceipt::Cleanup {
+                        receipt: existing.clone(),
+                    })
                 } else {
                     Err(Status::already_exists(
                         "member destroyed under another name",
@@ -390,13 +410,24 @@ impl FakeHost {
             Some(Member::Refused { prepared, .. }) => prepared.as_ref().map(|p| p.vm_ref.clone()),
             None => None,
         };
-        // A reported VM name must be the one this epoch prepared.
-        if prepared_ref.is_some() && prepared_ref != intent.vm_ref {
+        // A named retire must name what this epoch prepared. An unnamed retire
+        // (prepare acknowledgement lost) destroys the exact member's prepared,
+        // never-adopted VM and reports its name; complete in-epoch memory makes
+        // an unknown member a truthful "never prepared" answer.
+        if intent.vm_ref.is_some() && prepared_ref != intent.vm_ref {
             return Err(Status::failed_precondition("warm member name mismatch"));
         }
         if !state.warm.contains_key(&intent.member_id) && state.warm.len() >= MAX_MEMBERS {
             return Err(Status::resource_exhausted("fake warm store full"));
         }
+        let receipt = CleanupReceipt {
+            version: VERSION,
+            member_id: intent.member_id,
+            vm_ref: prepared_ref,
+            host_id: intent.host_id,
+            supervisor_epoch: intent.supervisor_epoch,
+            destroyed: true,
+        };
         state
             .warm
             .insert(intent.member_id, Member::Destroyed(receipt.clone()));

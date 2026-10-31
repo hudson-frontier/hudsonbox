@@ -255,7 +255,11 @@ impl Controller {
     ) -> Result<Option<Tick>, ControllerError> {
         match claim.phase.as_deref() {
             None | Some("queued" | "awaiting_placement") => {
-                match self.store.claim_warm_member(claim).await {
+                match self
+                    .store
+                    .claim_warm_member(claim, &self.config.allowed_images)
+                    .await
+                {
                     Ok(Claimed::Claimed(_) | Claimed::Existing(_)) => {}
                     Ok(Claimed::None) => return Ok(None),
                     Err(Error::LostClaim) => return Ok(Some(Tick::LostOwnership)),
@@ -264,6 +268,7 @@ impl Controller {
                         Error::Unauthorized
                         | Error::Quota
                         | Error::NoPoolAccess
+                        | Error::ImageDenied
                         | Error::Reconcile
                         | Error::Invalid,
                     ) => return Ok(None),
@@ -279,7 +284,11 @@ impl Controller {
     }
 
     async fn warm_handoff(&mut self, claim: &Claim) -> Result<Option<Tick>, ControllerError> {
-        let dispatch = match self.store.begin_warm_adopt(claim).await {
+        let dispatch = match self
+            .store
+            .begin_warm_adopt(claim, &self.config.allowed_images)
+            .await
+        {
             Ok(d) => d,
             Err(Error::LostClaim) => return Ok(Some(Tick::LostOwnership)),
             Err(Error::Reconcile | Error::Conflict) => return self.defer(claim).await.map(Some),

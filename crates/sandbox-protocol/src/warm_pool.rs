@@ -249,7 +249,9 @@ impl HandoffReceipt {
 pub struct CleanupReceipt {
     pub version: u32,
     pub member_id: Uuid,
-    /// Absent only when preparation never reported a VM name.
+    /// The VM the supervisor destroyed for this member at this epoch. Absent
+    /// only when the supervisor proves it never prepared one. For an unnamed
+    /// [`RetireIntent`] (prepare acknowledgement lost) it names what was found.
     pub vm_ref: Option<String>,
     pub host_id: HostId,
     pub supervisor_epoch: i64,
@@ -270,8 +272,10 @@ impl CleanupReceipt {
         {
             return Err(Error::Invalid);
         }
+        // A named intent must be echoed exactly. An unnamed intent accepts the
+        // name the supervisor resolved from its own member/epoch record.
         if self.member_id != member_id
-            || self.vm_ref.as_deref() != vm_ref
+            || vm_ref.is_some_and(|v| self.vm_ref.as_deref() != Some(v))
             || self.host_id != host_id
             || self.supervisor_epoch != supervisor_epoch
         {
@@ -281,8 +285,10 @@ impl CleanupReceipt {
     }
 }
 
-/// Destroy one unassigned member. `vm_ref` is absent only when preparation
-/// never reported a VM. Never names or touches an allocation.
+/// Destroy one unassigned member. `vm_ref` is absent when no prepare receipt
+/// was recorded; the supervisor then destroys whatever it prepared for the
+/// exact member at this epoch (never an adopted, customer-used VM) and names it
+/// in the receipt. Never names or touches an allocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetireIntent {
@@ -460,7 +466,24 @@ mod tests {
             ok.verify(member, Some("warm-1"), host, 2),
             Err(Error::Mismatch)
         );
-        assert_eq!(ok.verify(member, None, host, 1), Err(Error::Mismatch));
+        // An unnamed retire (prepare acknowledgement lost) accepts the name the
+        // supervisor resolved, or proof that none was prepared.
+        ok.verify(member, None, host, 1).unwrap();
+        let mut unnamed = ok.clone();
+        unnamed.vm_ref = None;
+        unnamed.verify(member, None, host, 1).unwrap();
+        assert_eq!(
+            unnamed.verify(member, Some("warm-1"), host, 1),
+            Err(Error::Mismatch)
+        );
+        assert_eq!(
+            ok.verify(member, Some("warm-2"), host, 1),
+            Err(Error::Mismatch)
+        );
+        assert_eq!(
+            ok.verify(Uuid::now_v7(), None, host, 1),
+            Err(Error::Mismatch)
+        );
         let mut absent = ok.clone();
         absent.destroyed = false;
         assert_eq!(

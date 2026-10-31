@@ -50,6 +50,10 @@ fn capabilities() -> Capabilities {
     }
 }
 
+fn images() -> std::collections::BTreeSet<String> {
+    [format!("sha256:{}", "a".repeat(64))].into()
+}
+
 async fn connect(f: &Fixture) -> Controller {
     f.controller().await
 }
@@ -231,10 +235,10 @@ async fn uncertain_unadopted_handoff_is_fenced_retired_and_cold_booted(pool: PgP
         .unwrap()
         .unwrap();
     assert!(matches!(
-        f.store.claim_warm_member(&claim).await.unwrap(),
+        f.store.claim_warm_member(&claim, &images()).await.unwrap(),
         Claimed::Claimed(_)
     ));
-    f.store.begin_warm_adopt(&claim).await.unwrap();
+    f.store.begin_warm_adopt(&claim, &images()).await.unwrap();
     let scope = intent(&pool).await;
     f.reclaim_now().await;
     // Recovery inspects: the member was never adopted, so it is fenced.
@@ -294,7 +298,7 @@ async fn adoption_refuses_other_tenants_permits_and_stale_epochs(pool: PgPool) {
         .await
         .unwrap()
         .unwrap();
-    f.store.claim_warm_member(&claim).await.unwrap();
+    f.store.claim_warm_member(&claim, &images()).await.unwrap();
     let scope = intent(&pool).await;
     let adopt = |r: WarmAdoptRequest| f.fake.adopt_warm_member(tonic::Request::new(r));
     // Another project cannot present this scope under its own ownership.
@@ -376,4 +380,180 @@ async fn creates_stay_cold_without_ready_members(pool: PgPool) {
     assert_eq!(f.fake.total_starts().await, 1);
     assert_eq!(f.fake.warm_adoptions().await, 0);
     assert!(member_states(&pool).await.is_empty());
+}
+
+async fn controller_allowing(f: &Fixture, image: &str) -> Controller {
+    let mut config = f.config.clone();
+    config.allowed_images = [image.to_owned()].into();
+    Controller::connect(
+        f.store.clone(),
+        config,
+        f.ca.as_bytes(),
+        f.cert.as_bytes(),
+        f.key.as_bytes(),
+    )
+    .await
+    .unwrap()
+}
+
+async fn rejection(pool: &PgPool) -> (String, Option<String>) {
+    sqlx::query_as(
+        "SELECT status,error->>'code' FROM operations WHERE kind='create'
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn adoption_requires_the_controller_image_allowlist(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    warm(&f, 1).await;
+    connect(&f).await.warm_upkeep(4).await.unwrap();
+    assert_eq!(f.fake.warm_ready().await, 1);
+    f.admit().await;
+    // The image was admitted and prepared, then removed from the allowlist.
+    let mut denied = controller_allowing(&f, &format!("sha256:{}", "9".repeat(64))).await;
+    denied.tick().await.unwrap();
+    // Denied before any claim: no member is bound, no VM booted, and the
+    // create reports the same rejection as a cold boot.
+    assert_eq!(f.fake.warm_adoptions().await, 0);
+    assert_eq!(f.fake.total_starts().await, 0);
+    assert_eq!(member_states(&pool).await, ["ready"]);
+    assert_eq!(
+        rejection(&pool).await,
+        ("failed".into(), Some("image_not_allowed".into()))
+    );
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn allowlist_removed_after_claim_fences_instead_of_adopting(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    warm(&f, 1).await;
+    connect(&f).await.warm_upkeep(4).await.unwrap();
+    f.admit().await;
+    // A worker under the old allowlist claims the member, then crashes.
+    let claim = f
+        .store
+        .claim_next(OperationKind::Create, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.store.claim_warm_member(&claim, &images()).await.unwrap(),
+        Claimed::Claimed(_)
+    ));
+    f.reclaim_now().await;
+    let mut denied = controller_allowing(&f, &format!("sha256:{}", "9".repeat(64))).await;
+    // First dispatch under a denied image is inspect-only: the member is
+    // fenced, never adopted.
+    assert_eq!(denied.tick().await.unwrap(), Tick::Deferred);
+    assert_eq!(phase(&pool).await.1, "warm_handoff_rejected");
+    assert_eq!(f.fake.warm_adoptions().await, 0);
+    let pass = denied.warm_upkeep(1).await.unwrap();
+    assert!(pass.steps.contains(&Step::Cleaned), "{pass:?}");
+    f.reclaim_now().await;
+    denied.tick().await.unwrap();
+    assert_eq!(f.fake.warm_adoptions().await, 0);
+    assert_eq!(f.fake.total_starts().await, 0);
+    assert_eq!(
+        rejection(&pool).await,
+        ("failed".into(), Some("image_not_allowed".into()))
+    );
+    let (live,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM allocations WHERE released_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(live, 0);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn lost_prepare_acks_through_exhaustion_clean_up_by_resolved_name(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    warm(&f, 1).await;
+    let controller = connect(&f).await;
+    // Every acknowledgement is lost: the fake booted the member, the database
+    // never learned its name.
+    f.fake
+        .lose_prepare_replies(sandbox_store::warm_pool::MAX_ATTEMPTS as u32)
+        .await;
+    let pass = controller.warm_upkeep(8).await.unwrap();
+    assert_eq!(pass.steps.last(), Some(&Step::Abandoned), "{pass:?}");
+    let (state, vm): (String, Option<String>) =
+        sqlx::query_as("SELECT state,vm_ref FROM warm_pool_members")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((state.as_str(), vm), ("retiring", None));
+    // Both sides still hold the reservation: unknown is never refunded.
+    assert_eq!(f.fake.warm_holding().await, 1);
+    let pass = controller.warm_upkeep(1).await.unwrap();
+    assert_eq!(pass.steps, vec![Step::Cleaned]);
+    let (state, vm): (String, Option<String>) =
+        sqlx::query_as("SELECT state,vm_ref FROM warm_pool_members ORDER BY created_at LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "retired");
+    assert!(vm.is_some_and(|v| v.starts_with("warm-")));
+    assert_eq!(f.fake.warm_holding().await, 0);
+    // Capacity freed only by that evidence is reused by a replacement.
+    let pass = controller.warm_upkeep(4).await.unwrap();
+    assert_eq!(pass.steps, vec![Step::Prepared]);
+    assert_eq!(f.fake.warm_ready().await, 1);
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn permit_hosts_adopt_only_registered_permits(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    f.fake.require_launch_permits().await;
+    warm(&f, 1).await;
+    connect(&f).await.warm_upkeep(4).await.unwrap();
+    f.admit().await;
+    let claim = f
+        .store
+        .claim_next(OperationKind::Create, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    f.store.claim_warm_member(&claim, &images()).await.unwrap();
+    let scope = intent(&pool).await;
+    // A permit that agrees with every caller field is still not proof of
+    // issuance: before registration it binds and fences nothing.
+    for inspect in [false, true] {
+        let request = tonic::Request::new(request(&scope, claim.revision));
+        let refused = if inspect {
+            f.fake.inspect_warm_handoff(request).await
+        } else {
+            f.fake.adopt_warm_member(request).await
+        };
+        assert_eq!(refused.unwrap_err().code(), tonic::Code::PermissionDenied);
+    }
+    assert_eq!(f.fake.warm_ready().await, 1);
+    // The controller registers the database-issued permit, then adopts once.
+    f.reclaim_now().await;
+    assert_eq!(connect(&f).await.tick().await.unwrap(), Tick::Confirmed);
+    assert_eq!(f.fake.warm_adoptions().await, 1);
+    assert!(f.fake.registered_permits().await >= scope.permit_serial);
+    // A forged permit at an unregistered serial, otherwise consistent, is
+    // denied even for an exact replay of the adopted scope.
+    let mut forged = scope.permit();
+    forged.serial += 1;
+    let mut replay = request(&scope, claim.revision + 1);
+    replay.launch_permit_json = warm_pool::encode(&forged).unwrap();
+    assert_eq!(
+        f.fake
+            .adopt_warm_member(tonic::Request::new(replay))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    // Cold creates on the same host also go through registration.
+    f.admit().await;
+    assert_eq!(connect(&f).await.tick().await.unwrap(), Tick::Confirmed);
+    assert_eq!(f.fake.total_starts().await, 1);
+    assert_eq!(f.fake.warm_adoptions().await, 1);
 }

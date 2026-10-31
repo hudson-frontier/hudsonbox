@@ -27,6 +27,7 @@ use sandbox_protocol::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::{
@@ -57,6 +58,8 @@ pub enum Error {
     NoPoolAccess,
     #[error("project allocation quota exceeded")]
     Quota,
+    #[error("sandbox image is not on the controller's allowlist")]
+    ImageDenied,
     #[error("sandbox requires reconciliation before a warm claim")]
     Reconcile,
     #[error("claim expired or was replaced")]
@@ -525,6 +528,37 @@ impl Store {
                 .push(begin_retire(&mut tx, host_pool, policy, member, &reason).await?);
             left -= 1;
         }
+        // Preparation whose final claim was lost (worker crash or lease expiry
+        // on the last attempt) can never be claimed or abandoned again. Whether
+        // a VM booted is unknown: retire it durably with the reservation held.
+        // SKIP LOCKED: a live claim holder keeps its row; no lock waits here.
+        let exhausted: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT o.id,m.id FROM capacity_operations o
+             JOIN warm_pool_members m ON m.id::text=o.target_ref AND m.pool_id=o.warm_pool_id
+             WHERE o.warm_pool_id=$1 AND o.kind='warm_prepare' AND o.status IN ('queued','running')
+             AND o.claim_revision>=$2 AND (o.lease_expires_at IS NULL OR o.lease_expires_at<=clock_timestamp())
+             AND m.state='preparing'
+             ORDER BY o.created_at,o.id LIMIT $3 FOR UPDATE OF o,m SKIP LOCKED",
+        )
+        .bind(policy)
+        .bind(MAX_ATTEMPTS)
+        .bind(left as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (operation, member) in exhausted {
+            let retire =
+                begin_retire(&mut tx, host_pool, policy, member, "prepare_exhausted").await?;
+            sqlx::query(
+                "UPDATE capacity_operations SET status='succeeded',lease_expires_at=NULL,error=NULL,
+                 provider_receipt=$2,updated_at=clock_timestamp() WHERE id=$1",
+            )
+            .bind(operation)
+            .bind(json!({"version":1,"outcome":"exhausted_to_retirement","retire_operation":retire}))
+            .execute(&mut *tx)
+            .await?;
+            out.retire.push(retire);
+            left -= 1;
+        }
         let (ready, total): (i64, i64) = sqlx::query_as(
             "SELECT count(*) FILTER (WHERE state='ready'),
              count(*) FILTER (WHERE state IN ('preparing','ready','claiming','retiring'))
@@ -955,16 +989,18 @@ impl Store {
             return Err(Error::Conflict);
         }
         let evidence = serde_json::to_value(receipt).map_err(|_| Error::Invalid)?;
+        // An unnamed retire records the VM name the supervisor resolved.
         sqlx::query(
-            "UPDATE warm_pool_members SET state='retired',cleanup_evidence=$2,updated_at=clock_timestamp()
-             WHERE id=$1",
+            "UPDATE warm_pool_members SET state='retired',cleanup_evidence=$2,
+             vm_ref=COALESCE(vm_ref,$3),updated_at=clock_timestamp() WHERE id=$1",
         )
         .bind(member_id)
         .bind(&evidence)
+        .bind(&receipt.vm_ref)
         .execute(&mut *tx)
         .await?;
-        if let Some(op) = operation {
-            sqlx::query(
+        if let (Some(op), Some(allocation)) = (operation, allocation) {
+            let returned = sqlx::query(
                 "UPDATE operations SET phase='reserved',next_retry_at=clock_timestamp(),
                  attempt_receipts=attempt_receipts||jsonb_build_array($2::jsonb),updated_at=clock_timestamp()
                  WHERE id=$1 AND phase='warm_handoff_rejected' AND status='running' AND attempt_count=0",
@@ -972,7 +1008,21 @@ impl Store {
             .bind(op)
             .bind(json!({"phase":"warm_member_cleaned","member_id":member_id}))
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
+            // The supervisor's Rejected receipt plus this destruction evidence
+            // prove no host holds the allocation: it is undispatched again, so
+            // the cold path may boot it or reject (and release) it before
+            // dispatch exactly as for a fresh reservation.
+            if returned == 1 {
+                sqlx::query(
+                    "UPDATE allocations SET lease_expires_at=NULL,updated_at=clock_timestamp()
+                     WHERE id=$1 AND status='reserved' AND released_at IS NULL",
+                )
+                .bind(allocation)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         Self::succeed(&mut tx, claim, &json!({"version":1,"cleanup":evidence})).await?;
         tx.commit().await?;
@@ -986,7 +1036,11 @@ impl Store {
     /// the member's host at the member's epoch with the member's exact size;
     /// persist the handoff intent; and park the create in `warm_handoff` so the
     /// ordinary cold dispatcher cannot boot a second VM for the allocation.
-    pub async fn claim_warm_member(&self, claim: &Claim) -> Result<Claimed, Error> {
+    pub async fn claim_warm_member(
+        &self,
+        claim: &Claim,
+        images: &BTreeSet<String>,
+    ) -> Result<Claimed, Error> {
         let mut tx = self.pool().begin().await?;
         timeouts(&mut tx).await?;
         let op = sqlx::query(
@@ -1044,6 +1098,11 @@ impl Store {
         };
         let (cpu, memory, disk) = (size("vcpu")?, size("memory_mib")?, size("disk_mib")?);
         let image: String = sandbox.try_get("image_digest")?;
+        // The controller's image allowlist applies to a prepared VM exactly as
+        // to a cold boot; the adopted create never reaches the cold check.
+        if !images.contains(&image) {
+            return Err(Error::ImageDenied);
+        }
         let authorized: bool = sqlx::query_scalar(
             "SELECT p.status='active' AND o.initiator_kind='project'
              AND (o.deadline IS NULL OR o.deadline > clock_timestamp())
@@ -1376,7 +1435,11 @@ impl Store {
     /// an adopt was already dispatched (lost acknowledgement or restart) or the
     /// create's credential, deadline or sandbox expiry no longer authorizes
     /// binding project identity: those paths may only inspect and fence.
-    pub async fn begin_warm_adopt(&self, claim: &Claim) -> Result<AdoptDispatch, Error> {
+    pub async fn begin_warm_adopt(
+        &self,
+        claim: &Claim,
+        images: &BTreeSet<String>,
+    ) -> Result<AdoptDispatch, Error> {
         let mut tx = self.pool().begin().await?;
         timeouts(&mut tx).await?;
         let op = sqlx::query(
@@ -1405,20 +1468,24 @@ impl Store {
             return Err(Error::Conflict);
         }
         let handoff = handoff_from(&row)?;
-        let authorized: bool = sqlx::query_scalar(
+        let (authorized, image): (bool, String) = sqlx::query_as(
             "SELECT p.status='active' AND o.initiator_kind='project'
              AND (o.deadline IS NULL OR o.deadline > clock_timestamp())
              AND (s.expires_at IS NULL OR s.expires_at > clock_timestamp())
              AND EXISTS (SELECT 1 FROM jsonb_array_elements(p.api_tokens) t
                 WHERE t->>'key_id'=o.initiator_key_id
                 AND (t->>'revoked_at' IS NULL OR (t->>'revoked_at')::timestamptz > clock_timestamp())
-                AND (t->>'expires_at' IS NULL OR (t->>'expires_at')::timestamptz > clock_timestamp()))
+                AND (t->>'expires_at' IS NULL OR (t->>'expires_at')::timestamptz > clock_timestamp())),
+             s.image_digest
              FROM projects p JOIN operations o ON o.project_id=p.id
              JOIN sandboxes s ON s.id=o.sandbox_id WHERE o.id=$1",
         )
         .bind(claim.operation_id.uuid())
         .fetch_one(&mut *tx)
         .await?;
+        // An image removed from the allowlist after the claim may still be
+        // fenced by inspection, never adopted.
+        let authorized = authorized && images.contains(&image);
         let mode = match phase.as_deref() {
             Some("warm_handoff") if authorized => AdoptMode::Adopt,
             Some("warm_handoff" | "warm_adopt_dispatched") => AdoptMode::Inspect,

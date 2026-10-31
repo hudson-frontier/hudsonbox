@@ -25,6 +25,10 @@ use sha2::Digest;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+fn images() -> std::collections::BTreeSet<String> {
+    [image()].into()
+}
+
 fn image() -> String {
     format!("sha256:{}", "a".repeat(64))
 }
@@ -397,9 +401,9 @@ async fn concurrent_claims_take_each_member_once(pool: PgPool) {
         let claim = create(&f.store, f.project, &f.token).await;
         let store = f.store.clone();
         tasks.spawn(async move {
-            let first = store.claim_warm_member(&claim).await.unwrap();
+            let first = store.claim_warm_member(&claim, &images()).await.unwrap();
             // A duplicated worker finds the same durable handoff.
-            let again = store.claim_warm_member(&claim).await.unwrap();
+            let again = store.claim_warm_member(&claim, &images()).await.unwrap();
             (first, again)
         });
     }
@@ -443,7 +447,7 @@ async fn claim_transfers_reservation_exactly_once_on_a_full_host(pool: PgPool) {
     let f = fixture(&pool, 1, 1).await;
     stock(&f.store, f.policy, 1).await;
     let claim = create(&f.store, f.project, &f.token).await;
-    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim).await.unwrap() else {
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim, &images()).await.unwrap() else {
         panic!()
     };
     assert_eq!(h.allocation.host_id, f.host);
@@ -534,9 +538,15 @@ async fn tenant_template_and_quota_denials(pool: PgPool) {
     stock(&store, dedicated.id, 1).await;
     // Other tenants, ungranted and over-quota projects never get the member.
     let c = create(&store, other, &other_token).await;
-    assert_eq!(store.claim_warm_member(&c).await.unwrap(), Claimed::None);
+    assert_eq!(
+        store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::None
+    );
     let c = create(&store, ungranted, &ungranted_token).await;
-    assert_eq!(store.claim_warm_member(&c).await.unwrap(), Claimed::None);
+    assert_eq!(
+        store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::None
+    );
     let shared_template = template(None, Publication::Shared, "public");
     store.put_sandbox_template(&shared_template).await.unwrap();
     let public = policy(shared_template.id, shared, None, 1);
@@ -544,7 +554,7 @@ async fn tenant_template_and_quota_denials(pool: PgPool) {
     stock(&store, public.id, 1).await;
     let c = create(&store, tight, &tight_token).await;
     assert!(matches!(
-        store.claim_warm_member(&c).await,
+        store.claim_warm_member(&c, &images()).await,
         Err(Error::Quota)
     ));
     assert_eq!(states(&pool, dedicated.id).await, ["ready"]);
@@ -552,7 +562,7 @@ async fn tenant_template_and_quota_denials(pool: PgPool) {
     // The owner can claim (dedicated or shared, both authorized).
     let c = create(&store, owner, &owner_token).await;
     assert!(matches!(
-        store.claim_warm_member(&c).await.unwrap(),
+        store.claim_warm_member(&c, &images()).await.unwrap(),
         Claimed::Claimed(_)
     ));
     // Dedicated host pool refuses a shared policy.
@@ -574,7 +584,7 @@ async fn lost_ack_and_restart_resume_the_same_durable_intent(pool: PgPool) {
     let f = fixture(&pool, 4, 1).await;
     stock(&f.store, f.policy, 1).await;
     let claim = create(&f.store, f.project, &f.token).await;
-    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim).await.unwrap() else {
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim, &images()).await.unwrap() else {
         panic!()
     };
     // Controller "restarts": the lease expires, another worker reclaims the
@@ -595,7 +605,7 @@ async fn lost_ack_and_restart_resume_the_same_durable_intent(pool: PgPool) {
         .unwrap();
     assert_eq!(again.operation_id, claim.operation_id);
     assert_eq!(
-        f.store.claim_warm_member(&again).await.unwrap(),
+        f.store.claim_warm_member(&again, &images()).await.unwrap(),
         Claimed::Existing(h.clone())
     );
     assert_eq!(
@@ -628,7 +638,7 @@ async fn adopt_is_dispatched_once_then_only_inspected(pool: PgPool) {
     let f = fixture(&pool, 4, 2).await;
     stock(&f.store, f.policy, 2).await;
     let claim = create(&f.store, f.project, &f.token).await;
-    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim).await.unwrap() else {
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim, &images()).await.unwrap() else {
         panic!()
     };
     // The scope names the exact registered permit and create operation.
@@ -642,11 +652,11 @@ async fn adopt_is_dispatched_once_then_only_inspected(pool: PgPool) {
     assert_eq!(h.intent.permit_serial, serial as u64);
     assert_eq!(op, claim.operation_id.uuid());
     assert_eq!(h.intent.permit().allocation, h.intent.allocation_id);
-    let first = f.store.begin_warm_adopt(&claim).await.unwrap();
+    let first = f.store.begin_warm_adopt(&claim, &images()).await.unwrap();
     assert_eq!(first.mode, AdoptMode::Adopt);
     assert_eq!(first.handoff, h);
     // Lost acknowledgement: every later attempt may only inspect.
-    let again = f.store.begin_warm_adopt(&claim).await.unwrap();
+    let again = f.store.begin_warm_adopt(&claim, &images()).await.unwrap();
     assert_eq!(again.mode, AdoptMode::Inspect);
     let phase: String = sqlx::query_scalar("SELECT phase FROM operations WHERE id=$1")
         .bind(claim.operation_id.uuid())
@@ -658,7 +668,7 @@ async fn adopt_is_dispatched_once_then_only_inspected(pool: PgPool) {
     // A second create whose credential is revoked after its claim never
     // dispatches adoption of project identity: inspect-and-fence only.
     let other = create(&f.store, f.project, &f.token).await;
-    let Claimed::Claimed(_) = f.store.claim_warm_member(&other).await.unwrap() else {
+    let Claimed::Claimed(_) = f.store.claim_warm_member(&other, &images()).await.unwrap() else {
         panic!()
     };
     sqlx::query("UPDATE projects SET api_tokens='[]' WHERE id=$1")
@@ -666,7 +676,7 @@ async fn adopt_is_dispatched_once_then_only_inspected(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let revoked = f.store.begin_warm_adopt(&other).await.unwrap();
+    let revoked = f.store.begin_warm_adopt(&other, &images()).await.unwrap();
     assert_eq!(revoked.mode, AdoptMode::Inspect);
     let phase: String = sqlx::query_scalar("SELECT phase FROM operations WHERE id=$1")
         .bind(other.operation_id.uuid())
@@ -682,7 +692,7 @@ async fn stale_epoch_receipts_are_refused_and_stale_members_retire(pool: PgPool)
     let f = fixture(&pool, 4, 2).await;
     stock(&f.store, f.policy, 2).await;
     let claim = create(&f.store, f.project, &f.token).await;
-    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim).await.unwrap() else {
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim, &images()).await.unwrap() else {
         panic!()
     };
     f.store.drain_host(f.host, 1).await.unwrap();
@@ -729,7 +739,7 @@ async fn drain_retires_ready_members_and_blocks_host_retirement_until_cleanup(po
     // A draining host's member is never claimed.
     let claim = create(&f.store, f.project, &f.token).await;
     assert_eq!(
-        f.store.claim_warm_member(&claim).await.unwrap(),
+        f.store.claim_warm_member(&claim, &images()).await.unwrap(),
         Claimed::None
     );
     let report = f.store.host_maintenance(f.host, 1).await.unwrap();
@@ -783,7 +793,7 @@ async fn rejected_handoff_retires_member_then_falls_back_to_cold_boot(pool: PgPo
     let f = fixture(&pool, 2, 1).await;
     stock(&f.store, f.policy, 1).await;
     let claim = create(&f.store, f.project, &f.token).await;
-    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim).await.unwrap() else {
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim, &images()).await.unwrap() else {
         panic!()
     };
     f.store
@@ -844,7 +854,7 @@ async fn ordinary_cold_boot_is_unchanged_without_warm_members(pool: PgPool) {
     let f = fixture(&pool, 2, 0).await;
     let claim = create(&f.store, f.project, &f.token).await;
     assert_eq!(
-        f.store.claim_warm_member(&claim).await.unwrap(),
+        f.store.claim_warm_member(&claim, &images()).await.unwrap(),
         Claimed::None
     );
     assert!(matches!(
@@ -891,5 +901,98 @@ async fn expired_prepare_lease_cannot_record_and_exhaustion_abandons_to_retireme
     f.store.abandon_warm_prepare(&last).await.unwrap();
     // Unknown whether a VM booted: reservation still held as retiring.
     assert_eq!(states(&pool, f.policy).await, ["retiring"]);
+    assert_accounted(&pool).await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn crash_on_final_prepare_attempt_is_retired_by_upkeep_with_reservation_held(pool: PgPool) {
+    let f = fixture(&pool, 2, 1).await;
+    f.store.reconcile_warm_pool(f.policy, 16).await.unwrap();
+    // Every attempt's worker crashes; the eighth claim also expires unanswered.
+    let mut last = f
+        .store
+        .claim_warm_operation(f.policy, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    while last.revision < sandbox_store::warm_pool::MAX_ATTEMPTS {
+        f.store.retry_warm_operation(&last).await.unwrap();
+        last = f
+            .store
+            .claim_warm_operation(f.policy, 30)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    // A live final claim is never swept out from under its holder.
+    let pass = f.store.reconcile_warm_pool(f.policy, 16).await.unwrap();
+    assert!(pass.retire.is_empty(), "{pass:?}");
+    assert_eq!(states(&pool, f.policy).await, ["preparing"]);
+    sqlx::query("UPDATE capacity_operations SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1")
+        .bind(last.id).execute(&pool).await.unwrap();
+    // Exhausted: no claimer will ever take it again, and the dead holder
+    // cannot abandon it.
+    assert!(
+        f.store
+            .claim_warm_operation(f.policy, 30)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        f.store.abandon_warm_prepare(&last).await,
+        Err(Error::LostClaim)
+    ));
+    // Upkeep durably retires it with its reservation held; a replacement is
+    // reserved only within the remaining capacity.
+    let pass = f.store.reconcile_warm_pool(f.policy, 16).await.unwrap();
+    assert_eq!(pass.retire.len(), 1, "{pass:?}");
+    let (status, outcome): (String, Option<String>) = sqlx::query_as(
+        "SELECT status,provider_receipt->>'outcome' FROM capacity_operations WHERE id=$1",
+    )
+    .bind(last.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "succeeded");
+    assert_eq!(outcome.as_deref(), Some("exhausted_to_retirement"));
+    assert_eq!(states(&pool, f.policy).await[0], "retiring");
+    assert_accounted(&pool).await;
+    // Idempotent: a second pass does not enqueue another retirement.
+    let again = f.store.reconcile_warm_pool(f.policy, 16).await.unwrap();
+    assert!(again.retire.is_empty(), "{again:?}");
+    // Only exact cleanup evidence for the unnamed member releases it; the
+    // supervisor names the VM it found.
+    let retire = loop {
+        let claim = f
+            .store
+            .claim_warm_operation(f.policy, 30)
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(claim.work, WarmWork::Retire { .. }) {
+            break claim;
+        }
+        f.store.retry_warm_operation(&claim).await.unwrap();
+    };
+    let WarmWork::Retire { vm_ref, .. } = &retire.work else {
+        unreachable!()
+    };
+    assert!(vm_ref.is_none());
+    let mut evidence = cleaned(&retire);
+    evidence.vm_ref = Some("warm-found".into());
+    f.store
+        .record_warm_cleanup(&retire, &evidence)
+        .await
+        .unwrap();
+    let (state, vm): (String, Option<String>) =
+        sqlx::query_as("SELECT state,vm_ref FROM warm_pool_members ORDER BY created_at,id LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), vm.as_deref()),
+        ("retired", Some("warm-found"))
+    );
     assert_accounted(&pool).await;
 }
