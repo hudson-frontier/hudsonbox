@@ -346,14 +346,16 @@ impl Host {
             return Err(Status::invalid_argument("invalid prepare intent"));
         }
         self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
-        let (mut entry, fresh) = self.reserve_member(&intent)?;
+        let (mut entry, _) = self.reserve_member(&intent)?;
         let gate = entry.gate.clone();
         let _gate = lock(&gate)?;
         // Re-read under the member gate.
         entry = self
             .member_entry(&intent.member_id)?
             .ok_or_else(|| uncertain("warm member record missing"))?;
-        if fresh || matches!(entry.record.state, MemberState::Preparing) {
+        // Retirement may have won the member gate after this call reserved
+        // a fresh record. The current durable state alone permits staging.
+        if matches!(entry.record.state, MemberState::Preparing) {
             match entry.manifest.receipt() {
                 // Never staged: stage and launch exactly once under the gate.
                 Err(_) if !entry.manifest.directory().join("receipt.json").exists() => {

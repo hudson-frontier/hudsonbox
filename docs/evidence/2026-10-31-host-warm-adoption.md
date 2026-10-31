@@ -8,6 +8,7 @@ PR [#218](https://github.com/hudson-frontier/hudsonbox/pull/218) rebases only it
 - The host accepts the previous-retirement envelope from #216 (contract checked against `a19b11e37d6d967ffc73ddce9b498316319d28e1`) through a private wire adapter. The shared protocol crate on the #217 base lacks these types. No guest/protocol changes or controller/store/fake changes are included; replace the adapter with shared types when the stacks combine under parent coordination.
 - Previous cleanup requires exact retained member, optional requested VM name resolved to the retained VM, original host/epoch and current reporting epoch. A single operation ID with nondecreasing claim revision is saved with the retirement fence before any effect. Lost responses and a subsequent host epoch retain that claim. Replies echo the exact request and original-epoch cleanup identity. Unknown old members and adopted members refuse cleanup.
 - A historical stopped receipt is insufficient by itself: the guardian must yield its lifecycle lock, verify the retained receipt and confirm current cgroup/runtime/socket absence before host-local capacity is released or previous cleanup is acknowledged. Partial/missing metadata refuses proof.
+- Prepare re-reads the durable lifecycle after taking the member gate. A call that initially reserved a fresh record cannot stage it if retirement won that gate first.
 - An unnamed retire that races ahead of prepare saves a bounded refusal tombstone before returning absence. A delayed prepare cannot launch that identity, including after restart. Named unknown retire remains refused.
 - The 256-identity limit remains an explicit operator lifetime budget, shared by member records and refusal tombstones. No retired/adopted authority is deleted. The owning [warm-pool document](../warm-pools.md#remaining-gates) describes exhaustion and replacement-host procedure. Automatic pruning is unsafe without a proven fence against delayed callbacks and identity reuse.
 - Preparation/adoption preserve the existing no-NIC isolated baseline. No allocation egress integration is implemented or claimed.
@@ -16,7 +17,15 @@ PR [#218](https://github.com/hudson-frontier/hudsonbox/pull/218) rebases only it
 
 The initial work stayed source/light only while #216 owned the build slot. After an explicit slot grant, focused validation uses the idle existing `t3-cffe33ba/target`, jobs=2, with disk monitored (about 19 GiB free at start). No new stack or infrastructure was started.
 
-Final focused results are recorded here after completion. Native host unit tests, native strict Clippy and Linux all-target compilation are in progress. Linux compilation reuses the existing clang/header shim and is type-check evidence only; it does not link or run Linux code.
+Passed:
+
+- `cargo test -p sandbox-supervisor --lib -j2`: 21 native macOS tests passed, including all five new portable regressions.
+- `cargo clippy -p sandbox-supervisor --all-targets -j2 -- -D warnings`: native strict Clippy passed.
+- `CC_aarch64_unknown_linux_gnu=clang CFLAGS_aarch64_unknown_linux_gnu='--target=aarch64-unknown-linux-gnu -isystem /tmp/hb188-linux-shim' cargo clippy --target aarch64-unknown-linux-gnu -p sandbox-supervisor --all-targets -j2 -- -D warnings`: passed, including compilation of all four new Linux-only host journal regressions and the dedicated-root guardian absence regression. Rechecked after the final Linux prepare race correction.
+- `cargo fmt --all --check`, `git diff --check` and `python3 scripts/check_docs.py`: passed (74 Markdown files).
+- Empty diff for `crates/sandbox-guest` and `crates/sandbox-protocol` against guest checkpoint `04c3c1b` confirms that stack's source security fixes remain intact.
+
+Linux compilation reuses the existing clang/header shim and is type-check evidence only; it does not link or run Linux code. An invocation without the shim variables could not find `aarch64-linux-gnu-gcc`; restoring the existing shim configuration passed. The native TLS regression initially used generation 7, outside the warm protocol's generation-1 contract; correcting that test fixture passed without any guest/protocol change. Final disk availability was about 18 GiB; no cache or target was deleted and no concurrent heavy job was launched. The build slot is released.
 
 New regressions cover portable cleanup identity/claim/reporting-epoch fences, reclaim after crash/lost reply, adopted-member refusal, wire bounds, host-issued opaque-slot TLS identity; Linux host journal write poisoning, missing guardian evidence, retained identity budget and unknown-retire tombstones; and a dedicated-root Linux guardian absence/lock/path test that needs no KVM but remains opt-in.
 
