@@ -94,14 +94,20 @@ Before acknowledging or opening workload services, the guest writes the complete
 binding to private durable rootfs state in `/var/lib/hudson/member`: fsync file,
 fsync directory, atomic rename and fsync directory. A stable file lock excludes
 concurrent agent incarnations. A permanent incarnation marker pins bootstrap and
-boot ID. Partial writes and uncertain persistence fail closed. Restart in the
+boot ID. A durable attempt marker also refuses a missing committed binding. Retained
+files open with no-follow/nonblocking flags and must be regular, owned by the
+agent user, mode 0600 and at most 64 KiB; the state directory must be private
+mode 0700 under the same owner. Partial writes and uncertain persistence fail
+closed. Restart in the
 same boot retains binding; another boot or changed bootstrap is refused. No
 crash path deletes or resets binding state. The base image must have no retained
 member state, and the host must never repool a VM that has been bound.
 
 The member endpoint remains available for exact scope/identity retries after a
 lost acknowledgement; a changed request ID alone is harmless. Changed ownership
-or credentials are refused after binding. The endpoint expires with its member
+or credentials are refused after binding. Freshness comparisons use decoded
+certificate/key bytes, and the guest verifies the allocation certificate's CA,
+validity, server purpose and exact allocation DNS name before persistence. The endpoint expires with its member
 identity; allocation service uses its separate deadline. Ordinary authenticated
 allocation Hello remains required to establish command readiness. Binding is not
 execution or cleanup evidence. Guest root can compromise its own state and keys;
@@ -109,7 +115,8 @@ host ownership and no-repool rules remain authoritative.
 
 Portable adversarial tests are in
 [`sandbox-guest/tests/warm_bind.rs`](../crates/sandbox-guest/tests/warm_bind.rs).
-Compilation and execution are pending at initial draft publication under the
-shared build-slot restriction. Linux compilation, controlled KVM crash/restart,
+The [validation record](evidence/2026-10-31-guest-late-binding.md) records 13
+portable adversarial tests, the full native protocol/guest suite and strict
+native/Linux source checks. Controlled KVM crash/restart, linked Linux builds,
 vsock routing, host integration and measured cold/warm readiness remain gates;
 no latency or isolation qualification is claimed.
