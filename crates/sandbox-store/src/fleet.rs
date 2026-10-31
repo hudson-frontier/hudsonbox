@@ -27,6 +27,7 @@ impl Store {
             "SELECT jsonb_build_object(
                 'host_id',h.id,'epoch',h.supervisor_epoch,'status',h.status,
                 'retired',h.capacity_retired_at IS NOT NULL,
+                'capacity',jsonb_build_object('vcpu',h.cpu_capacity,'memory_mib',h.memory_capacity_mib,'disk_mib',h.disk_capacity_mib),
                 'heartbeat_age_seconds',greatest(0,extract(epoch FROM (now()-h.last_seen_at))),
                 'fresh',COALESCE(h.last_seen_at>now()-interval '30 seconds',false),
                 'ready',h.capacity_retired_at IS NULL AND h.status='ready' AND h.endpoint IS NOT NULL
@@ -62,10 +63,19 @@ impl Store {
              'project_quota_exceeded',count(*) FILTER (WHERE error->>'code'='project_quota_exceeded'),
              'no_ready_host',count(*) FILTER (WHERE error->>'code'='no_ready_host'),
              'no_compatible_host',count(*) FILTER (WHERE error->>'code'='no_compatible_host'))
-             FROM operations WHERE status='queued'")
+             FROM operations WHERE status='queued' AND kind='create'")
+            .fetch_one(&mut *tx).await?;
+        let rejections: Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'insufficient_capacity',count(*) FILTER (WHERE error->>'code'='insufficient_capacity'),
+                'project_quota_exceeded',count(*) FILTER (WHERE error->>'code'='project_quota_exceeded'),
+                'no_ready_host',count(*) FILTER (WHERE error->>'code'='no_ready_host'),
+                'no_compatible_host',count(*) FILTER (WHERE error->>'code'='no_compatible_host'),
+                'host_pool_access_denied',count(*) FILTER (WHERE error->>'code'='host_pool_access_denied'))
+             FROM operations WHERE kind='create' AND status='failed'")
             .fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok(serde_json::json!({"version":1,"hosts":hosts,"queue":queue}))
+        Ok(serde_json::json!({"version":1,"hosts":hosts,"queue":queue,"rejections":rejections}))
     }
 }
 
@@ -87,6 +97,18 @@ pub fn prometheus(status: &Value) -> String {
             status["queue"][key]
         ));
     }
+    for reason in [
+        "insufficient_capacity",
+        "project_quota_exceeded",
+        "no_ready_host",
+        "no_compatible_host",
+        "host_pool_access_denied",
+    ] {
+        let count = status["rejections"][reason].as_i64().unwrap_or(0);
+        out.push_str(&format!(
+            "hudsonbox_fleet_rejections{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
     if let Some(hosts) = status["hosts"].as_array() {
         for key in [
             "active_allocations",
@@ -98,6 +120,18 @@ pub fn prometheus(status: &Value) -> String {
         ] {
             let total: i64 = hosts.iter().filter_map(|h| h[key].as_i64()).sum();
             out.push_str(&format!("hudsonbox_fleet_{key} {total}\n"));
+        }
+        for category in ["capacity", "reserved", "available"] {
+            for resource in ["vcpu", "memory_mib", "disk_mib"] {
+                let total: i64 = hosts
+                    .iter()
+                    .filter(|h| category == "reserved" || h["retired"] == false)
+                    .filter_map(|h| h[category][resource].as_i64())
+                    .sum();
+                out.push_str(&format!(
+                    "hudsonbox_fleet_{category}{{resource=\"{resource}\"}} {total}\n"
+                ));
+            }
         }
         let lag = hosts
             .iter()
@@ -111,7 +145,7 @@ pub fn prometheus(status: &Value) -> String {
                     "retired" => h["retired"] == true,
                     "ready" => h["ready"] == true,
                     "draining" => h["retired"] == false && h["status"] == "draining",
-                    _ => h["retired"] == false && h["ready"] == false,
+                    _ => h["retired"] == false && h["ready"] == false && h["status"] != "draining",
                 })
                 .count();
             out.push_str(&format!(
@@ -120,4 +154,38 @@ pub fn prometheus(status: &Value) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prometheus;
+    use serde_json::json;
+
+    #[test]
+    fn fixed_labels_partition_hosts_and_exclude_tombstone_capacity() {
+        let status = json!({
+            "queue":{"queued":0,"oldest_age_seconds":0,"insufficient_capacity":0,
+                "project_quota_exceeded":0,"no_ready_host":0,"no_compatible_host":0},
+            "rejections":{"host_pool_access_denied":3,"private-user-value":99},
+            "hosts":[
+                {"host_id":"private-host","status":"draining","ready":false,"retired":false,
+                 "capacity":{"vcpu":4},"reserved":{"vcpu":2},"available":{"vcpu":2}},
+                {"host_id":"private-tombstone","status":"draining","ready":false,"retired":true,
+                 "capacity":{"vcpu":8},"reserved":{"vcpu":0},"available":{"vcpu":0}},
+                {"status":"ready","ready":true,"retired":false,"capacity":{"vcpu":4}},
+                {"status":"unhealthy","ready":false,"retired":false,"capacity":{"vcpu":4}}
+            ]
+        });
+        let text = prometheus(&status);
+        for state in ["ready", "unavailable", "retired", "draining"] {
+            assert!(text.contains(&format!("hudsonbox_fleet_hosts{{state=\"{state}\"}} 1\n")));
+        }
+        assert!(text.contains("hudsonbox_fleet_capacity{resource=\"vcpu\"} 12\n"));
+        assert!(text.contains("hudsonbox_fleet_reserved{resource=\"vcpu\"} 2\n"));
+        assert!(
+            text.contains("hudsonbox_fleet_rejections{reason=\"host_pool_access_denied\"} 3\n")
+        );
+        assert!(!text.contains("private-"));
+        assert!(!text.contains("null"));
+    }
 }

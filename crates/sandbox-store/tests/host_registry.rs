@@ -678,3 +678,66 @@ async fn stale_and_never_seen_hosts_are_not_fresh(pool: PgPool) {
             .is_none()
     );
 }
+
+/// Diagnostics use one read-only snapshot and omit transport/provider identities.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_snapshot_tracks_freshness_without_leaking_registration(pool: PgPool) {
+    let store = Store::from_pool(pool.clone());
+    let first = registered(&store, None, 61).await;
+    let second = registered(&store, None, 62).await;
+    observe(&store, first, 1).await;
+    store.finish_host_drain(first, 1).await.unwrap();
+    let before: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(hosts) FROM hosts ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let snapshot = store.fleet_status().await.unwrap();
+    let hosts = snapshot["hosts"].as_array().unwrap();
+    let a = hosts
+        .iter()
+        .find(|h| h["host_id"] == first.uuid().to_string())
+        .unwrap();
+    let b = hosts
+        .iter()
+        .find(|h| h["host_id"] == second.uuid().to_string())
+        .unwrap();
+    assert_eq!(a["ready"], true);
+    assert_eq!(b["ready"], false);
+    assert_eq!(b["status"], "draining");
+    assert_eq!(a["available"]["vcpu"], 4);
+    for h in hosts {
+        for field in [
+            "endpoint",
+            "transport_server_name",
+            "transport_certificate_sha256",
+            "provider_ref",
+            "capabilities",
+        ] {
+            assert!(h.get(field).is_none(), "unexpected private field {field}");
+        }
+    }
+    let after: Vec<Value> = sqlx::query_scalar("SELECT to_jsonb(hosts) FROM hosts ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "diagnostics must not refresh or mutate hosts"
+    );
+    sqlx::query(
+        "UPDATE hosts SET last_seen_at=clock_timestamp()-interval '31 seconds' WHERE id=$1",
+    )
+    .bind(first.uuid())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale = store.fleet_status().await.unwrap();
+    let a = stale["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["host_id"] == first.uuid().to_string())
+        .unwrap();
+    assert_eq!(a["fresh"], false);
+    assert_eq!(a["ready"], false);
+}

@@ -436,3 +436,25 @@ draining, or a new epoch alone never establishes physical fencing.
 
 Portable SQL/fake-host tests and Linux/KVM qualification are separate evidence. These
 read models establish neither physical isolation nor cross-host recovery qualification.
+
+### Fleet telemetry interpretation
+
+Placement queue gauges count queued **create** operations only; commands, uploads
+and cleanup operations do not represent demand for a new host. Rejection gauges
+count retained failed create records for the fixed placement reason vocabulary,
+including pool-access denial. They are database snapshots, not monotonic counters:
+retention may reduce them. Unknown error text never becomes a metric label.
+
+Host state gauges form an exclusive partition: retired, ready, draining, then
+unavailable. A stale draining host remains in the draining bucket; inspect its
+JSON freshness separately. Capacity totals exclude retired inventory tombstones.
+Reserved totals retain every unreleased charge, including runtime overhead and
+uncertain owners; available capacity is accounting headroom and does not promise
+that a host is eligible for placement. Readiness still requires compatible image,
+project pool authorization and request-specific capacity checks at placement.
+
+Validation added for telemetry cardinality, exclusive states, tombstone capacity,
+read-only two-host freshness transitions and project-read field redaction remains
+pending Rust/PostgreSQL execution until the shared heavy build slot is granted.
+The snapshot does not record per-host RPC failure history; missing freshness must
+not be presented as an RPC failure counter or as physical fencing evidence.
