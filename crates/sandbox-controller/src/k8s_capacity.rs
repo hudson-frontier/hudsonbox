@@ -67,6 +67,7 @@ impl HttpKubernetesApi {
             .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .timeout(std::time::Duration::from_secs(10))
             .tls_certs_only([reqwest::Certificate::from_pem(ca_pem).map_err(|_| Error::Invalid)?])
             .build()
@@ -164,6 +165,42 @@ impl KubernetesCapacityProvider {
         Self { api }
     }
 }
+// Conservative integer subset of Kubernetes Quantity: enough for the frozen
+// whole CPU/MiB envelope and its canonical serialization. Reject other formats.
+fn quantity(value: &str) -> Option<u128> {
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split].parse::<u128>().ok()?;
+    let scale = match &value[split..] {
+        "" => 1000,
+        "m" => 1,
+        "Ki" => 1024 * 1000,
+        "Mi" => 1024 * 1024 * 1000,
+        "Gi" => 1024 * 1024 * 1024 * 1000,
+        "Ti" => 1024_u128.pow(4) * 1000,
+        "k" => 1_000_000,
+        "M" => 1_000_000_000,
+        "G" => 1_000_000_000_000,
+        _ => return None,
+    };
+    number.checked_mul(scale)
+}
+fn spec_matches(expected: &Value, actual: &Value) -> bool {
+    match (expected, actual) {
+        (Value::Object(expected), Value::Object(actual)) if expected.is_empty() => {
+            actual.is_empty()
+        }
+        (Value::Object(expected), Value::Object(actual)) => expected
+            .iter()
+            .all(|(k, v)| actual.get(k).is_some_and(|a| spec_matches(v, a))),
+        (Value::Array(expected), Value::Array(actual)) => {
+            expected.len() == actual.len()
+                && expected.iter().zip(actual).all(|(e, a)| spec_matches(e, a))
+        }
+        _ => expected == actual,
+    }
+}
 fn verify(pod: &Value, desired: &Value, expected_uid: Option<&str>) -> Result<String, Error> {
     let uid = pod["metadata"]["uid"]
         .as_str()
@@ -172,7 +209,10 @@ fn verify(pod: &Value, desired: &Value, expected_uid: Option<&str>) -> Result<St
     if expected_uid.is_some_and(|expected| expected != uid)
         || pod["metadata"]["name"] != desired["metadata"]["name"]
         || pod["metadata"]["namespace"] != desired["metadata"]["namespace"]
-        || pod["metadata"]["annotations"] != desired["metadata"]["annotations"]
+        || !spec_matches(
+            &desired["metadata"]["annotations"],
+            &pod["metadata"]["annotations"],
+        )
         || !pod["metadata"]["finalizers"]
             .as_array()
             .is_some_and(|f| f.iter().any(|v| v == TOMBSTONE))
@@ -182,12 +222,62 @@ fn verify(pod: &Value, desired: &Value, expected_uid: Option<&str>) -> Result<St
     {
         return Err(Error::Conflict);
     }
-    // Admission may default fields, but may not change the frozen resource envelope.
-    if pod["spec"]["containers"][0]["image"] != desired["spec"]["containers"][0]["image"]
-        || pod["spec"]["containers"][0]["resources"]
-            != desired["spec"]["containers"][0]["resources"]
-        || pod["spec"]["restartPolicy"] != "Never"
-        || pod["spec"]["affinity"] != desired["spec"]["affinity"]
+    // Kubernetes defaults fields and canonicalizes quantities. Compare the
+    // frozen spec as a subset, but never allow extra containers/volumes or a
+    // changed command, credentials, affinity, privileges or budget.
+    let mut actual_spec = pod["spec"].clone();
+    let mut desired_spec = desired["spec"].clone();
+    let actual_resources = actual_spec["containers"][0]["resources"].take();
+    let desired_resources = desired_spec["containers"][0]["resources"].take();
+    for kind in ["requests", "limits"] {
+        let Some(resources) = desired_resources[kind].as_object() else {
+            return Err(Error::Conflict);
+        };
+        for (resource, expected) in resources {
+            let actual = actual_resources[kind][resource].as_str().and_then(quantity);
+            let expected = expected.as_str().and_then(quantity);
+            if actual.is_none() || actual != expected {
+                return Err(Error::Conflict);
+            }
+        }
+    }
+    // Canonical sizeLimit units and the built-in node-lifecycle tolerations
+    // are Kubernetes defaults, not edits to the frozen worker envelope.
+    let desired_volumes = desired_spec["volumes"].as_array().ok_or(Error::Conflict)?;
+    let actual_volumes = actual_spec["volumes"]
+        .as_array_mut()
+        .ok_or(Error::Conflict)?;
+    if desired_volumes.len() != actual_volumes.len() {
+        return Err(Error::Conflict);
+    }
+    for (desired, actual) in desired_volumes.iter().zip(actual_volumes) {
+        if let Some(expected) = desired["emptyDir"]["sizeLimit"].as_str() {
+            let actual_size = actual["emptyDir"]["sizeLimit"].as_str().and_then(quantity);
+            if actual_size.is_none() || actual_size != quantity(expected) {
+                return Err(Error::Conflict);
+            }
+            actual["emptyDir"]["sizeLimit"] = json!(expected);
+        }
+    }
+    if let Some(tolerations) = actual_spec["tolerations"].as_array_mut() {
+        tolerations.retain(|t| {
+            !matches!(
+                t["key"].as_str(),
+                Some("node.kubernetes.io/not-ready" | "node.kubernetes.io/unreachable")
+            )
+        });
+    }
+    if actual_spec["affinity"] != desired_spec["affinity"]
+        || actual_spec["hostNetwork"].as_bool() == Some(true)
+        || actual_spec["hostPID"].as_bool() == Some(true)
+        || actual_spec["hostIPC"].as_bool() == Some(true)
+        || actual_spec["initContainers"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        || actual_spec["ephemeralContainers"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty())
+        || !spec_matches(&desired_spec, &actual_spec)
     {
         return Err(Error::Conflict);
     }
@@ -261,6 +351,9 @@ impl HostDiscovery for KubernetesCapacityProvider {
             let ProviderConfig::K8s(config) = &pool.provider_config else {
                 return Err(DiscoveryError::WrongPoolType);
             };
+            if config.worker_label_selector != format!("{WORKER_LABEL}=true") {
+                return Err(DiscoveryError::InvalidConfig);
+            }
             if pool.credential_secret_ref.as_deref() != Some(self.api.credential_reference()) {
                 return Err(DiscoveryError::InvalidConfig);
             }

@@ -22,6 +22,13 @@ pub struct WorkerConfig {
     pub identity_secret: String,
     pub controller_certificate_sha256: String,
     pub server_certificate_sha256: String,
+    #[serde(default)]
+    pub output_reader_certificate_sha256: Vec<String>,
+    #[serde(default)]
+    pub file_reader_certificate_sha256: Vec<String>,
+    /// Immutable Secret with private config.json for the existing S3 output adapter.
+    #[serde(default)]
+    pub artifacts_secret: Option<String>,
     pub overhead_vcpu: u32,
     pub overhead_memory_mib: u64,
     pub overhead_disk_mib: u64,
@@ -107,6 +114,29 @@ impl WorkerConfig {
             .checked_add(self.overhead_disk_mib)
             .filter(|n| *n <= 1_073_741_824)
             .ok_or(Error::Invalid)?;
+        let architecture = match config.capabilities.architecture.as_str() {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            _ => return Err(Error::Invalid),
+        };
+        if self.output_reader_certificate_sha256.len() > 8
+            || self.file_reader_certificate_sha256.len() > 8
+            || self
+                .output_reader_certificate_sha256
+                .iter()
+                .chain(&self.file_reader_certificate_sha256)
+                .any(|pin| {
+                    pin.len() != 64
+                        || !pin.bytes().all(|b| b.is_ascii_hexdigit())
+                        || pin.eq_ignore_ascii_case(&self.controller_certificate_sha256)
+                })
+            || self
+                .artifacts_secret
+                .as_deref()
+                .is_some_and(|name| !label(name))
+        {
+            return Err(Error::Invalid);
+        }
         let resources = json!({"cpu":cpu.to_string(),"memory":format!("{memory}Mi"),"ephemeral-storage":format!("{disk}Mi")});
         if self.runtime.images.is_empty()
             || self.runtime.images.len() > 32
@@ -124,14 +154,14 @@ impl WorkerConfig {
         if host_json.len() > 32768 {
             return Err(Error::Invalid);
         }
-        Ok(json!({"apiVersion":"v1","kind":"Pod","metadata":{
+        let mut pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{
             "name":format!("hb-{}",request.host.uuid()),"namespace":namespace,
             "labels":{WORKER_LABEL:"true","hudsonbox.io/pool":pool.to_string()},
             "annotations":{"hudsonbox.io/host":request.host.to_string(),"hudsonbox.io/epoch":request.epoch.to_string(),"hudsonbox.io/certificate-sha256":self.server_certificate_sha256},
             "finalizers":[TOMBSTONE]},"spec":{
             "hostname":format!("hb-{}",request.host.uuid()),"subdomain":"hudsonbox-workers",
             "restartPolicy":"Never","automountServiceAccountToken":false,"terminationGracePeriodSeconds":120,
-            "nodeSelector":{"hudsonbox.io/kvm":"true","kubernetes.io/os":"linux","kubernetes.io/arch":config.capabilities.architecture},
+            "nodeSelector":{"hudsonbox.io/kvm":"true","kubernetes.io/os":"linux","kubernetes.io/arch":architecture},
             "tolerations":[{"key":"hudsonbox.io/kvm","operator":"Equal","value":"true","effect":"NoSchedule"}],
             "affinity":{"podAntiAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":[{
                 "labelSelector":{"matchLabels":{WORKER_LABEL:"true"}},"namespaceSelector":{},"topologyKey":"kubernetes.io/hostname"}]}},
@@ -150,7 +180,36 @@ impl WorkerConfig {
                 {"name":"state","emptyDir":{"sizeLimit":format!("{}Mi",config.capacity.disk_mib)}},
                 {"name":"tmp","emptyDir":{"sizeLimit":format!("{}Mi",self.overhead_disk_mib)}},
                 {"name":"kvm","hostPath":{"path":"/dev/kvm","type":"CharDevice"}},
-                {"name":"cgroup","hostPath":{"path":"/sys/fs/cgroup","type":"Directory"}}]}}))
+                {"name":"cgroup","hostPath":{"path":"/sys/fs/cgroup","type":"Directory"}}]}});
+        let args = pod["spec"]["containers"][0]["args"]
+            .as_array_mut()
+            .ok_or(Error::Invalid)?;
+        for (flag, pins) in [
+            (
+                "--output-reader-cert-sha256",
+                &self.output_reader_certificate_sha256,
+            ),
+            (
+                "--file-reader-cert-sha256",
+                &self.file_reader_certificate_sha256,
+            ),
+        ] {
+            for pin in pins {
+                args.extend([json!(flag), json!(pin)]);
+            }
+        }
+        if let Some(secret) = &self.artifacts_secret {
+            args.extend([json!("--output-config"), json!("/artifacts/config.json")]);
+            pod["spec"]["containers"][0]["volumeMounts"]
+                .as_array_mut()
+                .ok_or(Error::Invalid)?
+                .push(json!({"name":"artifacts","mountPath":"/artifacts","readOnly":true}));
+            pod["spec"]["volumes"]
+                .as_array_mut()
+                .ok_or(Error::Invalid)?
+                .push(json!({"name":"artifacts","secret":{"secretName":secret,"defaultMode":256}}));
+        }
+        Ok(pod)
     }
 }
 
@@ -170,6 +229,9 @@ pub(crate) async fn enroll(
     .await?;
     let provider: Value = row.try_get("provider_config")?;
     let namespace = provider["namespace"].as_str().ok_or(Error::Invalid)?;
+    if provider["worker_label_selector"] != format!("{WORKER_LABEL}=true") {
+        return Err(Error::Invalid);
+    }
     // Account for existing hosts, including standalone inventory if a DB was misconfigured.
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM (SELECT id FROM hosts WHERE host_pool_id=$1 AND capacity_retired_at IS NULL UNION SELECT host_id FROM k8s_workers WHERE host_pool_id=$1 AND NOT retired) inventory",
@@ -212,6 +274,12 @@ pub struct Effect {
     pub retired: bool,
 }
 impl Store {
+    /// Include irreversibly closed hosts whose external retirement is uncertain.
+    pub async fn k8s_capacity_inventory(&self, pool: Uuid) -> Result<u32, Error> {
+        let count:i64=sqlx::query_scalar("SELECT count(*) FROM (SELECT id FROM hosts WHERE host_pool_id=$1 AND capacity_retired_at IS NULL UNION SELECT host_id FROM k8s_workers WHERE host_pool_id=$1 AND NOT retired) inventory")
+            .bind(pool).fetch_one(self.pool()).await?;
+        u32::try_from(count).map_err(|_| Error::Invalid)
+    }
     /// Re-read authoritative input, freeze irreversible retirement before dispatch.
     /// No provider result, timeout or missing Pod releases sandbox reservations.
     pub async fn prepare_k8s_capacity(&self, claim: &Claim) -> Result<Effect, Error> {

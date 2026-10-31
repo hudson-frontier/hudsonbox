@@ -7,7 +7,8 @@ cloud provisioning or installation is introduced. A supervisor Pod runs multiple
 Firecracker microVMs; customer code runs inside their guest kernels.
 
 This is an operator integration, not a qualified cluster installer. The reviewed
-[capacity policy skeleton](../deploy/kubernetes/capacity-policy.yaml) and generated
+[capacity policy skeleton](../deploy/kubernetes/capacity-policy.yaml),
+[static worker security/mount example](../deploy/kubernetes/worker-envelope.example.yaml) and generated
 [Pod envelope](../crates/sandbox-store/src/k8s_capacity.rs) require a separately
 built digest-pinned Linux worker image and compatible, dedicated KVM nodes. No
 cluster or KVM was available for this change. Do not treat portable tests as an
@@ -83,8 +84,12 @@ The supervisor remains root for jailer, namespaces, mounts and cgroup setup;
 explicit review boundaries. The root filesystem is read-only. Allocation state
 and temporary files have separate bounded emptyDir volumes. No host state or
 allocation directory is inherited on replacement. There is no host PID/network
-namespace or host-network guest NIC in this skeleton. Artifact credentials and
-network-enabled guests require separate reviewed integration.
+namespace or host-network guest NIC in this skeleton. Optional distinct API output/file reader certificate pins enable the existing
+read-only gRPC services. `artifacts_secret` optionally mounts a private
+`config.json` and passes the existing `--output-config` flag for S3 artifacts;
+review matching network destinations and Secret lifetime before use. These are
+versioned Secret references, never credential bytes in durable intent.
+Network-enabled guests require separate reviewed integration.
 
 There is no `compute_nodes` accounting model yet. Required Pod anti-affinity on
 `kubernetes.io/hostname`, with an all-namespace selector for the common worker
@@ -105,7 +110,8 @@ usable KVM: a separately configured external autoscaler must supply eligible nod
 selects the exact pool and reports observed identities through the existing
 provider router. Discovery never opens admission. A headless Service and each
 Pod's hostname/subdomain give a direct per-worker endpoint; issue its certificate
-for `hb-UUID.hudsonbox-workers.NAMESPACE.svc`, with the frozen certificate pin.
+for the existing registry SAN `host-UUID.sandbox.internal`, with the frozen
+certificate pin. The endpoint hostname and authenticated server name are distinct.
 Set the host transport using that endpoint, pin and `k8s/NAMESPACE/NAME/UID`
 provider reference; approve only after authenticated supervisor health matches
 the enrolled epoch/capabilities. This uses the same gRPC/mTLS paths as standalone,
@@ -142,7 +148,7 @@ report unknown outcomes, never infer safe replay/recovery from Pod absence.
 
 [Common portable fleet qualification PR #213](https://github.com/hudson-frontier/hudsonbox/pull/213)
 is the #198 source for shared routing/isolation/recovery tests (head
-`16cd6afbc53a7baf02646c377bddfa4b493411d5` at handoff). This adapter is stacked on
+`659e85acd05f8ef7434df4d890d0f4c2e4ee5d82` at handoff). This adapter is stacked on
 #209 `f820ddf`, which includes #211/#212, without duplicating #213's harness.
 The focused fake Kubernetes integration tests exercise durable effects with real
 PostgreSQL and simulated API responses. They do not test scheduling, RBAC

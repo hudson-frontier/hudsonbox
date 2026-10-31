@@ -295,6 +295,13 @@ impl Store {
         if value.status != "draining" {
             return Err(Error::Conflict);
         }
+        // A Kubernetes worker is not usable capacity until its original Pod UID
+        // is durably acknowledged. A pending/unknown create cannot open admission.
+        let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM k8s_workers w JOIN capacity_operations c ON c.id=w.provision_operation_id WHERE w.host_id=$1 AND (c.status<>'succeeded' OR w.pod_uid IS NULL OR w.retired))")
+            .bind(host.uuid()).fetch_one(&mut *tx).await?;
+        if pending {
+            return Err(Error::Outstanding);
+        }
         let fresh: bool = sqlx::query_scalar("SELECT COALESCE(last_seen_at>clock_timestamp()-interval '30 seconds',false) FROM hosts WHERE id=$1")
             .bind(host.uuid()).fetch_one(&mut *tx).await?;
         if value.outstanding_allocations != 0 || !fresh {
