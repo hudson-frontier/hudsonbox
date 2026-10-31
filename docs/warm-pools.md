@@ -82,6 +82,10 @@ Review regressions in the same file: an image removed from the allowlist after p
 
 ## Previous-epoch unused-member cleanup
 
+The [portable PR #216 validation record](evidence/2026-10-31-previous-warm-cleanup-validation.md)
+records exact tested source, 27 focused tests, authenticated controller restart
+and reporting-epoch regressions, and remaining real-host gates.
+
 `PreviousRetireIntent` is a distinct version-1 envelope sent through `RetireWarmMember`: it carries the original `RetireIntent` unchanged plus a strictly newer `reporting_epoch`. The controller routes only to that host's authenticated current incarnation. An older supervisor rejects the envelope. A reply must be `WarmReceipt::PreviousCleanup`, echo the whole request (including operation ID and revision), and contain a destruction receipt for the original member, VM name and epoch. The store rechecks the live capacity-operation fence and locks the host to confirm the reporting epoch is still current before releasing the member reservation. This path never returns an old allocation to cold-create; allocation owner-loss reconciliation retains authority over it.
 
 The fake's explicit `retain_warm_members_from` test helper fences the old warm handle and copies its member evidence into a newer same-host fake. Previous cleanup requires a retained record at the exact original epoch and refuses adopted members, unknown members, changed names, and wrong reporting epochs. A fresh fake with no retained records cannot attest old-member absence. This helper models retained evidence in memory; it is not durable restart or Linux/KVM evidence. Retire retries remain bounded; exhausted cleanup keeps reservations held.
