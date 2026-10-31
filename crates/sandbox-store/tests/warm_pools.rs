@@ -996,3 +996,242 @@ async fn crash_on_final_prepare_attempt_is_retired_by_upkeep_with_reservation_he
     );
     assert_accounted(&pool).await;
 }
+
+/// Everything a denied warm claim must leave untouched: every member's state,
+/// link and claim revision, live allocations, and per-host reserved resources
+/// (warm reservations and allocations both consume host capacity).
+#[derive(Debug, PartialEq, Eq)]
+struct Ledger {
+    members: Vec<(Uuid, String, Option<Uuid>, i64)>,
+    live_allocations: Vec<(Uuid, Uuid)>,
+    host_use: Vec<(Uuid, i64, i64, i64)>,
+}
+
+async fn ledger(pool: &PgPool) -> Ledger {
+    let members = sqlx::query_as(
+        "SELECT id,state,claimed_allocation_id,claim_revision FROM warm_pool_members ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let live_allocations = sqlx::query_as(
+        "SELECT id,project_id FROM allocations WHERE released_at IS NULL ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let host_use = sqlx::query_as(
+        "SELECT h.id,COALESCE(sum(r.vcpu),0)::bigint,COALESCE(sum(r.memory_mib),0)::bigint,
+         COALESCE(sum(r.disk_mib),0)::bigint FROM hosts h LEFT JOIN (
+           SELECT host_id,vcpu::bigint AS vcpu,memory_mib,disk_mib
+             FROM allocations WHERE released_at IS NULL
+           UNION ALL SELECT host_id,vcpu::bigint,memory_mib,disk_mib
+             FROM warm_pool_members WHERE state IN ('preparing','ready','retiring')
+         ) r ON r.host_id=h.id GROUP BY h.id ORDER BY h.id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    Ledger {
+        members,
+        live_allocations,
+        host_use,
+    }
+}
+
+/// The sandbox behind a denied claim gained no allocation and is still creating.
+async fn assert_unplaced(pool: &PgPool, claim: &Claim) {
+    let (allocation, observed): (Option<Uuid>, String) = sqlx::query_as(
+        "SELECT s.current_allocation_id,s.observed_state FROM sandboxes s
+         JOIN operations o ON o.sandbox_id=s.id WHERE o.id=$1",
+    )
+    .bind(claim.operation_id.uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!((allocation, observed.as_str()), (None, "creating"));
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn ungranted_project_cannot_claim_shared_policy(pool: PgPool) {
+    // Shared host pool, shared template, owner-less policy: the only thing the
+    // ungranted project lacks is the host-pool grant.
+    let f = fixture(&pool, 4, 1).await;
+    stock(&f.store, f.policy, 1).await;
+    let (ungranted, ungranted_token) = project(&pool, json!({})).await;
+    let before = ledger(&pool).await;
+    let c = create(&f.store, ungranted, &ungranted_token).await;
+    assert_eq!(
+        f.store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::None
+    );
+    // The cold fallback names the missing grant.
+    assert!(matches!(
+        f.store.place_create(&c, HostScope::Fleet).await,
+        Err(PlacementError::NoPoolAccess)
+    ));
+    assert_eq!(ledger(&pool).await, before);
+    assert_eq!(states(&pool, f.policy).await, ["ready"]);
+    assert_unplaced(&pool, &c).await;
+    // Control: the member was claimable, by the granted project.
+    let c = create(&f.store, f.project, &f.token).await;
+    assert!(matches!(
+        f.store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::Claimed(_)
+    ));
+    assert_accounted(&pool).await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn revoked_grant_after_policy_denies_claim(pool: PgPool) {
+    // The grant existed when the policy was written and the member prepared;
+    // the claim must re-check it rather than trust the policy.
+    let f = fixture(&pool, 4, 1).await;
+    stock(&f.store, f.policy, 1).await;
+    let c = create(&f.store, f.project, &f.token).await;
+    // There is no revoke API (grants only grow); remove the grant directly, as
+    // the controller's no-grant tests do.
+    let removed =
+        sqlx::query("DELETE FROM project_host_pool_access WHERE project_id=$1 AND host_pool_id=$2")
+            .bind(f.project.uuid())
+            .bind(f.shared)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .rows_affected();
+    assert_eq!(removed, 1);
+    let before = ledger(&pool).await;
+    assert_eq!(
+        f.store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::None
+    );
+    assert!(matches!(
+        f.store.place_create(&c, HostScope::Fleet).await,
+        Err(PlacementError::NoPoolAccess)
+    ));
+    assert_eq!(ledger(&pool).await, before);
+    assert_eq!(states(&pool, f.policy).await, ["ready"]);
+    assert_unplaced(&pool, &c).await;
+    // Control: restoring the grant makes the same member claimable by the
+    // same create.
+    f.store
+        .grant_host_pool_access(f.project, f.shared)
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::Claimed(_)
+    ));
+    assert_eq!(states(&pool, f.policy).await, ["claiming"]);
+    assert_accounted(&pool).await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn vcpu_memory_disk_quota_denies_warm_claim(pool: PgPool) {
+    // The member is 1 vCPU / 512 MiB / 1024 MiB. Each project is one unit
+    // short on exactly one resource and at the default on everything else.
+    let f = fixture(&pool, 4, 1).await;
+    stock(&f.store, f.policy, 1).await;
+    for limits in [
+        json!({"vcpu":0}),
+        json!({"memory_mib":511}),
+        json!({"disk_mib":1023}),
+    ] {
+        let (p, token) = project(&pool, limits.clone()).await;
+        f.store.grant_host_pool_access(p, f.shared).await.unwrap();
+        let before = ledger(&pool).await;
+        let c = create(&f.store, p, &token).await;
+        assert!(
+            matches!(
+                f.store.claim_warm_member(&c, &images()).await,
+                Err(Error::Quota)
+            ),
+            "{limits}"
+        );
+        // Cold placement applies the same quota.
+        assert!(
+            matches!(
+                f.store.place_create(&c, HostScope::Fleet).await,
+                Err(PlacementError::Quota)
+            ),
+            "{limits}"
+        );
+        assert_eq!(ledger(&pool).await, before, "{limits}");
+        assert_eq!(states(&pool, f.policy).await, ["ready"], "{limits}");
+        assert_unplaced(&pool, &c).await;
+    }
+    // Control: limits exactly equal to the request are not a denial.
+    let (p, token) = project(
+        &pool,
+        json!({"sandboxes":1,"vcpu":1,"memory_mib":512,"disk_mib":1024}),
+    )
+    .await;
+    f.store.grant_host_pool_access(p, f.shared).await.unwrap();
+    let c = create(&f.store, p, &token).await;
+    assert!(matches!(
+        f.store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::Claimed(_)
+    ));
+    assert_accounted(&pool).await;
+}
+
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn dedicated_pool_member_never_claimed_by_other_granted_project(pool: PgPool) {
+    // Both projects are granted the host pool and the template is shared, so
+    // the dedicated policy's owner is the only thing separating them.
+    let store = Store::from_pool(pool.clone());
+    let shared = host_pool(&store, "shared", Tenancy::Shared).await;
+    host(&pool, shared, 8).await;
+    let (owner, owner_token) = project(&pool, json!({})).await;
+    let (other, other_token) = project(&pool, json!({})).await;
+    for p in [owner, other] {
+        store.grant_host_pool_access(p, shared).await.unwrap();
+    }
+    let t = template(None, Publication::Shared, "node");
+    store.put_sandbox_template(&t).await.unwrap();
+    let dedicated = policy(t.id, shared, Some(owner), 2);
+    store.put_warm_pool_policy(&dedicated).await.unwrap();
+    stock(&store, dedicated.id, 2).await;
+    let before = ledger(&pool).await;
+    // Repeated attempts (and a duplicated worker) never reach a member.
+    for _ in 0..3 {
+        let c = create(&store, other, &other_token).await;
+        assert_eq!(
+            store.claim_warm_member(&c, &images()).await.unwrap(),
+            Claimed::None
+        );
+        assert_eq!(
+            store.claim_warm_member(&c, &images()).await.unwrap(),
+            Claimed::None
+        );
+        assert_unplaced(&pool, &c).await;
+    }
+    assert_eq!(ledger(&pool).await, before);
+    assert_eq!(states(&pool, dedicated.id).await, ["ready", "ready"]);
+    // Control: the owner claims a member, and the other project still cannot
+    // take the remaining one.
+    let c = create(&store, owner, &owner_token).await;
+    assert!(matches!(
+        store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::Claimed(_)
+    ));
+    let c = create(&store, other, &other_token).await;
+    assert_eq!(
+        store.claim_warm_member(&c, &images()).await.unwrap(),
+        Claimed::None
+    );
+    let mut s = states(&pool, dedicated.id).await;
+    s.sort();
+    assert_eq!(s, ["claiming", "ready"]);
+    let foreign: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM warm_pool_members m JOIN allocations a ON a.id=m.claimed_allocation_id
+         WHERE m.pool_id=$1 AND a.project_id<>$2",
+    )
+    .bind(dedicated.id)
+    .bind(owner.uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(foreign, 0);
+    assert_accounted(&pool).await;
+}
