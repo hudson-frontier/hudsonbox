@@ -92,7 +92,11 @@ impl Store {
              'project_quota_exceeded',count(*) FILTER (WHERE error->>'code'='project_quota_exceeded'),
              'no_ready_host',count(*) FILTER (WHERE error->>'code'='no_ready_host'),
              'no_compatible_host',count(*) FILTER (WHERE error->>'code'='no_compatible_host'))
-             FROM operations WHERE status='queued' AND kind='create'")
+             FROM operations o WHERE kind='create' AND attempt_count=0
+                AND attempt_receipts='[]'::jsonb
+                AND (status='queued' OR (status='running' AND phase='awaiting_placement'
+                    AND lease_expires_at IS NULL))
+                AND NOT EXISTS (SELECT 1 FROM allocations a WHERE a.sandbox_id=o.sandbox_id)")
             .fetch_one(&mut *tx).await?;
         let rejections: Value = sqlx::query_scalar(
             "SELECT jsonb_build_object(

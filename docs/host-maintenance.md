@@ -441,7 +441,9 @@ read models establish neither physical isolation nor cross-host recovery qualifi
 
 ### Fleet telemetry interpretation
 
-Placement queue gauges count queued **create** operations only; commands, uploads
+Placement queue gauges count queued **create** operations and lease-free running
+creates in `awaiting_placement`, only with zero dispatch attempts, empty attempt
+receipts and no allocation. Dispatched running/unknown work, commands, uploads
 and cleanup operations do not represent demand for a new host. Rejection gauges
 count retained failed create records for the fixed placement reason vocabulary,
 including pool-access denial. They are database snapshots, not monotonic counters:
