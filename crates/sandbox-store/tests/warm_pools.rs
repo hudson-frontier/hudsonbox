@@ -997,6 +997,115 @@ async fn crash_on_final_prepare_attempt_is_retired_by_upkeep_with_reservation_he
     assert_accounted(&pool).await;
 }
 
+/// Migration 0031: the claim binding is one-way and only a prepare receipt
+/// makes a member ready, whatever SQL a future code path issues.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn trigger_refuses_detaching_claims_and_re_readying_members(pool: PgPool) {
+    async fn refused(pool: &PgPool, sql: &str, member: Uuid, message: &str) {
+        let err = sqlx::query(sql)
+            .bind(member)
+            .execute(pool)
+            .await
+            .unwrap_err();
+        let db = err.as_database_error().expect("database error");
+        assert!(db.message().contains(message), "{sql}: {}", db.message());
+    }
+    const DETACH: &str = "claimed_allocation_id is immutable";
+    const READY: &str = "enter ready only from preparing";
+    let f = fixture(&pool, 2, 2).await;
+    stock(&f.store, f.policy, 2).await;
+    let claim = create(&f.store, f.project, &f.token).await;
+    let Claimed::Claimed(h) = f.store.claim_warm_member(&claim, &images()).await.unwrap() else {
+        panic!()
+    };
+    let claimed = h.intent.member_id;
+    let allocation = h.allocation.id.uuid();
+    let other: Uuid =
+        sqlx::query_scalar("SELECT id FROM warm_pool_members WHERE pool_id=$1 AND id<>$2")
+            .bind(f.policy)
+            .bind(claimed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // Clearing or rebinding the claim is refused before any other check.
+    refused(
+        &pool,
+        "UPDATE warm_pool_members SET state='retiring',claimed_allocation_id=NULL WHERE id=$1",
+        claimed,
+        DETACH,
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE warm_pool_members SET claimed_allocation_id=gen_random_uuid() WHERE id=$1",
+        claimed,
+        DETACH,
+    )
+    .await;
+    refused(
+        &pool,
+        "UPDATE warm_pool_members SET state='ready',lease_expires_at=clock_timestamp()+interval '1 hour'
+         WHERE id=$1",
+        claimed,
+        READY,
+    )
+    .await;
+    // Adoption keeps the claim; the assigned member still cannot re-pool.
+    f.store
+        .record_warm_handoff(&claim, &handoff(&h, adopted()))
+        .await
+        .unwrap();
+    for sql in [
+        "UPDATE warm_pool_members SET claimed_allocation_id=NULL WHERE id=$1",
+        "UPDATE warm_pool_members SET state='ready',claimed_allocation_id=NULL,
+         lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+    ] {
+        refused(&pool, sql, claimed, DETACH).await;
+    }
+    let row: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state,claimed_allocation_id FROM warm_pool_members WHERE id=$1")
+            .bind(claimed)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row, ("assigned".into(), Some(allocation)));
+    // An unclaimed ready member may refresh in place, but once retiring it is
+    // never readied again.
+    sqlx::query(
+        "UPDATE warm_pool_members SET lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE warm_pool_members SET state='retiring' WHERE id=$1")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    refused(
+        &pool,
+        "UPDATE warm_pool_members SET state='ready' WHERE id=$1",
+        other,
+        READY,
+    )
+    .await;
+    // Members are born unclaimed and preparing.
+    refused(
+        &pool,
+        "INSERT INTO warm_pool_members(id,pool_id,host_id,supervisor_epoch,template_id,vcpu,memory_mib,
+         disk_mib,state,vm_ref,prepare_receipt,lease_expires_at)
+         SELECT gen_random_uuid(),pool_id,host_id,supervisor_epoch,template_id,vcpu,memory_mib,disk_mib,
+         'ready',vm_ref,prepare_receipt,clock_timestamp()+interval '1 hour' FROM warm_pool_members WHERE id=$1",
+        other,
+        "unclaimed preparing reservation",
+    )
+    .await;
+    let mut states = states(&pool, f.policy).await;
+    states.sort();
+    assert_eq!(states, ["assigned", "retiring"]);
+}
+
 async fn fleet_host(store: &Store, host: HostId) -> serde_json::Value {
     store.fleet_status().await.unwrap()["hosts"]
         .as_array()
