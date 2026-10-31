@@ -186,6 +186,7 @@ impl Host {
                     disk_mib: 64,
                     expires_unix_ms: guardian::wall_ms() + 1000,
                 },
+                member: None,
             }
             .validate()?;
         }
@@ -416,6 +417,7 @@ impl Host {
                 disk_mib: r.disk_mib,
                 expires_unix_ms: request.allocation_expires_unix_ms,
             },
+            member: None,
         })
     }
     fn admit(
@@ -425,9 +427,8 @@ impl Host {
         manifest: Manifest,
     ) -> Result<Record, Status> {
         let mut j = self.journal()?;
-        let mut cpu = 0u64;
-        let mut memory = 0u64;
-        let mut disk = 0u64;
+        // Unadopted warm members reserve capacity exactly like allocations.
+        let (mut cpu, mut memory, mut disk) = Self::warm_held(&j);
         for (id, r) in &j.records {
             if id != &o.allocation_id
                 && r.owner.sandbox_id == o.sandbox_id
@@ -620,42 +621,11 @@ impl Host {
         }
         // Never unshare a multithreaded server. The separate single-threaded
         // executable owns namespace setup and the child guardian.
-        let child = Command::new(&self.inner.config.guardian_binary)
-            .arg("--manifest")
-            .arg(manifest.directory().join("manifest.json"))
-            .arg("run")
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match child {
-            Ok(mut child) => {
-                let allocation = o.allocation_id.clone();
-                std::thread::spawn(move || match child.wait() {
-                    Ok(status) if !status.success() => {
-                        eprintln!(
-                            "sandbox guardian exited unexpectedly for allocation {allocation}: {status:?}"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        eprintln!(
-                            "could not wait for sandbox guardian for allocation {allocation}: {error}"
-                        );
-                    }
-                });
-            }
-            Err(error) => {
-                eprintln!(
-                    "could not launch sandbox guardian for allocation {}: {error}",
-                    o.allocation_id
-                );
-                self.stopped(&o.allocation_id)?;
-                record.stopped = true;
-                let (s, r) = self.observe_record(&record)?;
-                return Ok(self.observation(o, &record, s, r));
-            }
+        if !self.spawn_guardian(&manifest, format!("allocation {}", o.allocation_id)) {
+            self.stopped(&o.allocation_id)?;
+            record.stopped = true;
+            let (s, r) = self.observe_record(&record)?;
+            return Ok(self.observation(o, &record, s, r));
         }
         // Give the child time to acquire ownership. Do not reconcile Prepared here:
         // a delayed spawn is still an in-flight effect of this accepted request.
@@ -834,6 +804,7 @@ impl Host {
             {
                 let _ = host.observe_record(&record);
             }
+            let _ = host.reconcile_member();
             Ok(())
         })
         .await
@@ -845,7 +816,9 @@ impl Supervisor for Host {
         &self,
         request: Request<sandbox_protocol::supervisor::WarmPrepareRequest>,
     ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
-        self.warm_prepare_sync(request.into_inner())
+        let request = request.into_inner();
+        self.work(move |host| host.warm_prepare_sync(request))
+            .await
             .map(Response::new)
     }
 
@@ -853,7 +826,9 @@ impl Supervisor for Host {
         &self,
         request: Request<sandbox_protocol::supervisor::WarmAdoptRequest>,
     ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
-        self.warm_handoff_sync(request.into_inner())
+        let request = request.into_inner();
+        self.work(move |host| host.warm_handoff_sync(request, false))
+            .await
             .map(Response::new)
     }
 
@@ -861,7 +836,9 @@ impl Supervisor for Host {
         &self,
         request: Request<sandbox_protocol::supervisor::WarmAdoptRequest>,
     ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
-        self.warm_handoff_sync(request.into_inner())
+        let request = request.into_inner();
+        self.work(move |host| host.warm_handoff_sync(request, true))
+            .await
             .map(Response::new)
     }
 
@@ -869,7 +846,9 @@ impl Supervisor for Host {
         &self,
         request: Request<sandbox_protocol::supervisor::WarmRetireRequest>,
     ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
-        self.warm_retire_sync(request.into_inner())
+        let request = request.into_inner();
+        self.work(move |host| host.warm_retire_sync(request))
+            .await
             .map(Response::new)
     }
 
