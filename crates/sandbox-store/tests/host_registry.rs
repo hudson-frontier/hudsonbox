@@ -792,6 +792,11 @@ async fn fleet_rpc_counts_are_epoch_fenced_and_history_does_not_exhaust_active_b
     let snapshot = store.fleet_status().await.unwrap();
     assert_eq!(snapshot["hosts"].as_array().unwrap().len(), 1);
     assert_eq!(snapshot["hosts"][0]["host_id"], b.uuid().to_string());
+    // Tombstones are counted (`a` plus the bulk history), never enumerated.
+    assert_eq!(snapshot["retired_hosts"], 10002);
+    let metrics = sandbox_store::fleet::prometheus(&snapshot);
+    assert!(metrics.contains("hudsonbox_fleet_hosts{state=\"retired\"} 10002\n"));
+    assert!(!metrics.contains(&a.uuid().to_string()));
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]

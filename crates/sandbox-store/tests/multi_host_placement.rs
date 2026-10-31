@@ -863,3 +863,83 @@ async fn fleet_queue_tracks_real_placement_wait_and_excludes_dispatched_work(poo
     assert_eq!(store.fleet_status().await.unwrap()["queue"]["queued"], 2);
     assert_eq!(snapshot["hosts"][0]["host_id"], only.uuid().to_string());
 }
+
+/// Rejection gauges reflect failed create records by fixed reason and leave
+/// the placement queue; the Prometheus rendering uses only that vocabulary.
+#[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+async fn fleet_rejections_reflect_failed_creates_by_reason(pool: PgPool) {
+    use sandbox_store::dispatch::CreateRejection;
+    let store = Store::from_pool(pool.clone());
+    let shared = host_pool(&store, "rejections", Tenancy::Shared).await;
+    host(&pool, shared, 1).await;
+    let (granted, granted_token) = project(&pool).await;
+    store.grant_host_pool_access(granted, shared).await.unwrap();
+    let (denied, denied_token) = project(&pool).await;
+    let zero = store.fleet_status().await.unwrap();
+    assert_eq!(
+        zero["rejections"],
+        json!({"insufficient_capacity":0,"project_quota_exceeded":0,"no_ready_host":0,
+            "no_compatible_host":0,"host_pool_access_denied":0})
+    );
+    assert_eq!(zero["queue"]["queued"], 0);
+    assert_eq!(zero["queue"]["oldest_age_seconds"], 0);
+
+    // No pool grant: never retried, rejected before dispatch.
+    let no_access = create(&store, denied, &denied_token).await;
+    assert!(matches!(
+        store.place_create(&no_access, HostScope::Fleet).await,
+        Err(PlacementError::NoPoolAccess)
+    ));
+    store
+        .reject_undispatched_create(&no_access, CreateRejection::HostPoolAccessDenied)
+        .await
+        .unwrap();
+
+    // Capacity wait past the bound fails with the waiting reason.
+    let holder = create(&store, granted, &granted_token).await;
+    store.place_create(&holder, HostScope::Fleet).await.unwrap();
+    let starved = create(&store, granted, &granted_token).await;
+    sqlx::query(
+        "UPDATE operations SET created_at=clock_timestamp()-make_interval(secs => $2) WHERE id=$1",
+    )
+    .bind(starved.operation_id.uuid())
+    .bind((sandbox_store::placement::PLACEMENT_WAIT_SECONDS + 1) as f64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let wait = store
+        .place_create(&starved, HostScope::Fleet)
+        .await
+        .unwrap_err()
+        .wait_reason()
+        .unwrap();
+    assert_eq!(
+        store.await_placement(&starved, wait).await.unwrap(),
+        WaitOutcome::Expired
+    );
+    store
+        .reject_undispatched_create(&starved, wait.rejection())
+        .await
+        .unwrap();
+
+    let snapshot = store.fleet_status().await.unwrap();
+    assert_eq!(
+        snapshot["rejections"],
+        json!({"insufficient_capacity":1,"project_quota_exceeded":0,"no_ready_host":0,
+            "no_compatible_host":0,"host_pool_access_denied":1})
+    );
+    assert_eq!(
+        snapshot["queue"]["queued"], 0,
+        "failed and placed creates are not demand"
+    );
+    let metrics = sandbox_store::fleet::prometheus(&snapshot);
+    for line in [
+        "hudsonbox_fleet_rejections{reason=\"insufficient_capacity\"} 1\n",
+        "hudsonbox_fleet_rejections{reason=\"host_pool_access_denied\"} 1\n",
+        "hudsonbox_fleet_rejections{reason=\"no_ready_host\"} 0\n",
+        "hudsonbox_fleet_queue_queued 0\n",
+    ] {
+        assert!(metrics.contains(line), "{line}");
+    }
+    assert!(!metrics.contains(&granted.uuid().to_string()));
+}
