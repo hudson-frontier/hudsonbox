@@ -12,6 +12,64 @@ use tokio::{
     net::UnixStream,
 };
 
+/// Open one stream to a guest vsock port through Firecracker's hybrid
+/// Unix-socket CONNECT handshake. Authentication is the caller's TLS.
+async fn connect_vsock(socket: &std::path::Path, port: u32) -> Result<UnixStream> {
+    use std::os::unix::fs::FileTypeExt;
+    ensure!(
+        std::fs::symlink_metadata(socket)?.file_type().is_socket(),
+        "guest endpoint is not a Unix socket"
+    );
+    let mut socket = UnixStream::connect(socket).await?;
+    socket
+        .write_all(format!("CONNECT {port}\n").as_bytes())
+        .await?;
+    let mut reply = Vec::new();
+    for _ in 0..16 {
+        let b = socket.read_u8().await?;
+        reply.push(b);
+        if b == b'\n' {
+            break;
+        }
+    }
+    let reply = std::str::from_utf8(&reply)?;
+    let assigned = reply
+        .strip_prefix("OK ")
+        .and_then(|s| s.strip_suffix('\n'))
+        .context("invalid Firecracker CONNECT acknowledgement")?;
+    ensure!(
+        !assigned.is_empty()
+            && assigned.bytes().all(|b| b.is_ascii_digit())
+            && assigned.parse::<u32>()? > 0,
+        "invalid assigned vsock port"
+    );
+    Ok(socket)
+}
+
+/// One authenticated call to an unbound warm member's bind endpoint
+/// ([`MEMBER_PORT`](sandbox_protocol::warm_bind::MEMBER_PORT)) through the
+/// operator-owned jail directory. No automatic retry.
+#[cfg(target_os = "linux")]
+pub async fn member_call(
+    directory: PathBuf,
+    tls: &ClientTls,
+    request: &sandbox_protocol::warm_bind::MemberRequest,
+) -> Result<sandbox_protocol::warm_bind::MemberResponse> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    ensure!(directory.is_absolute(), "absolute guest directory required");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits() as i32)
+        .open(directory)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}/vsock.sock", file.as_raw_fd()));
+    tokio::time::timeout(wire::CONNECTION_TIMEOUT, async {
+        let socket = connect_vsock(&path, sandbox_protocol::warm_bind::MEMBER_PORT).await?;
+        sandbox_protocol::warm_bind::member_call(tls, socket, request).await
+    })
+    .await
+    .context("member call uncertain: connection deadline")?
+}
+
 #[derive(Debug, Clone)]
 pub struct GuestClient {
     socket: PathBuf,
@@ -67,36 +125,7 @@ impl GuestClient {
             "discover and bind guest boot identity before commands"
         );
         tokio::time::timeout(wire::CONNECTION_TIMEOUT, async {
-            use std::os::unix::fs::FileTypeExt;
-            ensure!(
-                std::fs::symlink_metadata(&self.socket)?
-                    .file_type()
-                    .is_socket(),
-                "guest endpoint is not a Unix socket"
-            );
-            let mut socket = UnixStream::connect(&self.socket).await?;
-            socket
-                .write_all(format!("CONNECT {}\n", self.port).as_bytes())
-                .await?;
-            let mut reply = Vec::new();
-            for _ in 0..16 {
-                let b = socket.read_u8().await?;
-                reply.push(b);
-                if b == b'\n' {
-                    break;
-                }
-            }
-            let reply = std::str::from_utf8(&reply)?;
-            let assigned = reply
-                .strip_prefix("OK ")
-                .and_then(|s| s.strip_suffix('\n'))
-                .context("invalid Firecracker CONNECT acknowledgement")?;
-            ensure!(
-                !assigned.is_empty()
-                    && assigned.bytes().all(|b| b.is_ascii_digit())
-                    && assigned.parse::<u32>()? > 0,
-                "invalid assigned vsock port"
-            );
+            let socket = connect_vsock(&self.socket, self.port).await?;
             let mut tls = self.tls.connect(socket).await?;
             let request_id = OperationId::generate().to_string();
             let request = w::Request {

@@ -1,0 +1,50 @@
+# Real-host warm adoption integration, 2026-10-31
+
+PR [#218](https://github.com/hudson-frontier/hudsonbox/pull/218) rebases only its two host commits onto guest [#217](https://github.com/hudson-frontier/hudsonbox/pull/217) at `04c3c1b51e86c0deea18233762d63a065c8252d1`. Guest/protocol sources are unchanged relative to that checkpoint, preserving canonical SPKI comparison, exactly one fresh allocation CA, retained-file modes and bounded reads/wire. This evidence describes source/unit behavior, not a real warm VM run.
+
+## Contracts and changes
+
+- Guardian issuance uses `HandoffIntent.allocation_id` and generation for allocation bootstrap and SAN. The member bootstrap and VM paths keep the independent opaque slot. A portable regression feeds actual host-issued credentials into the durable guest binder, restarts it after a lost reply, authenticates the allocation TLS channel and rejects the slot as a server name while keeping the same CA and pin.
+- The host accepts the previous-retirement envelope from #216 (contract checked against `a19b11e37d6d967ffc73ddce9b498316319d28e1`) through a private wire adapter. The shared protocol crate on the #217 base lacks these types. No guest/protocol changes or controller/store/fake changes are included; replace the adapter with shared types when the stacks combine under parent coordination.
+- Previous cleanup requires exact retained member, optional requested VM name resolved to the retained VM, original host/epoch and current reporting epoch. A single operation ID with nondecreasing claim revision is saved with the retirement fence before any effect. Lost responses and a subsequent host epoch retain that claim. Replies echo the exact request and original-epoch cleanup identity. Unknown old members and adopted members refuse cleanup.
+- A historical stopped receipt is insufficient by itself: the guardian must yield its lifecycle lock, verify the retained receipt and confirm current cgroup/runtime/socket absence before host-local capacity is released or previous cleanup is acknowledged. Partial/missing metadata refuses proof.
+- Prepare re-reads the durable lifecycle after taking the member gate. A call that initially reserved a fresh record cannot stage it if retirement won that gate first.
+- An unnamed retire that races ahead of prepare saves a bounded refusal tombstone before returning absence. A delayed prepare cannot launch that identity, including after restart. Named unknown retire remains refused.
+- The 256-identity limit remains an explicit operator lifetime budget, shared by member records and refusal tombstones. No retired/adopted authority is deleted. The owning [warm-pool document](../warm-pools.md#remaining-gates) describes exhaustion and replacement-host procedure. Automatic pruning is unsafe without a proven fence against delayed callbacks and identity reuse.
+- Preparation/adoption preserve the existing no-NIC isolated baseline. No allocation egress integration is implemented or claimed.
+
+## Validation
+
+The initial work stayed source/light only while #216 owned the build slot. After an explicit slot grant, focused validation uses the idle existing `t3-cffe33ba/target`, jobs=2, with disk monitored (about 19 GiB free at start). No new stack or infrastructure was started.
+
+Passed:
+
+- `cargo test -p sandbox-supervisor --lib -j2`: 21 native macOS tests passed, including all five new portable regressions.
+- `cargo clippy -p sandbox-supervisor --all-targets -j2 -- -D warnings`: native strict Clippy passed.
+- `CC_aarch64_unknown_linux_gnu=clang CFLAGS_aarch64_unknown_linux_gnu='--target=aarch64-unknown-linux-gnu -isystem /tmp/hb188-linux-shim' cargo clippy --target aarch64-unknown-linux-gnu -p sandbox-supervisor --all-targets -j2 -- -D warnings`: passed, including compilation of all four new Linux-only host journal regressions and the dedicated-root guardian absence regression. Rechecked after the final Linux prepare race correction.
+- `cargo fmt --all --check`, `git diff --check` and `python3 scripts/check_docs.py`: passed (74 Markdown files).
+- Empty diff for `crates/sandbox-guest` and `crates/sandbox-protocol` against guest checkpoint `04c3c1b` confirms that stack's source security fixes remain intact.
+
+Linux compilation reuses the existing clang/header shim and is type-check evidence only; it does not link or run Linux code. An invocation without the shim variables could not find `aarch64-linux-gnu-gcc`; restoring the existing shim configuration passed. The native TLS regression initially used generation 7, outside the warm protocol's generation-1 contract; correcting that test fixture passed without any guest/protocol change. Final disk availability was about 18 GiB; no cache or target was deleted and no concurrent heavy job was launched. The build slot is released.
+
+New regressions cover portable cleanup identity/claim/reporting-epoch fences, reclaim after crash/lost reply, adopted-member refusal, wire bounds, host-issued opaque-slot TLS identity; Linux host journal write poisoning, missing guardian evidence, retained identity budget and unknown-retire tombstones; and a dedicated-root Linux guardian absence/lock/path test that needs no KVM but remains opt-in.
+
+## Runtime and review gates
+
+No Linux/KVM environment is available. No actual prepare/adopt/re-key, vsock transport, guardian process crash/restart, workload isolation or cold-versus-warm latency measurement was run. Native linked Linux tests (including host journal regressions) and the dedicated-root guardian absence test still need execution. Full hosted required checks and independent test/security review must apply to the final head. PR #218 remains draft. No merge, deployment, watch, paid infrastructure, snapshots or billing claim.
+
+## PR 218 adopted metadata retirement review correction
+
+The P2 blocker was reproduced from the source contracts: allocation views retain slot-keyed paths but the immutable disk manifest remains inert. Retirement previously selected the allocation path and compared the disk manifest with the allocation view. Both assumptions now use the original inert identity and the confirmed adoption mapping. The binding must carry the exact permit and owner, the reconstructed inert digest must match the guardian receipt, and the disk manifest must match that original. Adopted deletion plans use version 3 and retain the original manifest, full binding-bearing stopped receipt, exact file hashes and inodes. Cold version-1/2 plans remain readable and cold writes stay version 2. The existing RPC claim, epoch, history-floor and frozen-scope fences are unchanged.
+
+A Linux regression creates actual serialized inert manifest and stopped adoption receipt files with slot distinct from allocation, opens the production metadata retirement session, persists and reloads its plan, and resumes after every unlink. It verifies removal at a new authority epoch, stale epoch/frontier refusal, changed-scope and corrupt-original refusal, forged slot/permit refusal, and preservation of a second guardian directory at the allocation path. No live process or KVM is needed. A separate ordinary Linux unit test rejects forged adoption mappings. GitHub-hosted Linux CI explicitly runs the root-only session regression using its already-built test executable; the ordinary mapping test runs in the workspace suite.
+
+Local validation on macOS reused only `t3-cffe33ba/target` with jobs=2: 21 native supervisor library tests passed; native and aarch64 Linux cross-target strict Clippy passed for all supervisor targets; formatting, diff whitespace and documentation checks passed. The Linux cross-target check used the existing clang/header shim described above. Linux unit tests and the root-only session regression were compiled but could not execute on macOS; their CI execution remains pending. No PostgreSQL service or new infrastructure was needed. About 18 GiB remained available and the heavy build slot was released after validation.
+
+Real KVM was NOT RUN. This correction supplies source and compilation evidence, with Linux runtime results pending; it does not complete hardware or release gates. The PR remains draft pending validation and review.
+
+## Linux journal decoding follow-up
+
+The first full Linux test run at `b391a46` exposed four failures reading inert guardian records: their intentionally nil project/sandbox placeholders were serialized through public identifiers, whose decoder requires UUIDv7. Guardian-local decoding now accepts exactly the existing typed nil placeholders for those two fields; public identifier parsing remains unchanged. The journal compatibility regression also rejects a non-v7, non-nil project and checks that public parsing still rejects the inert placeholder. The existing three cleanup/restart regressions exercise the same journal decoder. This fixes a runtime persistence defect, not merely test data.
+
+Integrated main's previous-epoch cleanup contracts and validation documentation without removing the real-host integration gates. Formatting, documentation and whitespace checks pass. Linux-source strict Clippy is checked with the existing aarch64 header shim; Linux execution of the four regressions remains a hosted-CI gate, and real KVM remains unrun.

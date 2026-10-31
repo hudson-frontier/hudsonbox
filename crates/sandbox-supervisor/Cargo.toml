@@ -26,6 +26,7 @@ sandbox-artifacts = { workspace = true }
 sha2 = { workspace = true }
 tonic = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true }
