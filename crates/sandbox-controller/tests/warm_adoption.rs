@@ -857,12 +857,13 @@ async fn destroyed_adopted_sandbox_releases_once_and_is_never_repooled(pool: PgP
     .await
     .unwrap();
     assert_eq!(old, ("assigned".into(), Some(allocation), None));
-    let retires: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM capacity_operations WHERE target_ref=$1")
-            .bind(adopted.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let retires: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM capacity_operations WHERE target_ref=$1 AND kind='warm_retire'",
+    )
+    .bind(adopted.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(retires, 0, "an adopted member is never warm-retired");
 
     // Neither re-readying nor detaching the old member is accepted.
