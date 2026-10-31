@@ -1504,8 +1504,8 @@ async fn duplicate_supervisor_same_host_id_is_fenced(pool: PgPool) {
 /// Observed (CI run 41219994173): the clone answers the stop with
 /// `FencedAbsent` from empty memory and the allocation is released. Same-epoch
 /// uniqueness of a supervisor process is an unenforced deployment assumption.
-#[ignore = "gap: a same-host, same-epoch clone holding the registered key can release capacity via FencedAbsent"]
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
+#[ignore = "gap: a same-host, same-epoch clone holding the registered key can release capacity via FencedAbsent"]
 async fn same_epoch_clone_with_copied_key_cannot_release_capacity(pool: PgPool) {
     let fleet = Fleet::new(&pool, true).await;
     let mut controller = fleet.controller(0).await;
