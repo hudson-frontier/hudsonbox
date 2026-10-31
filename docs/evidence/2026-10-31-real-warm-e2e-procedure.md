@@ -1,7 +1,10 @@
 # Real warm-pool lifecycle procedure (#188)
 
-Status: **NOT RUN — no KVM hardware available.** This file records the
-procedure only. It is not evidence that any scenario passed. Hosted CI compiles
+Status: **NOT RUN to completion.** A nested aarch64 attempt on an Apple M4 Pro
+([record](2026-10-31-nested-kvm-qualification.md)) passed host preflight and
+artifact verification, but every test failed at fixture startup because the
+guardian binary was built in a user-owned tree (see that record); no VM
+lifecycle ran. No supported x86_64 KVM host has run it. This file records the procedure only. It is not evidence that any scenario passed. Hosted CI compiles
 the ignored test target on Linux; compiling proves nothing about real VM
 behavior, cleanup or latency.
 
@@ -56,6 +59,9 @@ and that state must be inspected before anyone deletes it.
 
 ## Result
 
-NOT RUN — no KVM hardware available. Record the source hashes, host details,
+NOT RUN. The [nested aarch64 attempt](2026-10-31-nested-kvm-qualification.md)
+failed at host startup for environment reasons. The guardian binary built by
+the test and every ancestor directory must be root-owned and not group/world
+writable, so build and run from a root-owned checkout. Record the source hashes, host details,
 pass/fail counts and the printed timing lines here once the suite has run on a
 qualified host.
