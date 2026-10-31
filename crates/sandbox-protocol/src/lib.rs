@@ -55,3 +55,5 @@ pub mod history;
 pub mod allocation_authority;
 
 pub mod allocation_retirement;
+
+pub mod warm_pool;

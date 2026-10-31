@@ -141,7 +141,7 @@ impl Store {
         if !(1..=300).contains(&seconds) {
             return Err(Error::Invalid);
         }
-        let row = sqlx::query("UPDATE capacity_operations SET status='running',claim_revision=claim_revision+1,lease_expires_at=clock_timestamp()+make_interval(secs=>$2),available_at=clock_timestamp()+make_interval(secs=>$2),updated_at=clock_timestamp() WHERE id=(SELECT id FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running') AND claim_revision<$3 AND available_at<=clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,claim_revision,request")
+        let row = sqlx::query("UPDATE capacity_operations SET status='running',claim_revision=claim_revision+1,lease_expires_at=clock_timestamp()+make_interval(secs=>$2),available_at=clock_timestamp()+make_interval(secs=>$2),updated_at=clock_timestamp() WHERE id=(SELECT id FROM capacity_operations WHERE host_pool_id=$1 AND warm_pool_id IS NULL AND status IN ('queued','running') AND claim_revision<$3 AND available_at<=clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,claim_revision,request")
             .bind(pool).bind(f64::from(seconds)).bind(MAX_ATTEMPTS).fetch_optional(self.pool()).await?;
         row.map(|r| {
             Ok(Claim {
@@ -183,7 +183,7 @@ impl Store {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(Error::Conflict)?;
-        let row = sqlx::query("SELECT status,provider_receipt IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) unclaimed FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 FOR UPDATE")
+        let row = sqlx::query("SELECT status,provider_receipt IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) unclaimed FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 AND warm_pool_id IS NULL FOR UPDATE")
             .bind(id).bind(pool).fetch_optional(&mut *tx).await?.ok_or(Error::Conflict)?;
         let status: String = row.try_get("status")?;
         if status == "cancelled" {
@@ -256,7 +256,10 @@ impl Store {
                 Action::Retire => {
                     let fresh: bool=sqlx::query_scalar("SELECT COALESCE(last_seen_at>clock_timestamp()-interval '30 seconds',false) FROM hosts WHERE id=$1")
                         .bind(request.host.uuid()).fetch_one(&mut *tx).await?;
-                    if report.status != "draining" || report.outstanding_allocations != 0 || !fresh
+                    if report.status != "draining"
+                        || report.outstanding_allocations != 0
+                        || report.unretired_warm_members != 0
+                        || !fresh
                     {
                         return Err(Error::Conflict);
                     }

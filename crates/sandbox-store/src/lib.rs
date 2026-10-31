@@ -34,6 +34,7 @@ pub mod retention;
 pub mod storage_audit;
 pub mod stream;
 pub mod uploads;
+pub mod warm_pool;
 pub mod work;
 
 use std::time::Duration;

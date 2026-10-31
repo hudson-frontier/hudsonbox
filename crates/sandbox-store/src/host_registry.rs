@@ -497,7 +497,9 @@ impl Store {
             .fetch_one(&mut *tx)
             .await?;
         let current = pool_from_row(&row)?;
-        let unfinished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running'))")
+        let unfinished: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running'))
+            OR EXISTS(SELECT 1 FROM warm_pool_members m JOIN warm_pool_policies w ON w.id=m.pool_id
+                WHERE w.host_pool_id=$1 AND m.state IN ('preparing','ready','claiming','retiring'))")
             .bind(spec.id).fetch_one(&mut *tx).await?;
         if current.pool_type != spec.pool_type && (current.enrolled_hosts != 0 || unfinished) {
             return Err(RegistryError::InUse);

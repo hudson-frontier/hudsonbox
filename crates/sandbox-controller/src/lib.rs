@@ -11,6 +11,7 @@ mod recovery;
 pub mod retirement;
 mod uploads;
 pub mod wakeup;
+pub mod warm_pool;
 pub mod workers;
 
 use sandbox_protocol::{

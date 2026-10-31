@@ -164,14 +164,14 @@ fn limit(value: &Value, key: &str, default: i64) -> Result<i64, PlacementError> 
 
 /// Host resources one allocation consumes: the request plus runtime overhead.
 #[derive(Debug, Clone, Copy)]
-struct Footprint {
-    vcpu: i64,
-    memory_mib: i64,
-    disk_mib: i64,
+pub(crate) struct Footprint {
+    pub(crate) vcpu: i64,
+    pub(crate) memory_mib: i64,
+    pub(crate) disk_mib: i64,
 }
 
 impl Footprint {
-    fn of(vcpu: i64, memory_mib: i64, disk_mib: i64) -> Self {
+    pub(crate) fn of(vcpu: i64, memory_mib: i64, disk_mib: i64) -> Self {
         Self {
             vcpu,
             memory_mib: memory_mib.saturating_add(VMM_MEMORY_OVERHEAD_MIB),
@@ -188,19 +188,30 @@ struct Headroom {
     disk_mib: i64,
 }
 
+/// Unassigned warm-member reservations (#188), each counted exactly once:
+/// preparing, ready and retiring members always hold; a claiming member holds
+/// only once its claimed allocation is released (until then the allocation,
+/// created in the same transaction with the same size, holds it). Assigned
+/// members transferred to allocation accounting; retired ones have cleanup
+/// evidence. Shared with warm-pool preparation so both use one definition.
+pub(crate) const WARM_HELD: &str = "SELECT m.host_id,m.vcpu,m.memory_mib,m.disk_mib
+    FROM warm_pool_members m LEFT JOIN allocations a ON a.id=m.claimed_allocation_id
+    WHERE m.state IN ('preparing','ready','retiring')
+    OR (m.state='claiming' AND a.released_at IS NOT NULL)";
+
 /// Capacity held on each locked host. Unreleased allocations of every status
-/// count, including uncertain and expired-lease ones. Seam: unassigned
-/// warm-pool member reservations (#188) must be added here, under the same
-/// host locks, before warm pools hold capacity.
-async fn held(
+/// count, including uncertain and expired-lease ones, plus [`WARM_HELD`]
+/// reservations. Callers hold the host row locks.
+pub(crate) async fn held(
     tx: &mut sqlx::PgConnection,
     hosts: &[uuid::Uuid],
 ) -> Result<std::collections::HashMap<uuid::Uuid, Footprint>, PlacementError> {
-    let rows: Vec<(uuid::Uuid, i64, i64, i64)> = sqlx::query_as(
+    let rows: Vec<(uuid::Uuid, i64, i64, i64)> = sqlx::query_as(&format!(
         "SELECT host_id,COALESCE(sum(vcpu),0)::bigint,
          COALESCE(sum(memory_mib+$2),0)::bigint,COALESCE(sum(disk_mib+$3),0)::bigint
-         FROM allocations WHERE host_id=ANY($1) AND released_at IS NULL GROUP BY host_id",
-    )
+         FROM (SELECT host_id,vcpu,memory_mib,disk_mib FROM allocations WHERE released_at IS NULL
+         UNION ALL {WARM_HELD}) r WHERE host_id=ANY($1) GROUP BY host_id"
+    ))
     .bind(hosts)
     .bind(VMM_MEMORY_OVERHEAD_MIB)
     .bind(ARTIFACT_DISK_OVERHEAD_MIB)

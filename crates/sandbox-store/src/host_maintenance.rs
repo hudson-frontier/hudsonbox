@@ -21,6 +21,10 @@ pub struct HostMaintenance {
     pub previous_epoch_allocations: i64,
     /// Unreleased reservations whose sandbox runtime is currently unknown.
     pub unknown_state_allocations: i64,
+    /// Warm members (#188) on this host, any epoch, that are not assigned to an
+    /// allocation and lack cleanup evidence. Their reservations still hold;
+    /// retirement requires zero.
+    pub unretired_warm_members: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +124,13 @@ pub(crate) async fn report(
     .bind(host.uuid())
     .fetch_one(&mut **tx)
     .await?;
+    let warm: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM warm_pool_members WHERE host_id=$1
+        AND state IN ('preparing','ready','claiming','retiring')",
+    )
+    .bind(host.uuid())
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(HostMaintenance {
         host_id: host.to_string(),
         supervisor_epoch: row.try_get("supervisor_epoch")?,
@@ -132,6 +143,7 @@ pub(crate) async fn report(
         unknown_operations: work.1,
         previous_epoch_allocations: reservations.4,
         unknown_state_allocations: reservations.5,
+        unretired_warm_members: warm,
     })
 }
 
