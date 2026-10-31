@@ -127,7 +127,7 @@ async fn authenticated_binding_persists_and_exact_retry_survives_restart() {
     let mut m = member();
     let (_, req) = request(&m);
     assert!(m.guest.bound().is_none());
-    call(&m, &client(&m), MemberRequest::Bind(req.clone()))
+    call(&m, &client(&m), MemberRequest::Bind(Box::new(req.clone())))
         .await
         .unwrap()
         .verify_bound(&req)
@@ -139,7 +139,7 @@ async fn authenticated_binding_persists_and_exact_retry_survives_restart() {
     // Drop closes the cross-process incarnation lock, as process death would.
     drop(m.guest);
     m.guest = MemberGuest::open(m.bootstrap.clone(), BOOT.into(), &path).unwrap();
-    call(&m, &client(&m), MemberRequest::Bind(req.clone()))
+    call(&m, &client(&m), MemberRequest::Bind(Box::new(req.clone())))
         .await
         .unwrap()
         .verify_bound(&req)
@@ -148,7 +148,7 @@ async fn authenticated_binding_persists_and_exact_retry_survives_restart() {
     changed.scope.project_id = ProjectId::generate();
     changed.scope_sha256 = changed.scope.digest().unwrap();
     assert!(matches!(
-        call(&m, &client(&m), MemberRequest::Bind(changed))
+        call(&m, &client(&m), MemberRequest::Bind(Box::new(changed)))
             .await
             .unwrap(),
         MemberResponse::Rejected { .. }
@@ -162,12 +162,16 @@ async fn wrong_tls_identity_and_allocation_protocol_cannot_bind() {
     let (_, req) = request(&m);
     let other = member();
     assert!(
-        call(&m, &client(&other), MemberRequest::Bind(req.clone()))
-            .await
-            .is_err()
+        call(
+            &m,
+            &client(&other),
+            MemberRequest::Bind(Box::new(req.clone()))
+        )
+        .await
+        .is_err()
     );
     assert!(
-        call(&m, &m.fixture.client(), MemberRequest::Bind(req))
+        call(&m, &m.fixture.client(), MemberRequest::Bind(Box::new(req)))
             .await
             .is_err()
     );
@@ -192,7 +196,7 @@ fn scope_boot_version_and_credentials_are_checked_before_installation() {
         }
         assert!(
             matches!(
-                m.guest.handle(MemberRequest::Bind(bad), now()),
+                m.guest.handle(MemberRequest::Bind(Box::new(bad)), now()),
                 MemberResponse::Rejected { .. }
             ),
             "field {field}"
@@ -200,13 +204,13 @@ fn scope_boot_version_and_credentials_are_checked_before_installation() {
         assert!(m.guest.bound().is_none());
     }
     m.guest
-        .handle(MemberRequest::Bind(req.clone()), now())
+        .handle(MemberRequest::Bind(Box::new(req.clone())), now())
         .verify_bound(&req)
         .unwrap();
     let mut other = req.clone();
     other.allocation = request(&m).1.allocation;
     assert!(matches!(
-        m.guest.handle(MemberRequest::Bind(other), now()),
+        m.guest.handle(MemberRequest::Bind(Box::new(other)), now()),
         MemberResponse::Rejected { .. }
     ));
     assert!(!format!("{req:?}").contains("PRIVATE KEY"));
@@ -218,7 +222,7 @@ fn partial_persistence_and_changed_bootstrap_never_reset_to_unused() {
     std::fs::write(path.join("binding.pending"), b"partial").unwrap();
     let (_, req) = request(&m);
     assert!(matches!(
-        m.guest.handle(MemberRequest::Bind(req), now()),
+        m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),
         MemberResponse::Rejected { .. }
     ));
     drop(m.guest);
@@ -256,7 +260,7 @@ async fn allocation_identity_works_only_on_its_separate_channel() {
     let m = member();
     let (allocation, req) = request(&m);
     m.guest
-        .handle(MemberRequest::Bind(req.clone()), now())
+        .handle(MemberRequest::Bind(Box::new(req.clone())), now())
         .verify_bound(&req)
         .unwrap();
     let cert = CertificateDer::pem_slice_iter(req.allocation.guest_cert_pem.as_bytes())
@@ -307,7 +311,7 @@ async fn same_ca_unpinned_host_and_wrong_alpn_are_rejected() {
         call(
             &m,
             &client_for_member(&m, &unpinned),
-            MemberRequest::Bind(req)
+            MemberRequest::Bind(Box::new(req))
         )
         .await
         .is_err()
@@ -332,8 +336,14 @@ fn concurrent_conflicting_binds_install_one_identity() {
     let (_, first) = request(&m);
     let (_, second) = request(&m);
     let answers = std::thread::scope(|scope| {
-        let a = scope.spawn(|| m.guest.handle(MemberRequest::Bind(first.clone()), now()));
-        let b = scope.spawn(|| m.guest.handle(MemberRequest::Bind(second.clone()), now()));
+        let a = scope.spawn(|| {
+            m.guest
+                .handle(MemberRequest::Bind(Box::new(first.clone())), now())
+        });
+        let b = scope.spawn(|| {
+            m.guest
+                .handle(MemberRequest::Bind(Box::new(second.clone())), now())
+        });
         [a.join().unwrap(), b.join().unwrap()]
     });
     assert_eq!(
@@ -359,7 +369,7 @@ fn missing_or_corrupt_committed_binding_is_never_unused() {
         let m = member();
         let (_, req) = request(&m);
         m.guest
-            .handle(MemberRequest::Bind(req.clone()), now())
+            .handle(MemberRequest::Bind(Box::new(req.clone())), now())
             .verify_bound(&req)
             .unwrap();
         let path = m.directory.path().join("state");
@@ -418,7 +428,76 @@ fn pem_reencoding_cannot_disguise_a_reused_member_key() {
     // from a legitimate fresh allocation identity.
     assert!(req.allocation.server_tls(now()).is_ok());
     assert!(matches!(
-        m.guest.handle(MemberRequest::Bind(req), now()),
+        m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),
+        MemberResponse::Rejected { .. }
+    ));
+    assert!(m.guest.bound().is_none());
+}
+
+#[test]
+fn retained_state_rejects_symlink_fifo_oversize_and_public_modes_promptly() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for target in ["incarnation.json", "binding.json"] {
+        for attack in 0..5 {
+            let m = member();
+            let (_, req) = request(&m);
+            m.guest
+                .handle(MemberRequest::Bind(Box::new(req.clone())), now())
+                .verify_bound(&req)
+                .unwrap();
+            let path = m.directory.path().join("state");
+            drop(m.guest);
+            let file = path.join(target);
+            match attack {
+                0 => {
+                    std::fs::remove_file(&file).unwrap();
+                    symlink("/dev/zero", &file).unwrap();
+                }
+                1 => {
+                    std::fs::remove_file(&file).unwrap();
+                    rustix::fs::mknodat(
+                        rustix::fs::CWD,
+                        &file,
+                        rustix::fs::FileType::Fifo,
+                        rustix::fs::Mode::from_raw_mode(0o600),
+                        0,
+                    )
+                    .unwrap();
+                }
+                2 => std::fs::write(&file, vec![b'x'; 128 * 1024]).unwrap(),
+                3 => {
+                    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                _ => {
+                    std::fs::remove_file(&file).unwrap();
+                    std::fs::create_dir(&file).unwrap();
+                }
+            }
+            let start = std::time::Instant::now();
+            assert!(MemberGuest::open(m.bootstrap.clone(), BOOT.into(), &path).is_err());
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        }
+    }
+}
+#[test]
+fn wrong_allocation_san_and_reencoded_member_identity_are_rejected() {
+    let m = member();
+    let (allocation, mut req) = request(&m);
+    req.allocation.guest_cert_pem = allocation.guest.cert.pem(); // valid CA and key, wrong allocation SAN
+    req.allocation.guest_key_pem = allocation.guest.key.serialize_pem();
+    assert!(req.allocation.server_tls(now()).is_ok());
+    assert!(matches!(
+        m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),
+        MemberResponse::Rejected { .. }
+    ));
+    let (_, mut req) = request(&m);
+    req.allocation.ca_pem = m.bootstrap.ca_pem.replace('\n', "\r\n");
+    req.allocation.guest_cert_pem = m.bootstrap.guest_cert_pem.replace('\n', "\r\n");
+    req.allocation.guest_key_pem = m.bootstrap.guest_key_pem.replace('\n', "\r\n");
+    assert_ne!(req.allocation.host_pin, m.bootstrap.host_pin);
+    assert!(req.allocation.server_tls(now()).is_ok());
+    assert!(matches!(
+        m.guest.handle(MemberRequest::Bind(Box::new(req)), now()),
         MemberResponse::Rejected { .. }
     ));
     assert!(m.guest.bound().is_none());

@@ -26,7 +26,7 @@ use crate::{
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -189,7 +189,7 @@ impl std::fmt::Debug for BindRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MemberRequest {
     Hello { version: u32, request_id: Uuid },
-    Bind(BindRequest),
+    Bind(Box<BindRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,16 +327,22 @@ impl MemberGuest {
         }
         let metadata = fs::symlink_metadata(directory)?;
         ensure!(
-            metadata.is_dir() && metadata.permissions().mode() & 0o777 == 0o700,
+            metadata.is_dir()
+                && metadata.permissions().mode() & 0o777 == 0o700
+                && metadata.uid() == rustix::process::geteuid().as_raw(),
             "unsafe member state directory"
         );
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(directory.join("lock"))?;
+        let fd = rustix::fs::open(
+            directory.join("lock"),
+            rustix::fs::OFlags::RDWR
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )?;
+        let lock = File::from(fd);
+        private_regular(&lock)?;
         lock.try_lock().context("member state already open")?;
         File::open(directory)?.sync_all()?;
         // The first file is a permanent incarnation marker, created before serving.
@@ -447,7 +453,7 @@ impl MemberGuest {
                     boot_id: self.boot_id.clone(),
                 }
             }
-            MemberRequest::Bind(request) => self.bind(request, now_ms),
+            MemberRequest::Bind(request) => self.bind(*request, now_ms),
         }
     }
 
@@ -549,6 +555,12 @@ fn validate_binding(
         "allocation identity reused member credentials"
     );
     a.server_tls(now_ms)?;
+    crate::guest_wire::validate_server_identity(
+        a.ca_pem.as_bytes(),
+        a.guest_cert_pem.as_bytes(),
+        a.allocation,
+        now_ms,
+    )?;
     Ok(())
 }
 fn first_cert(pem: &str) -> Result<CertificateDer<'static>> {
@@ -557,16 +569,29 @@ fn first_cert(pem: &str) -> Result<CertificateDer<'static>> {
         .context("missing certificate")?
         .context("invalid certificate")
 }
-fn read_retained(path: &Path) -> Result<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path)?;
+fn private_regular(file: &File) -> Result<()> {
+    let metadata = file.metadata()?;
     ensure!(
-        metadata.is_file() && metadata.permissions().mode() & 0o777 == 0o600,
+        metadata.is_file()
+            && metadata.permissions().mode() & 0o777 == 0o600
+            && metadata.uid() == rustix::process::geteuid().as_raw(),
         "unsafe retained member state"
     );
+    Ok(())
+}
+fn read_retained(path: &Path) -> Result<Vec<u8>> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let file = File::from(fd);
+    private_regular(&file)?;
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take((MAX_FRAME + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    file.take((MAX_FRAME + 1) as u64).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= MAX_FRAME, "oversized retained member state");
     Ok(bytes)
 }

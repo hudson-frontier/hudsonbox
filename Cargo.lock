@@ -2340,6 +2340,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "prost",
+ "rustix",
  "rcgen",
  "serde",
  "serde_json",

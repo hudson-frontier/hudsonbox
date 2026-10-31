@@ -71,6 +71,37 @@ fn roots(pem: &[u8]) -> Result<rustls::RootCertStore> {
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
+/// Check a newly installed allocation certificate's CA, validity, TLS server
+/// purpose and exact allocation SAN before the guest commits its identity.
+pub(crate) fn validate_server_identity(
+    ca: &[u8],
+    cert: &[u8],
+    allocation: AllocationId,
+    now_ms: i64,
+) -> Result<()> {
+    use rustls::{client::danger::ServerCertVerifier, pki_types::UnixTime};
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots(ca)?),
+        provider(),
+    )
+    .build()?;
+    let chain = certificates(cert)?;
+    let now = if now_ms == 0 {
+        UnixTime::now()
+    } else {
+        ensure!(now_ms > 0, "invalid identity time");
+        UnixTime::since_unix_epoch(Duration::from_millis(now_ms as u64))
+    };
+    verifier.verify_server_cert(
+        &chain[0],
+        &chain[1..],
+        &ServerName::try_from(guest_name(allocation))?,
+        &[],
+        now,
+    )?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ServerTls {
     acceptor: TlsAcceptor,
