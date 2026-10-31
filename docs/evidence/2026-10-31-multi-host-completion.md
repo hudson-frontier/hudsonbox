@@ -14,20 +14,15 @@ Hosted CI for merged items means `docs-check` and the runtime workflow (`Determi
 | [#221](https://github.com/hudson-frontier/hudsonbox/pull/221) | Kubernetes same-node worker refusal and pod recreate identity | Yes | Yes: `0a63ead24d74aee38932ba658b9104ea548a64f8`; runs 41220673724 (runtime), 41220673782 (docs) | `1fe3999b1ed7bace65cf7cf9f1633f2b375049e2` | NO | NO |
 | [#220](https://github.com/hudson-frontier/hudsonbox/pull/220) | Fleet diagnostics warm reservation accounting and retired gauge | Yes | Yes: `33be17e185b02f82dab0fdce873c2233f38834eb`; runs 41221557956 (runtime), 41221558020 (docs) | `cf2c8f87ebfea76bcec9e254c874ccf85274b606` | NO | NO |
 | [#224](https://github.com/hudson-frontier/hudsonbox/pull/224) | Never re-pool adopted warm members: trigger migration 0031 and test | Yes | Yes: `f97c88028ee3f725cc04f65b6717f5455a0606a3`; runs 41222254395 (runtime), 41222254388 (docs) | `78ddb60723857a61d00a6989f272f30504e0a267` | NO | NO |
+| [#223](https://github.com/hudson-frontier/hudsonbox/pull/223) | Warm-claim grant, revocation and quota denial tests | Yes | Yes: `8a32471a9e17509e3744683593721c48e3641e7e`; runs 41224785673, 41224785700 | `dcc776f9fe32fa87d107030498815a39100a37fd` | NO | NO |
+| [#225](https://github.com/hudson-frontier/hudsonbox/pull/225) | Duplicate supervisor and combined-fault qualification (one same-epoch clone gap ignored, #227) | Yes | Yes: `18dc831d776c3c8da8369ca5a621732dbc8f812c`; runs 41223157210, 41223157253 | `727bebca34c1c214a72fc77ce5a27653b2a5d16a` | NO | NO |
+| [#226](https://github.com/hudson-frontier/hudsonbox/pull/226) | KVM-gated real warm lifecycle suite (compiled in CI; all tests ignored there) | Yes | Yes: `fc934dac38780d7b5f432a13724d41c79c2c6a3b`; runs 41223968046, 41223968048 | `f7159853a0d4b579bfe119226fe243d5dbeeb776` | NO (suite NOT RUN) | NO |
 
 Kubernetes evidence for #221 (and the existing [Kubernetes capacity evidence](2026-10-30-kubernetes-capacity.md)) uses a fake Kubernetes API only.
 
-## Pending items
-
-These were OPEN when checked. At the listed head, `docs-check` and `Determine runtime scope` had passed; the Rust/client jobs had no conclusion yet. Hosted CI is therefore recorded as pending, not passed.
-
-| PR | Scope | Implemented | Hosted CI passed (head, runs) | Merged | Real KVM verified | Deployed |
-| --- | --- | --- | --- | --- | --- | --- |
-| [#223](https://github.com/hudson-frontier/hudsonbox/pull/223) | Warm-claim grant, revocation and quota denial tests | In review | Pending: `7326edfbbe1c9e92cf930d30f780e25d802f9956`; run 41223153211 | No | NO | NO |
-| [#225](https://github.com/hudson-frontier/hudsonbox/pull/225) | Duplicate supervisor and combined-fault qualification | In review | Pending: `18dc831d776c3c8da8369ca5a621732dbc8f812c`; run 41223157210 | No | NO | NO |
-| [#226](https://github.com/hudson-frontier/hudsonbox/pull/226) | KVM-gated real warm lifecycle suite | In review | Pending: `bebb3bf6d12387a98f478a49f8bef7eab44c8133`; run 41223160693 | No | NO (suite NOT RUN) | NO |
-
 ## Remaining limits
+
+Every unrun hardware gate is tracked in [#229](https://github.com/hudson-frontier/hudsonbox/issues/229).
 
 - No real Linux/KVM two-host qualification has been run; see the [operator procedure](2026-10-30-fleet-qualification.md#operator-two-host-linuxkvm-qualification-not-run).
 - No real Kubernetes cluster has been used; Kubernetes evidence is fake-API only.
