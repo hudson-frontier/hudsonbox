@@ -11,6 +11,10 @@ pub mod guest;
 pub mod guardian;
 pub mod lease;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod warm_cleanup;
+pub mod warm_member;
+
 pub mod identity;
 
 #[cfg(target_os = "linux")]

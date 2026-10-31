@@ -274,6 +274,31 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Test root-only guardian retirement and absence without KVM
+        run: |
+          cargo test -p sandbox-supervisor --lib --no-run --message-format=json > "$RUNNER_TEMP/guardian-tests.jsonl"
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          artifacts = [json.loads(line) for line in
+                       Path(os.environ["RUNNER_TEMP"], "guardian-tests.jsonl").read_text().splitlines()]
+          binaries = [a["executable"] for a in artifacts
+                      if a.get("reason") == "compiler-artifact" and a.get("executable")
+                      and a["target"]["name"] == "sandbox_supervisor"]
+          assert len(binaries) == 1, binaries
+          for test in [
+              "guardian::retirement::tests::adopted_slot_metadata_retirement_resumes_exact_serialized_evidence",
+              "guardian::retirement::tests::retained_member_absence_requires_free_lifecycle_lock_and_no_runtime_paths",
+          ]:
+              subprocess.run([
+                  "sudo", "-n", "env", "HUDSON_GUARDIAN_TEST_VM=1", binaries[0],
+                  "--exact", test, "--ignored",
+              ], check=True)
+          PYTHON
+
       - name: Verify private object storage semantics
         env:
           HUDSON_TEST_S3_ENDPOINT: ${{ steps.object-storage.outputs.endpoint }}

@@ -38,6 +38,18 @@ impl Deadline {
             .map_err(|_| anyhow::anyhow!("lease was fenced or changed"))?;
         Ok(())
     }
+    /// Rebind a live deadline to a new absolute expiry, which may be shorter.
+    /// Used once when a warm member's idle lease becomes its allocation lease,
+    /// after that binding is durable. A fenced or expired deadline never revives.
+    pub fn replace(&self, prior: u64, expires: i64, wall: u64, boot: u64) -> Result<()> {
+        let wall = i64::try_from(wall)?;
+        let next = Self::convert(expires, wall, boot)?;
+        ensure!(prior > boot && next > boot, "expired lease");
+        self.0
+            .compare_exchange(prior, next, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| anyhow::anyhow!("lease was fenced or changed"))?;
+        Ok(())
+    }
     pub fn expire(&self, boot: u64) -> bool {
         let prior = self.value();
         prior != 0
@@ -76,6 +88,21 @@ mod tests {
         assert!(Deadline::new(2000, 1000, u64::MAX).is_err());
         let d = Deadline::new(2000, 1000, 100).unwrap();
         assert!(d.extend(d.value(), 1500, 1000, 100).is_err());
+    }
+    #[test]
+    fn replacement_may_shorten_but_never_revives_a_fence() {
+        let d = Deadline::new(200_000, 0, 1_000).unwrap();
+        let prior = d.value();
+        d.replace(prior, 10_000, 0, 1_000).unwrap();
+        assert_eq!(d.value(), 11_000);
+        assert!(d.replace(prior, 20_000, 0, 1_000).is_err());
+        d.stop();
+        assert!(d.replace(0, 20_000, 0, 1_000).is_err());
+        assert!(d.replace(11_000, 20_000, 0, 1_000).is_err());
+        assert_eq!(d.value(), 0);
+        let d = Deadline::new(5_000, 0, 1_000).unwrap();
+        assert!(d.replace(d.value(), 400_000, 0, 1_000).is_err());
+        assert!(d.replace(d.value(), 1_000, 0, 7_000).is_err());
     }
     #[test]
     fn concurrent_expiry_and_extension_cannot_overwrite_a_fence() {

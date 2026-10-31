@@ -153,6 +153,7 @@ impl Fixture {
                 disk_mib: 64,
                 expires_unix_ms: guardian::wall_ms() + ttl_ms,
             },
+            member: None,
         };
         let path = root.join("start.json");
         fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
