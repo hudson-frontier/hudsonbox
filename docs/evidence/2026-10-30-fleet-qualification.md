@@ -49,7 +49,7 @@ Existing suites already provide related coverage, so it is not duplicated here:
 - [Multi-host placement](../../crates/sandbox-store/tests/multi_host_placement.rs): store-level concurrency, quota, tenant-pool denial when a shared pool is full, and the drain race.
 - [Standalone capacity](../../crates/sandbox-store/tests/capacity.rs): retirement of occupied hosts and intents.
 
-### Remaining portable retirement gap: source added, execution pending
+### Portable retirement and replacement coverage
 
 `retire_replace_at_pool_max_routes_new_identity_without_inheriting_history`
 adds controller plus standalone-capacity integration coverage in the same
@@ -70,11 +70,10 @@ controller across replacement. Its assertions cover:
   active inventory excludes it, and both original supervisors' counters exclude
   the replacement work.
 
-**Execution pending:** the original seven tests' results below predate this
-addition. The new eight-test suite and focused Clippy have not been run on this
-head. Issue #197 owns the only heavy-build slot; this follow-up is source/light
-only until the parent grants `CARGO_BUILD_JOBS=2`. Reuse the existing target and
-PostgreSQL when granted; create no additional dependency/service stack.
+**Passed:** all eight qualification tests, including retirement/replacement,
+and focused strict Clippy passed on tested commit
+`659e85acd05f8ef7434df4d890d0f4c2e4ee5d82`. No test or runtime fix was needed.
+This portable result does not complete the real-host gate for #198.
 
 ### Harness notes
 
@@ -88,21 +87,41 @@ found.
 
 ### Local commands and result
 
-Native macOS, pinned toolchain, `CARGO_BUILD_JOBS=2`, and the existing isolated
-target `/tmp/hudsonbox-196-target` from the same branch lineage. The tests use the
-existing localhost:55432 development PostgreSQL through SQLx disposable test
-databases, with no shared reset and no new service. The database URL was
-supplied in the environment.
+Tested commit: `659e85acd05f8ef7434df4d890d0f4c2e4ee5d82`.
+Validation date: 2026-10-30 (America/New_York). Native macOS aarch64, pinned
+Rust 1.92.0, `CARGO_BUILD_JOBS=2`, and the idle compatible target
+`/tmp/hudsonbox-196-target` from the same branch lineage. The existing
+localhost:55432 PostgreSQL service was reused with a fresh temporary anchor
+database, `qualification_213_659e85a`; SQLx created disposable test databases
+and applied this commit's embedded `sandbox_store::MIGRATOR`, including migrations
+0027 and 0028. No existing database was reset and no new service was started.
+The database URL was supplied in the environment; no credentials are recorded.
+The temporary anchor database was dropped after validation. Free disk remained
+about 21 GiB before and after the heavy checks. No concurrent heavy Cargo job
+was started by this validator; the slot was released after focused Clippy.
 
 ```sh
-cargo test -p sandbox-controller --test fleet_qualification
-cargo clippy -p sandbox-controller --test fleet_qualification -- -D warnings
+cargo test --locked -p sandbox-controller --test fleet_qualification
+cargo clippy --locked -p sandbox-controller --test fleet_qualification -- -D warnings
 cargo fmt --all -- --check
 python3 scripts/check_docs.py
+git diff --check
 ```
 
-Result: 7 of 7 passed in three consecutive runs. Clippy and formatting were
-clean. The full workspace suite and hosted CI are reported on the PR, not here.
+Result: **8 passed, 0 failed, 0 ignored** (2.66 seconds of test execution).
+Focused strict Clippy, formatting, documentation checks (69 Markdown files) and
+diff whitespace checks passed. The original seven tests had also passed in three
+consecutive historical runs before the retirement/replacement addition; those
+runs are not claimed for this eight-test head. The subsequent evidence-only
+commit does not change the tested Rust sources.
+
+Full workspace CI was not rerun locally. At validation time, hosted `docs-check`
+passed on the tested head, but `rust-check` failed in the inherited
+`upgrade_preserves_existing_host_state_and_is_repeatable` capacity-upgrade test
+(the comparison had not excluded migration 0028 RPC fields). The parent is
+handling that failure on #209; no fix is included here. Final hosted statuses
+remain authoritative on the PR. Real Linux/KVM and Kubernetes results remain
+**NOT RUN**.
 
 ## Operator two-host Linux/KVM qualification (NOT RUN)
 
