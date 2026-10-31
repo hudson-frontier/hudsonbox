@@ -810,10 +810,34 @@ async fn fleet_rpc_observation_lock_wait_is_cancelled_on_server(pool: PgPool) {
         .record_host_rpc_failure(a, 1, RpcFailure::Unavailable)
         .await
         .unwrap_err();
-    let sqlx::Error::Database(database) = failure else {
-        panic!("expected PostgreSQL statement cancellation, got {failure}");
-    };
-    assert_eq!(database.code().as_deref(), Some("57014"));
+    match failure {
+        sqlx::Error::Database(database) => {
+            assert_eq!(database.code().as_deref(), Some("57014"));
+        }
+        // Pool acquisition, scheduling and the transaction setup share the
+        // caller's 100ms bound. Under load that bound may win the race.
+        sqlx::Error::PoolTimedOut => {}
+        other => panic!("expected a bounded telemetry timeout, got {other}"),
+    }
+    // Keep A locked while proving that cancellation left no blocked telemetry
+    // statement on the server, regardless of which deadline the caller saw.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let blocked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
+                 AND wait_event_type='Lock' AND query LIKE 'UPDATE hosts SET rpc_failures=%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if blocked == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("telemetry update remained blocked after its server deadline");
     store
         .record_host_rpc_failure(b, 1, RpcFailure::Unavailable)
         .await
