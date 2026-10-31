@@ -203,7 +203,7 @@ impl WorkerConfig {
             pod["spec"]["containers"][0]["volumeMounts"]
                 .as_array_mut()
                 .ok_or(Error::Invalid)?
-                .push(json!({"name":"artifacts","mountPath":"/artifacts","readOnly":true}));
+                .push(json!({"name":"artifacts","mountPath":"/artifacts/config.json","subPath":"config.json","readOnly":true}));
             pod["spec"]["volumes"]
                 .as_array_mut()
                 .ok_or(Error::Invalid)?

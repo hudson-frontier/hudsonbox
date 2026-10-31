@@ -86,10 +86,21 @@ and temporary files have separate bounded emptyDir volumes. No host state or
 allocation directory is inherited on replacement. There is no host PID/network
 namespace or host-network guest NIC in this skeleton. Optional distinct API output/file reader certificate pins enable the existing
 read-only gRPC services. `artifacts_secret` optionally mounts a private
-`config.json` and passes the existing `--output-config` flag for S3 artifacts;
+`config.json` through a single-file `subPath` mount and passes the existing `--output-config` flag for S3 artifacts. Mounting the whole Secret directory is unsupported: projected Secret entries are symlinks and the private credential reader rejects symlinks. The Secret must remain immutable for the worker lifetime; subPath mounts do not refresh rotated contents. Replace the worker with a fresh identity to use a new Secret version;
 review matching network destinations and Secret lifetime before use. These are
 versioned Secret references, never credential bytes in durable intent.
 Network-enabled guests require separate reviewed integration.
+
+Before admitting a node to this pool, its administrator must create and delegate
+`/sys/fs/cgroup/hudsonbox` using the node's cgroup manager. The parent must expose
+cgroup v2 `cpu`, `memory`, and `pids` controller files, and enable all three in its
+`cgroup.subtree_control` so allocation children can enforce their limits. Root
+controller availability alone is insufficient. Verify this inside the worker's
+cgroup namespace and writable mount before starting `sandbox-host`; its preflight
+rejects a missing or undelegated parent. The Pod intentionally does not alter the
+node's cgroup hierarchy or systemd delegation. A fresh node without this setup is
+not ready for the `hudsonbox.io/kvm` label. Preparation and enforcement on a real
+node remain unqualified gates, not results of the fake API tests.
 
 There is no `compute_nodes` accounting model yet. Required Pod anti-affinity on
 `kubernetes.io/hostname`, with an all-namespace selector for the common worker

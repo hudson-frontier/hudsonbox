@@ -412,6 +412,15 @@ fn pod_envelope_has_explicit_overhead_and_global_node_exclusion() {
     let config = provision(Some(pool));
     let mut worker = worker();
     let pod = worker.pod(pool, &request, &config, "workers").unwrap();
+    let artifact_mount = pod["spec"]["containers"][0]["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|mount| mount["name"] == "artifacts")
+        .unwrap();
+    assert_eq!(artifact_mount["mountPath"], "/artifacts/config.json");
+    assert_eq!(artifact_mount["subPath"], "config.json");
+    assert_eq!(artifact_mount["readOnly"], true);
     assert_eq!(pod["metadata"]["labels"][WORKER_LABEL], "true");
     assert_eq!(
         pod["spec"]["containers"][0]["resources"]["requests"],
@@ -444,6 +453,28 @@ fn pod_envelope_has_explicit_overhead_and_global_node_exclusion() {
     assert!(worker.pod(pool, &request, &config, "workers").is_err());
     worker.overhead_memory_mib = u64::MAX;
     assert!(worker.pod(pool, &request, &config, "workers").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn projected_artifact_secret_requires_a_regular_file_mount() {
+    use std::os::unix::{fs::PermissionsExt, fs::symlink};
+    let root = tempfile::tempdir().unwrap();
+    let version = root.path().join("..version");
+    std::fs::create_dir(&version).unwrap();
+    let file = version.join("config.json");
+    std::fs::write(&file, br#"{"endpoint":"https://objects.example.test","region":"us-east-1","bucket":"output-test","access_key":"test-access","secret_key":"test-secret"}"#).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    symlink("..version", root.path().join("..data")).unwrap();
+    symlink("..data/config.json", root.path().join("config.json")).unwrap();
+    assert!(
+        sandbox_artifacts::S3Config::read_private(&root.path().join("config.json"))
+            .is_err()
+    );
+    // Model the regular inode exposed by a single-file subPath bind mount.
+    let mounted = root.path().join("mounted.json");
+    std::fs::hard_link(&file, &mounted).unwrap();
+    assert!(sandbox_artifacts::S3Config::read_private(&mounted).is_ok());
 }
 
 #[sqlx::test(migrator = "sandbox_store::MIGRATOR")]
