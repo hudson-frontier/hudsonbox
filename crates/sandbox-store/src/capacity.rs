@@ -31,6 +31,11 @@ pub enum Action {
     Provision {
         config: Box<HostProvision>,
     },
+    /// Immutable Kubernetes worker intent, never a sandbox Pod.
+    K8sProvision {
+        config: Box<HostProvision>,
+        worker: Box<crate::k8s_capacity::WorkerConfig>,
+    },
     Status,
     Drain,
     Retire,
@@ -38,7 +43,7 @@ pub enum Action {
 impl Action {
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Provision { .. } => "provision",
+            Self::Provision { .. } | Self::K8sProvision { .. } => "provision",
             Self::Status => "status",
             Self::Drain => "drain",
             Self::Retire => "retire",
@@ -103,7 +108,8 @@ impl Store {
         {
             return Err(Error::Invalid);
         }
-        if let Action::Provision { config } = &request.action {
+        if let Action::Provision { config } | Action::K8sProvision { config, .. } = &request.action
+        {
             if config.host_pool_id != Some(pool) {
                 return Err(Error::Invalid);
             }
@@ -111,12 +117,11 @@ impl Store {
         }
         let value = serde_json::to_value(request).map_err(|_| Error::Invalid)?;
         let mut tx = self.pool().begin().await?;
-        let _kind: String =
-            sqlx::query_scalar("SELECT type FROM host_pools WHERE id=$1 FOR UPDATE")
-                .bind(pool)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(Error::Conflict)?;
+        let kind: String = sqlx::query_scalar("SELECT type FROM host_pools WHERE id=$1 FOR UPDATE")
+            .bind(pool)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(Error::Conflict)?;
         if let Some(row) = sqlx::query("SELECT id,request FROM capacity_operations WHERE host_pool_id=$1 AND idempotency_key=$2")
             .bind(pool).bind(key).fetch_optional(&mut *tx).await? {
             if row.try_get::<Value,_>("request")? != value { return Err(Error::Conflict); }
@@ -130,6 +135,14 @@ impl Store {
         let id = Uuid::now_v7();
         sqlx::query("INSERT INTO capacity_operations(id,host_pool_id,kind,target_ref,idempotency_key,request) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(id).bind(pool).bind(request.action.kind()).bind(request.host.to_string()).bind(key).bind(value).execute(&mut *tx).await?;
+        match &request.action {
+            Action::K8sProvision { config, worker } if kind == "k8s" => {
+                crate::k8s_capacity::enroll(&mut tx, id, pool, request, config, worker).await?;
+            }
+            Action::K8sProvision { .. } => return Err(Error::Conflict),
+            Action::Provision { .. } if kind != "standalone" => return Err(Error::Conflict),
+            _ => {}
+        }
         tx.commit().await?;
         Ok(id)
     }
@@ -141,7 +154,7 @@ impl Store {
         if !(1..=300).contains(&seconds) {
             return Err(Error::Invalid);
         }
-        let row = sqlx::query("UPDATE capacity_operations SET status='running',claim_revision=claim_revision+1,lease_expires_at=clock_timestamp()+make_interval(secs=>$2),available_at=clock_timestamp()+make_interval(secs=>$2),updated_at=clock_timestamp() WHERE id=(SELECT id FROM capacity_operations WHERE host_pool_id=$1 AND status IN ('queued','running') AND claim_revision<$3 AND available_at<=clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,claim_revision,request")
+        let row = sqlx::query("UPDATE capacity_operations SET status='running',claim_revision=claim_revision+1,lease_expires_at=clock_timestamp()+make_interval(secs=>$2),available_at=clock_timestamp()+make_interval(secs=>$2),updated_at=clock_timestamp() WHERE id=(SELECT id FROM capacity_operations WHERE host_pool_id=$1 AND warm_pool_id IS NULL AND status IN ('queued','running') AND claim_revision<$3 AND available_at<=clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING id,claim_revision,request")
             .bind(pool).bind(f64::from(seconds)).bind(MAX_ATTEMPTS).fetch_optional(self.pool()).await?;
         row.map(|r| {
             Ok(Claim {
@@ -183,7 +196,7 @@ impl Store {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(Error::Conflict)?;
-        let row = sqlx::query("SELECT status,provider_receipt IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) unclaimed FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 FOR UPDATE")
+        let row = sqlx::query("SELECT status,provider_receipt IS NULL AND (lease_expires_at IS NULL OR lease_expires_at<=clock_timestamp()) unclaimed FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 AND warm_pool_id IS NULL FOR UPDATE")
             .bind(id).bind(pool).fetch_optional(&mut *tx).await?.ok_or(Error::Conflict)?;
         let status: String = row.try_get("status")?;
         if status == "cancelled" {
@@ -220,6 +233,9 @@ impl Store {
         let value: Value=sqlx::query_scalar("SELECT request FROM capacity_operations WHERE id=$1 AND host_pool_id=$2 AND claim_revision=$3 AND status='running' AND lease_expires_at>clock_timestamp() FOR UPDATE")
             .bind(claim.id).bind(claim.pool).bind(claim.revision).fetch_optional(&mut *tx).await?.ok_or(Error::LostClaim)?;
         let request: Request = serde_json::from_value(value).map_err(|_| Error::Invalid)?;
+        if matches!(request.action, Action::K8sProvision { .. }) {
+            return Err(Error::Conflict);
+        }
         let retired: Option<bool>=sqlx::query_scalar("SELECT capacity_retired_at IS NOT NULL FROM hosts WHERE id=$1 AND host_pool_id=$2 FOR UPDATE")
             .bind(request.host.uuid()).bind(claim.pool).fetch_optional(&mut *tx).await?;
         // A retired host is a retained tombstone. Only status and exact retire
@@ -256,7 +272,10 @@ impl Store {
                 Action::Retire => {
                     let fresh: bool=sqlx::query_scalar("SELECT COALESCE(last_seen_at>clock_timestamp()-interval '30 seconds',false) FROM hosts WHERE id=$1")
                         .bind(request.host.uuid()).fetch_one(&mut *tx).await?;
-                    if report.status != "draining" || report.outstanding_allocations != 0 || !fresh
+                    if report.status != "draining"
+                        || report.outstanding_allocations != 0
+                        || report.unretired_warm_members != 0
+                        || !fresh
                     {
                         return Err(Error::Conflict);
                     }

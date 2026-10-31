@@ -30,6 +30,35 @@ service Supervisor {
   rpc InspectLease(LeaseInspection) returns (LeaseObservation);
   // Cleanup evidence for an older retained owner; never start or renew work.
   rpc ReconcilePreviousAllocation(PreviousAllocationRequest) returns (PreviousAllocationObservation);
+  // Warm pools (#188). Each request/receipt is bounded sandbox_protocol::warm_pool
+  // JSON. Prepare boots one unused VM that holds no project identity or secret.
+  rpc PrepareWarmMember(WarmPrepareRequest) returns (WarmObservation);
+  // Bind a prepared, never-used VM to exactly one registered allocation scope.
+  rpc AdoptWarmMember(WarmAdoptRequest) returns (WarmObservation);
+  // Lost-ack reconciliation: never adopts. An unadopted member is fenced against
+  // this scope and reported rejected, so a late Adopt cannot apply afterwards.
+  rpc InspectWarmHandoff(WarmAdoptRequest) returns (WarmObservation);
+  // Destroy an unassigned member; never touches an adopted allocation.
+  rpc RetireWarmMember(WarmRetireRequest) returns (WarmObservation);
+}
+
+message WarmPrepareRequest { bytes intent_json = 1; }
+message WarmAdoptRequest {
+  // Operation fencing for the create claim; must name the scope's allocation.
+  Ownership ownership = 1;
+  // Exact HandoffIntent persisted with the database claim.
+  bytes intent_json = 2;
+  // Registered allocation permit derived from that intent; the supervisor
+  // requires both to match. Unregistered or mismatched permits never adopt.
+  bytes launch_permit_json = 3;
+  int64 allocation_expires_unix_ms = 4;
+}
+message WarmRetireRequest { bytes intent_json = 1; }
+message WarmObservation {
+  // Tagged sandbox_protocol::warm_pool::WarmReceipt.
+  bytes receipt_json = 1;
+  bool simulated = 2;
+  int64 observed_unix_ms = 3;
 }
 
 message PreviousAllocationRequest {

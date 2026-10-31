@@ -41,6 +41,9 @@ enum Action {
     CapacityTick {
         #[arg(long)]
         pool_id: uuid::Uuid,
+        /// Private explicit HTTPS cluster/CA/token file references. No ambient kubeconfig.
+        #[arg(long)]
+        k8s_config: Option<PathBuf>,
     },
     /// Cancel a stale, unclaimed static intent that has no receipt.
     CapacityCancel {
@@ -116,7 +119,9 @@ enum Action {
         #[arg(long)]
         pool_id: uuid::Uuid,
         #[arg(long)]
-        discovery_config: PathBuf,
+        discovery_config: Option<PathBuf>,
+        #[arg(long)]
+        k8s_config: Option<PathBuf>,
     },
 }
 
@@ -210,10 +215,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
             let request = serde_json::from_slice(&private_bytes(&request_config)?)?;
             serde_json::json!({"operation_id": store.enqueue_capacity(pool_id, &idempotency_key, &request).await?})
         }
-        Action::CapacityTick { pool_id } => {
-            let router = sandbox_controller::capacity::ProviderRouter::default().with(
+        Action::CapacityTick {
+            pool_id,
+            k8s_config,
+        } => {
+            let mut router = sandbox_controller::capacity::ProviderRouter::default().with(
                 std::sync::Arc::new(sandbox_controller::capacity::StandaloneStaticProvider),
             );
+            if let Some(path) = k8s_config {
+                router = router.with(std::sync::Arc::new(k8s_provider(&path)?));
+            }
             match store.claim_capacity(pool_id, 30).await? {
                 Some(claim) => router.apply(&store, &claim).await?,
                 None => serde_json::json!({"idle":true}),
@@ -280,14 +291,25 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Action::Discover {
             pool_id,
             discovery_config,
+            k8s_config,
         } => {
             let pool = store
                 .host_pool(pool_id)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("pool missing"))?;
-            let router = ProviderRouter::new().with(std::sync::Arc::new(
-                StandaloneStaticDiscovery::from_json(&private_bytes(&discovery_config)?)?,
-            ));
+            anyhow::ensure!(
+                discovery_config.is_some() != k8s_config.is_some(),
+                "select one discovery config"
+            );
+            let mut router = ProviderRouter::new();
+            if let Some(path) = discovery_config {
+                router = router.with(std::sync::Arc::new(StandaloneStaticDiscovery::from_json(
+                    &private_bytes(&path)?,
+                )?));
+            }
+            if let Some(path) = k8s_config {
+                router = router.with(std::sync::Arc::new(k8s_provider(&path)?));
+            }
             let discovered = router.discover(&pool).await?;
             serde_json::to_value(reconcile(
                 &discovered,
@@ -303,6 +325,31 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
     println!("{}", serde_json::to_string(&value)?);
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct K8sConfig {
+    version: u32,
+    server: String,
+    credential_secret_ref: String,
+    ca_file: PathBuf,
+    token_file: PathBuf,
+}
+fn k8s_provider(
+    path: &std::path::Path,
+) -> anyhow::Result<sandbox_controller::k8s_capacity::KubernetesCapacityProvider> {
+    use sandbox_controller::k8s_capacity::{HttpKubernetesApi, KubernetesCapacityProvider};
+    let config: K8sConfig = serde_json::from_slice(&private_bytes(path)?)?;
+    anyhow::ensure!(config.version == 1, "unsupported cluster configuration");
+    let token = String::from_utf8(private_bytes(&config.token_file)?)?;
+    let api = HttpKubernetesApi::new(
+        &config.server,
+        &private_bytes(&config.ca_file)?,
+        token.trim().into(),
+        config.credential_secret_ref,
+    )?;
+    Ok(KubernetesCapacityProvider::new(std::sync::Arc::new(api)))
 }
 
 async fn host_action(

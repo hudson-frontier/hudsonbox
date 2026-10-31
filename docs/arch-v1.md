@@ -1,6 +1,6 @@
 # Architecture v1: standalone and Kubernetes deployment
 
-Snapshot: 2026-10-30. This is the target deployment view discussed for [release tracker #177](https://github.com/hudson-frontier/hudsonbox/issues/177), not a report of a production deployment or completed release. The standalone foundation exists. Registry-based multi-host placement, per-owner routing, host-loss reconciliation and static standalone capacity operations are implemented, with portable fake-supervisor evidence only; supported two-host Linux/KVM qualification has not been run. Kubernetes workers, durable checkpoints and the complete tenant model remain proposed work.
+Snapshot: 2026-10-30. This is the target deployment view discussed for [release tracker #177](https://github.com/hudson-frontier/hudsonbox/issues/177), not a report of a production deployment or completed release. The standalone foundation exists. Registry-based multi-host placement, per-owner routing, host-loss reconciliation and static standalone capacity operations are implemented, with portable fake-supervisor evidence only; supported two-host Linux/KVM qualification has not been run. An optional Kubernetes worker capacity adapter is implemented; real Kubernetes/KVM qualification, durable checkpoints and the complete tenant model remain incomplete.
 
 [Architecture](architecture.md) remains authoritative for component boundaries; [lifecycle](lifecycle.md), [networking](networking.md), [authentication](auth-design.md) and [roadmap](roadmap.md) own their detailed contracts. This snapshot explains how the two deployment options fit together without making Kubernetes a customer prerequisite.
 
@@ -39,7 +39,7 @@ flowchart TB
         SA -.-> H2
     end
 
-    subgraph KT["Option B: Kubernetes capacity integration — proposed"]
+    subgraph KT["Option B: optional Kubernetes capacity integration"]
         KA["Worker-pool capacity adapter"]
         KAPI["Kubernetes API / scheduler<br/>Worker Pod CPU and RAM reservations"]
         AUTO["Configured node autoscaler / provider<br/>Provision eligible KVM-capable nodes"]
@@ -95,7 +95,7 @@ A worker Pod packages the supervisor and host-side Firecracker processes. Custom
 1. The client submits an approved image, resource request and stable idempotency key. The API authenticates the project, checks policy and persists an operation. It returns an operation ID; admission is not readiness.
 2. The controller claims the operation and reserves eligible capacity. The implemented fleet placement also checks approved host capabilities and shared/dedicated pool access; snapshot/cache locality remains proposed.
 3. **Standalone:** select an existing registered host. Operators initially provide capacity; a future provider adapter may add hosts under explicit configuration.
-4. **Kubernetes:** select an existing ready worker. A proposed capacity adapter expands worker Pods with explicit resource budgets. A separately configured node autoscaler can add eligible nodes when those Pods cannot fit. Sandbox demand must be translated into worker demand; Kubernetes cannot infer it from out-of-band Firecracker processes.
+4. **Kubernetes:** select an existing ready worker. The optional capacity adapter creates bounded worker Pods from explicit durable intents and resource budgets. A separately configured node autoscaler can add eligible nodes when those Pods cannot fit. Sandbox demand must be translated into worker demand; Kubernetes cannot infer it from out-of-band Firecracker processes.
 5. The supervisor validates ownership and capacity independently, records intent, prepares private disks and launches the guarded Firecracker allocation. Kubernetes packaging must preserve guardian watchdogs, ownership fencing, host limits and cleanup rather than bypass them.
 6. The guest boots and authenticates over vsock. A matching live guest handshake establishes readiness; merely observing a Firecracker process does not.
 7. Execute requests follow API → PostgreSQL → controller → supervisor → vsock → guest agent → customer process. Files and output use scoped API/supervisor/guest paths, with object storage for artifacts; bulk bytes bypass the controller work queue. The client can reconnect using the same operation handle.
@@ -136,10 +136,10 @@ Open-source and proprietary offerings need the same isolation baseline. Self-hos
 
 - **Implemented foundation:** authenticated API and clients, PostgreSQL operations, supervisor/guardian, real guest execution, files, output and cancellation, with controlled development evidence. The controller adds registry-based multi-host placement with shared/dedicated pool access, per-owner routing, host-loss reconciliation without premature release, and static standalone capacity operations; their evidence is portable fake-supervisor and PostgreSQL testing only.
 - **Incomplete qualification:** supported-host security/resource/concurrency gates, the [operator two-host Linux/KVM procedure](evidence/2026-10-30-fleet-qualification.md#operator-two-host-linuxkvm-qualification-not-run) (not run), production images, complete cleanup/reclamation and independent operator installation.
-- **Proposed extensions:** durable checkpoints/full pause-resume and checkpoint-based host-loss recovery (#178), network enforcement and guest ingress, Kubernetes worker packaging/capacity integration, cloud host provisioning, warm pools and complete tenant administration.
+- **Proposed extensions:** durable checkpoints/full pause-resume and checkpoint-based host-loss recovery (#178), network enforcement and guest ingress, qualified Kubernetes worker packaging, cloud host provisioning and complete tenant administration. Warm-pool runtime qualification remains incomplete.
 
 The API/controller themselves can run as ordinary services or Kubernetes Deployments; their packaging does not determine the sandbox isolation boundary. Detailed delivery is tracked in [#177](https://github.com/hudson-frontier/hudsonbox/issues/177) and its sub-issues. This document supplies no deployment, infrastructure-purchase or release authorization.
 
 ## Accepted fleet and warm-pool models
 
-The [accepted v1 data model](data-models.md#accepted-v1-fleet-and-warm-pool-model) locks host pools, immutable sandbox templates, warm-pool policies/members and durable capacity operations as the implementation baseline. `host_pools.type` is exactly `k8s` or `standalone`; the provider router selects the corresponding capacity/discovery adapter. Controller-to-supervisor communication remains gRPC/mTLS in both paths. Registry/pool migrations and [static standalone capacity operations](host-maintenance.md#standalone-durable-capacity-operations) implement part of this baseline. Templates, warm-pool runtime and Kubernetes capacity support remain unimplemented.
+The [accepted v1 data model](data-models.md#accepted-v1-fleet-and-warm-pool-model) locks host pools, immutable sandbox templates, warm-pool policies/members and durable capacity operations as the implementation baseline. `host_pools.type` is exactly `k8s` or `standalone`; the provider router selects the corresponding capacity/discovery adapter. Controller-to-supervisor communication remains gRPC/mTLS in both paths. Registry/pool migrations and [static standalone capacity operations](host-maintenance.md#standalone-durable-capacity-operations) implement part of this baseline. The [optional Kubernetes adapter](kubernetes-capacity.md) implements worker capacity intent and discovery, with cluster/KVM qualification still open. [Warm pools](warm-pools.md) implement templates, fenced reservations, supervisor RPCs and bounded upkeep; supported runtime qualification remains incomplete.

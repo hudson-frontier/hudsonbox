@@ -127,3 +127,12 @@ git diff --check
 The unit tests use mocked tool/platform/KVM results. They need no daemon, network,
 credentials, sudo or running VM. Passing those tests validates diagnostic behavior,
 not the runtime security gates.
+
+## Optional Kubernetes adapter checks
+
+The [capacity integration guide](kubernetes-capacity.md) distinguishes portable
+fake-API/PostgreSQL checks from unrun real cluster/KVM gates. With the existing
+development database and pinned repository toolchain, run
+`cargo test -p sandbox-controller --test k8s_capacity --test capacity --locked`.
+SQLx creates isolated temporary databases; do not reset shared development state.
+The manifests are review inputs and this test command performs no deployment.

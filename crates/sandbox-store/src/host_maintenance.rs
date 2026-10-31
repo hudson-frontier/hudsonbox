@@ -21,6 +21,10 @@ pub struct HostMaintenance {
     pub previous_epoch_allocations: i64,
     /// Unreleased reservations whose sandbox runtime is currently unknown.
     pub unknown_state_allocations: i64,
+    /// Warm members (#188) on this host, any epoch, that are not assigned to an
+    /// allocation and lack cleanup evidence. Their reservations still hold;
+    /// retirement requires zero.
+    pub unretired_warm_members: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -120,6 +124,13 @@ pub(crate) async fn report(
     .bind(host.uuid())
     .fetch_one(&mut **tx)
     .await?;
+    let warm: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM warm_pool_members WHERE host_id=$1
+        AND state IN ('preparing','ready','claiming','retiring')",
+    )
+    .bind(host.uuid())
+    .fetch_one(&mut **tx)
+    .await?;
     Ok(HostMaintenance {
         host_id: host.to_string(),
         supervisor_epoch: row.try_get("supervisor_epoch")?,
@@ -132,6 +143,7 @@ pub(crate) async fn report(
         unknown_operations: work.1,
         previous_epoch_allocations: reservations.4,
         unknown_state_allocations: reservations.5,
+        unretired_warm_members: warm,
     })
 }
 
@@ -282,6 +294,13 @@ impl Store {
         let value = report(&mut tx, host, expected_epoch).await?;
         if value.status != "draining" {
             return Err(Error::Conflict);
+        }
+        // A Kubernetes worker is not usable capacity until its original Pod UID
+        // is durably acknowledged. A pending/unknown create cannot open admission.
+        let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM k8s_workers w JOIN capacity_operations c ON c.id=w.provision_operation_id WHERE w.host_id=$1 AND (c.status<>'succeeded' OR w.pod_uid IS NULL OR w.retired))")
+            .bind(host.uuid()).fetch_one(&mut *tx).await?;
+        if pending {
+            return Err(Error::Outstanding);
         }
         let fresh: bool = sqlx::query_scalar("SELECT COALESCE(last_seen_at>clock_timestamp()-interval '30 seconds',false) FROM hosts WHERE id=$1")
             .bind(host.uuid()).fetch_one(&mut *tx).await?;

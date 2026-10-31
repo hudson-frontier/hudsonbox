@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+reqwest.workspace = true
 rcgen = { workspace = true }
 serde = { workspace = true }
 rustix = { workspace = true }
@@ -32,7 +33,6 @@ sandbox-client = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["process", "test-util"] }
 sandbox-cleanup = { path = "../sandbox-cleanup" }
-reqwest.workspace = true
 sandbox-api = { path = "../sandbox-api" }
 sandbox-fake-host = { path = "../sandbox-fake-host" }
 axum = { workspace = true }

@@ -7,6 +7,8 @@ mod commands;
 mod file_downloads;
 mod files;
 mod live_output;
+mod permits;
+mod warm;
 use sandbox_protocol::{
     AllocationId, HostId, OperationId, ProjectId, SandboxId,
     supervisor::{
@@ -71,6 +73,12 @@ struct State {
     lose_next_archive_reply: bool,
     archive_delay: Duration,
     archives_started: u64,
+    warm: HashMap<uuid::Uuid, warm::Member>,
+    warm_prepares: u64,
+    warm_adoptions: u64,
+    lose_next_adopt_reply: bool,
+    lose_prepare_replies: u32,
+    permits: permits::Registry,
 }
 
 impl std::fmt::Debug for State {
@@ -478,6 +486,42 @@ impl FakeHost {
 
 #[tonic::async_trait]
 impl Supervisor for FakeHost {
+    async fn prepare_warm_member(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmPrepareRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_prepare(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn adopt_warm_member(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmAdoptRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_handoff(request.into_inner(), false)
+            .await
+            .map(Response::new)
+    }
+
+    async fn inspect_warm_handoff(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmAdoptRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_handoff(request.into_inner(), true)
+            .await
+            .map(Response::new)
+    }
+
+    async fn retire_warm_member(
+        &self,
+        request: Request<sandbox_protocol::supervisor::WarmRetireRequest>,
+    ) -> Result<Response<sandbox_protocol::supervisor::WarmObservation>, Status> {
+        self.warm_retire(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
     async fn forget_allocation(
         &self,
         _: Request<sandbox_protocol::supervisor::AllocationForgetRequest>,
@@ -507,12 +551,12 @@ impl Supervisor for FakeHost {
 
     async fn allocation_authority(
         &self,
-        _: Request<sandbox_protocol::supervisor::AllocationAuthorityRequest>,
+        request: Request<sandbox_protocol::supervisor::AllocationAuthorityRequest>,
     ) -> Result<Response<sandbox_protocol::supervisor::AllocationAuthorityObservation>, Status>
     {
-        Err(Status::unimplemented(
-            "fake host does not provide durable launch authority",
-        ))
+        self.allocation_authority_inner(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn retire_released_history(
@@ -638,12 +682,13 @@ impl Supervisor for FakeHost {
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HostInfo>, Status> {
-        if std::mem::take(&mut self.state.lock().await.fail_next_health) {
+        let mut state = self.state.lock().await;
+        if std::mem::take(&mut state.fail_next_health) {
             return Err(Status::unavailable("injected health failure"));
         }
         Ok(Response::new(HostInfo {
-            capabilities_json: self.state.lock().await.capabilities_json.clone(),
-            launch_permits_required: false,
+            capabilities_json: state.capabilities_json.clone(),
+            launch_permits_required: state.permits.required(),
             host_id: self.config.host.to_string(),
             supervisor_epoch: self.config.epoch,
             simulated: true,
@@ -687,6 +732,10 @@ impl Supervisor for FakeHost {
                 "allocation was stopped before create",
             ));
         }
+        // A new allocation receipt requires the exact registered permit.
+        state
+            .permits
+            .admit(&request.launch_permit_json, &owner, true)?;
         let duration = bounded_deadline(request.allocation_expires_unix_ms, now)?;
         if !self.config.images.contains(&request.image_digest) {
             return Err(Status::permission_denied("image not allowed"));
@@ -719,9 +768,8 @@ impl Supervisor for FakeHost {
         if state.allocations.len() >= MAX_RECORDS {
             return Err(Status::resource_exhausted("fake receipt store full"));
         }
-        let mut cpu = 0u64;
-        let mut memory = 0u64;
-        let mut disk = 0u64;
+        // Unadopted warm members hold capacity exactly like allocations.
+        let (mut cpu, mut memory, mut disk) = Self::warm_held(&state);
         for r in state
             .allocations
             .values()

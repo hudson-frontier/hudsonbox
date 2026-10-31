@@ -333,8 +333,8 @@ capacity router dispatches exactly `host_pools.type` (`standalone` or `k8s`);
 an unconfigured Kubernetes adapter fails closed. Sandbox operations, project
 access, placement reservations and supervisor gRPC/mTLS remain unchanged.
 
-Migration 0027 adds `capacity_operations`: pool, optional warm-pool seam (NULL
-only until warm pools ship), kind, target, idempotency key, retained request,
+Migration 0027 adds `capacity_operations`: pool, optional warm-pool seam (used
+by `warm_prepare`/`warm_retire` intents since [migration 0030](warm-pools.md)), kind, target, idempotency key, retained request,
 status, claim revision, database-clock lease, provider receipt and fixed error.
 Pool-scoped exact retries preserve the ID and receipt; changed input conflicts.
 Only one live claim can apply an intent. Expired/replaced claims cannot commit
@@ -370,7 +370,8 @@ explicitly finish drain through the existing manager commands. Drain blocks new
 placement and retains running work. Status receipts describe their completion
 snapshot; use registry/status again for current health.
 
-Retire requires draining, zero unreleased allocations and fresh authenticated
+Retire requires draining, zero unreleased allocations, zero unretired warm-pool
+members (`unretired_warm_members`) and fresh authenticated
 health. Occupied, unhealthy, stale and uncertain hosts fail closed. Recovery must
 first complete the existing verified allocation cleanup/fencing path; a lease
 expiry, provider disappearance or operator assertion never releases capacity.

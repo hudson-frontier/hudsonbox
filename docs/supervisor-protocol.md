@@ -154,3 +154,7 @@ Original host records and root fencing entries remain retained. The observation 
 ### ForgetAllocation
 
 The authenticated controller issues a bounded `ForgetRequest` only after retaining database metadata completion. The host validates exact scope and physical metadata absence, durably completes root authority, removes its journal record and then forgets the root entry. `Forgotten` acknowledges this handoff; `Retired` is only closed-serial denial and must never be translated into `Released` or `FencedAbsent`. The database requires its independently retained metadata completion and exact fresh claim before consuming either response. See [claim ownership and crash recovery](allocation-retirement.md#database-and-host-forgetting-handoff). The [controller worker](allocation-retirement.md#automatic-controller-worker) now dispatches and reconciles these requests.
+
+## Warm-pool RPCs
+
+`PrepareWarmMember`, `AdoptWarmMember`, `InspectWarmHandoff` and `RetireWarmMember` carry bounded `sandbox_protocol::warm_pool` JSON. Adoption requires the exact database handoff intent together with its derived allocation permit and matching ownership; inspection never adopts and fences an unadopted member. The fake host simulates members; the real host answers fail-closed. [Warm pools](warm-pools.md#supervisor-protocol-and-adoption-authority) owns the contract and the [real Firecracker blocker](warm-pools.md#real-firecracker-blocker).

@@ -277,6 +277,11 @@ async fn upgrade_preserves_existing_host_state_and_is_repeatable(pool: PgPool) {
             .is_null()
     );
     assert_eq!(before, after);
+    let workers: i64 = sqlx::query_scalar("SELECT count(*) FROM k8s_workers")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(workers, 0);
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM capacity_operations")
         .fetch_one(&pool)
         .await

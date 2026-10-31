@@ -85,8 +85,12 @@ pub async fn plan(store: &Store, pool: &HostPool, demand: Demand) -> Result<Capa
         .registered_hosts(Some(pool.id))
         .await
         .map_err(|_| Error::Invalid)?;
-    let enrolled = u32::try_from(hosts.iter().filter(|h| !h.capacity_retired).count())
-        .map_err(|_| Error::Invalid)?;
+    let enrolled = if pool.pool_type == PoolType::K8s {
+        store.k8s_capacity_inventory(pool.id).await?
+    } else {
+        u32::try_from(hosts.iter().filter(|h| !h.capacity_retired).count())
+            .map_err(|_| Error::Invalid)?
+    };
     let ready = u32::try_from(hosts.iter().filter(|h| h.admits_new_work()).count())
         .map_err(|_| Error::Invalid)?;
     let max = u32::try_from(pool.max_hosts).map_err(|_| Error::Invalid)?;
