@@ -467,10 +467,7 @@ fn projected_artifact_secret_requires_a_regular_file_mount() {
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
     symlink("..version", root.path().join("..data")).unwrap();
     symlink("..data/config.json", root.path().join("config.json")).unwrap();
-    assert!(
-        sandbox_artifacts::S3Config::read_private(&root.path().join("config.json"))
-            .is_err()
-    );
+    assert!(sandbox_artifacts::S3Config::read_private(&root.path().join("config.json")).is_err());
     // Model the regular inode exposed by a single-file subPath bind mount.
     let mounted = root.path().join("mounted.json");
     std::fs::hard_link(&file, &mounted).unwrap();
