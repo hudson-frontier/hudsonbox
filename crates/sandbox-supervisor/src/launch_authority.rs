@@ -476,6 +476,14 @@ pub fn authorize(root: &Path, permit: Option<&Permit>) -> Result<LaunchGuard> {
     Ok(LaunchGuard { _lock: lock })
 }
 
+/// Launch or clean an inert warm member (#188). It names no allocation, so no
+/// permit applies; the shared gate still orders it against exclusive fences.
+/// Adoption separately requires the exact registered allocation permit.
+pub fn authorize_member(root: &Path) -> Result<LaunchGuard> {
+    Ok(LaunchGuard {
+        _lock: gate(root, false)?,
+    })
+}
 /// Serialize cleanup with retirement. Fenced owners can inspect/clean existing
 /// state but cannot create an allocation directory or replacement lifecycle lock.
 pub(crate) fn authorize_cleanup(

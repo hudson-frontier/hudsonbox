@@ -36,6 +36,8 @@ enum Metadata {
     Absent {},
     Stopped {
         directory: Identity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_manifest: Option<Box<Manifest>>,
         receipt: Box<Receipt>,
         files: BTreeMap<String, Entry>,
         #[serde(default)]
@@ -58,8 +60,7 @@ impl Plan {
     }
     fn validate(&self, intent: &Intent, manifest: Option<&Manifest>) -> Result<()> {
         ensure!(
-            (self.version == 1 || self.version == 2)
-                && self.intent_sha256 == hex::encode(intent.digest()?),
+            (1..=3).contains(&self.version) && self.intent_sha256 == hex::encode(intent.digest()?),
             "deletion scope mismatch"
         );
         match (&self.metadata, manifest) {
@@ -67,13 +68,23 @@ impl Plan {
             (
                 Metadata::Stopped {
                     directory,
+                    original_manifest,
                     receipt,
                     files,
                     staged,
                 },
                 Some(manifest),
             ) => {
-                manifest.validate_receipt(receipt)?;
+                let original = retirement_manifest(manifest, receipt)?;
+                ensure!(
+                    match (original_manifest, manifest.is_bound_view()) {
+                        (Some(retained), true) =>
+                            self.version == 3 && retained.digest()? == original.digest()?,
+                        (None, false) => true,
+                        _ => false,
+                    },
+                    "missing or changed original retirement manifest"
+                );
                 ensure!(
                     receipt.state == State::Stopped && receipt.cleanup_confirmed,
                     "unverified deletion cleanup"
@@ -86,7 +97,7 @@ impl Plan {
                     .values()
                     .try_fold(0u64, |total, entry| total.checked_add(entry.len));
                 ensure!(
-                    (self.version == 2 || staged.is_empty())
+                    (self.version >= 2 || staged.is_empty())
                         && staged.len() <= MAX_STAGED_FILES
                         && staged_bytes.is_some_and(|n| n <= MAX_STAGED_BYTES)
                         && staged.keys().all(|name| is_staging_name(name)),
@@ -94,7 +105,7 @@ impl Plan {
                 );
                 ensure!(directory.inode > 0, "invalid deletion directory identity");
                 let receipt_bytes = serde_json::to_vec(receipt)?;
-                let manifest_bytes = serde_json::to_vec(manifest)?;
+                let manifest_bytes = serde_json::to_vec(&original)?;
                 for (name, bytes) in [
                     ("receipt.json", receipt_bytes),
                     ("manifest.json", manifest_bytes),
@@ -140,6 +151,40 @@ impl Plan {
         Ok(())
     }
 }
+/// Reconstruct the immutable inert manifest from the retained allocation view.
+/// Its digest and the guardian's confirmed permit-bearing binding independently
+/// pin the slot and ownership mapping; a caller-selected path is never authority.
+fn retirement_manifest(view: &Manifest, receipt: &Receipt) -> Result<Manifest> {
+    view.validate_receipt(receipt)?;
+    let mut original = view.clone();
+    if view.is_bound_view() {
+        let binding = receipt
+            .binding
+            .as_ref()
+            .context("missing adoption binding")?;
+        ensure!(
+            binding.permit == view.launch_permit,
+            "adoption permit changed"
+        );
+        let (owner, digest) = view.receipt_identity()?;
+        original.start.owner = owner;
+        original.launch_permit = None;
+        original
+            .member
+            .as_mut()
+            .context("missing member")?
+            .bound_from = None;
+        ensure!(
+            original.digest()? == digest,
+            "original member manifest changed"
+        );
+        ensure!(
+            original.bound(binding)?.digest()? == view.digest()?,
+            "adoption mapping changed"
+        );
+    }
+    Ok(original)
+}
 fn absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -183,7 +228,14 @@ impl Plan {
                 "retirement guardian scope mismatch"
             );
         }
-        verify_absent(root, cgroup_parent, intent)
+        if let Some(m) = manifest {
+            absent(&m.directory())?;
+            absent(&m.group())?;
+            File::open(root)?.sync_all()?;
+            Ok(())
+        } else {
+            verify_absent(root, cgroup_parent, intent)
+        }
     }
 }
 fn entry(path: &Path) -> Result<Entry> {
@@ -250,8 +302,9 @@ impl Session {
             "invalid retirement cgroup parent"
         );
         let p = &intent.permit;
-        let path = root.join(p.allocation.to_string());
-        absent(&cgroup_parent.join(p.allocation.uuid().to_string()))?;
+        let key = manifest.map_or(p.allocation, Manifest::key);
+        let path = root.join(key.to_string());
+        absent(&cgroup_parent.join(key.uuid().to_string()))?;
         if let Some(m) = manifest {
             m.validate()?;
             ensure!(
@@ -399,16 +452,18 @@ impl Session {
         } else {
             let metadata = if let Some(manifest) = manifest {
                 let disk: Manifest = read_json(&path.join("manifest.json"))?;
+                let receipt = manifest.receipt()?;
+                let original = retirement_manifest(manifest, &receipt)?;
                 ensure!(
-                    disk.digest()? == manifest.digest()?,
+                    disk.digest()? == original.digest()?,
                     "retirement manifest changed"
                 );
-                let receipt = manifest.receipt()?;
                 ensure!(
                     receipt.cleanup_confirmed && receipt.state == State::Stopped,
                     "guardian cleanup unconfirmed"
                 );
                 Metadata::Stopped {
+                    original_manifest: manifest.is_bound_view().then(|| Box::new(original)),
                     directory: Identity::of(
                         &directory
                             .as_ref()
@@ -423,7 +478,11 @@ impl Session {
                 Metadata::Absent {}
             };
             Plan {
-                version: 2,
+                version: if manifest.is_some_and(Manifest::is_bound_view) {
+                    3
+                } else {
+                    2
+                },
                 intent_sha256: hex::encode(intent.digest()?),
                 metadata,
             }

@@ -105,6 +105,11 @@ node remain unqualified gates, not results of the fake API tests.
 There is no `compute_nodes` accounting model yet. Required Pod anti-affinity on
 `kubernetes.io/hostname`, with an all-namespace selector for the common worker
 label, permits **one Hudsonbox worker per node across all pools/namespaces**.
+Discovery also refuses (fails closed) a result in which two active, non-terminating
+worker Pods report the same `spec.nodeName`, so node capacity is never counted twice
+even if anti-affinity is bypassed. A Pod re-created under a deleted worker's name is
+a new incarnation (new UID in its provider reference) and inherits no registry
+ownership, allocations or warm members; these are fake-API tests, not cluster evidence.
 Nodes must have the reviewed KVM label and matching architecture, a dedicated
 NoSchedule taint and enough allocatable resources including kube/system overhead.
 Do not colocate standalone supervisors or manually bypass the common label,
