@@ -301,6 +301,66 @@ pub struct RetireIntent {
     pub operation_revision: i64,
 }
 
+/// Cleanup of a retained member from an earlier supervisor incarnation.
+/// Sent through RetireWarmMember over the authenticated current host channel.
+/// Older implementations reject this distinct envelope rather than treating it
+/// as an ordinary retire. The original intent and epoch remain immutable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousRetireIntent {
+    pub version: u32,
+    pub original: RetireIntent,
+    pub reporting_epoch: i64,
+}
+
+impl PreviousRetireIntent {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.version != VERSION
+            || self.original.version != VERSION
+            || self.original.supervisor_epoch <= 0
+            || self.reporting_epoch <= self.original.supervisor_epoch
+            || self.original.operation_revision <= 0
+            || self.original.operation_id.is_nil()
+            || self.original.member_id.is_nil()
+            || self
+                .original
+                .vm_ref
+                .as_deref()
+                .is_some_and(|v| !valid_vm_ref(v))
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+}
+
+/// Destruction evidence from retained, fenced original ownership. Unknown old
+/// members must never receive this receipt. Customer-used members are cleaned
+/// through allocation reconciliation, never this unused-member protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviousCleanupReceipt {
+    pub version: u32,
+    pub request: PreviousRetireIntent,
+    pub cleanup: CleanupReceipt,
+}
+
+impl PreviousCleanupReceipt {
+    pub fn verify(&self, expected: &PreviousRetireIntent) -> Result<(), Error> {
+        expected.validate()?;
+        if self.version != VERSION || self.request != *expected {
+            return Err(Error::Mismatch);
+        }
+        let original = &expected.original;
+        self.cleanup.verify(
+            original.member_id,
+            original.vm_ref.as_deref(),
+            original.host_id,
+            original.supervisor_epoch,
+        )
+    }
+}
+
 /// Bounded supervisor answer for every warm RPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -308,6 +368,7 @@ pub enum WarmReceipt {
     Prepared { receipt: PrepareReceipt },
     Handoff { receipt: HandoffReceipt },
     Cleanup { receipt: CleanupReceipt },
+    PreviousCleanup { receipt: PreviousCleanupReceipt },
 }
 
 /// Upper bound for any warm request or receipt JSON.

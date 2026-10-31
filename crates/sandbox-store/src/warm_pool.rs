@@ -943,6 +943,51 @@ impl Store {
         claim: &WarmClaim,
         receipt: &CleanupReceipt,
     ) -> Result<(), Error> {
+        self.record_warm_cleanup_inner(claim, receipt, None).await
+    }
+
+    /// Accept previous-epoch evidence only for the exact live retire claim and
+    /// the still-current reporting incarnation. Host routing/authentication is
+    /// performed by the controller; a stale heartbeat is never release proof.
+    pub async fn record_previous_warm_cleanup(
+        &self,
+        claim: &WarmClaim,
+        receipt: &sandbox_protocol::warm_pool::PreviousCleanupReceipt,
+    ) -> Result<(), Error> {
+        use sandbox_protocol::warm_pool::{PreviousRetireIntent, RetireIntent};
+        let WarmWork::Retire {
+            member_id,
+            vm_ref,
+            host_id,
+            supervisor_epoch,
+        } = &claim.work
+        else {
+            return Err(Error::Invalid);
+        };
+        let expected = PreviousRetireIntent {
+            version: VERSION,
+            original: RetireIntent {
+                version: VERSION,
+                member_id: *member_id,
+                vm_ref: vm_ref.clone(),
+                host_id: *host_id,
+                supervisor_epoch: *supervisor_epoch,
+                operation_id: claim.id,
+                operation_revision: claim.revision,
+            },
+            reporting_epoch: receipt.request.reporting_epoch,
+        };
+        receipt.verify(&expected)?;
+        self.record_warm_cleanup_inner(claim, &receipt.cleanup, Some(receipt))
+            .await
+    }
+
+    async fn record_warm_cleanup_inner(
+        &self,
+        claim: &WarmClaim,
+        receipt: &CleanupReceipt,
+        previous: Option<&sandbox_protocol::warm_pool::PreviousCleanupReceipt>,
+    ) -> Result<(), Error> {
         let WarmWork::Retire {
             member_id,
             vm_ref,
@@ -955,6 +1000,16 @@ impl Store {
         receipt.verify(*member_id, vm_ref.as_deref(), *host_id, *supervisor_epoch)?;
         let mut tx = self.pool().begin().await?;
         timeouts(&mut tx).await?;
+        if let Some(previous) = previous {
+            let current: i64 =
+                sqlx::query_scalar("SELECT supervisor_epoch FROM hosts WHERE id=$1 FOR UPDATE")
+                    .bind(host_id.uuid())
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if current != previous.request.reporting_epoch {
+                return Err(Error::Conflict);
+            }
+        }
         Self::fenced(&mut tx, claim, "warm_retire").await?;
         // Unlocked read to find the create operation, then lock it before the member.
         let allocation: Option<Uuid> =
@@ -988,7 +1043,11 @@ impl Store {
         {
             return Err(Error::Conflict);
         }
-        let evidence = serde_json::to_value(receipt).map_err(|_| Error::Invalid)?;
+        let evidence = match previous {
+            Some(previous) => serde_json::to_value(previous),
+            None => serde_json::to_value(receipt),
+        }
+        .map_err(|_| Error::Invalid)?;
         // An unnamed retire records the VM name the supervisor resolved.
         sqlx::query(
             "UPDATE warm_pool_members SET state='retired',cleanup_evidence=$2,
@@ -999,7 +1058,7 @@ impl Store {
         .bind(&receipt.vm_ref)
         .execute(&mut *tx)
         .await?;
-        if let (Some(op), Some(allocation)) = (operation, allocation) {
+        if let (None, Some(op), Some(allocation)) = (previous, operation, allocation) {
             let returned = sqlx::query(
                 "UPDATE operations SET phase='reserved',next_retry_at=clock_timestamp(),
                  attempt_receipts=attempt_receipts||jsonb_build_array($2::jsonb),updated_at=clock_timestamp()
