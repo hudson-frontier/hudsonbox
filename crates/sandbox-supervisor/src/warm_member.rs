@@ -299,7 +299,9 @@ impl MemberRecord {
         Step::Answer(Self::receipt(
             intent,
             digest,
-            HandoffOutcome::Rejected { reason: reason(why) },
+            HandoffOutcome::Rejected {
+                reason: reason(why),
+            },
         ))
     }
 
@@ -430,7 +432,9 @@ impl MemberRecord {
         Ok(Self::receipt(
             &intent,
             &digest,
-            HandoffOutcome::Rejected { reason: reason(why) },
+            HandoffOutcome::Rejected {
+                reason: reason(why),
+            },
         ))
     }
 
@@ -509,7 +513,9 @@ impl MemberRecord {
                 false
             }
             _ => {
-                self.advance(MemberState::Retiring { reason: reason(why) });
+                self.advance(MemberState::Retiring {
+                    reason: reason(why),
+                });
                 true
             }
         }

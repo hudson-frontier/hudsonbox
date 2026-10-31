@@ -52,6 +52,7 @@ fn fixture() -> (tempfile::TempDir, AuthorityFile, Manifest, Intent) {
             disk_mib: 64,
             expires_unix_ms: wall_ms() + 30000,
         },
+        member: None,
     };
     let intent = Intent {
         version: 1,

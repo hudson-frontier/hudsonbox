@@ -55,6 +55,10 @@ pub(super) struct Journal {
     pub host: HostId,
     pub epoch: i64,
     pub records: BTreeMap<String, Record>,
+    /// Warm members keyed by member ID (#188). Absent in journals written
+    /// before warm members existed; such journals load unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub warm: BTreeMap<String, super::warm::Entry>,
     #[serde(skip)]
     pub poisoned: bool,
 }
@@ -132,6 +136,7 @@ pub(super) fn open(config: &Config) -> anyhow::Result<(File, Journal)> {
                 host: config.host,
                 epoch: config.epoch,
                 records: BTreeMap::new(),
+                warm: BTreeMap::new(),
                 poisoned: false,
             }
         }
@@ -146,6 +151,19 @@ pub(super) fn open(config: &Config) -> anyhow::Result<(File, Journal)> {
             <= sandbox_protocol::supervisor_files::MAX_HOST_FILES,
         "too many host file records"
     );
+    anyhow::ensure!(
+        journal.warm.len() <= super::warm::MAX_MEMBERS,
+        "too many retained warm members"
+    );
+    // Retained members never become adoptable at a new epoch: maintenance
+    // retires them and keeps their reservation until cleanup is proven.
+    for (key, entry) in &journal.warm {
+        super::warm::validate_retained(config, key, entry)?;
+        anyhow::ensure!(
+            entry.record.epoch() < config.epoch,
+            "retained warm member from current epoch"
+        );
+    }
     journal.epoch = config.epoch;
     // New epochs never revive an old owner, even when its guardian survived.
     for (key, record) in &mut journal.records {

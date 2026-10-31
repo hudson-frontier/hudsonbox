@@ -1,33 +1,52 @@
-//! Warm-pool RPCs on the real Firecracker host (#188): fail closed.
+//! Warm-pool RPCs on the real Firecracker host (#188).
 //!
-//! Secure adoption is blocked by the guest boundary, not by this protocol.
-//! The guardian writes the per-allocation bootstrap device (allocation ID,
-//! generation, channel CA and certificates, `allocation-<UUID>` server name)
-//! before launch, the guest agent reads it once at boot, and the guardian's
-//! receipt, journal, lease watchdog and jail are keyed by allocation. A VM
-//! booted before its allocation exists therefore cannot later receive that
-//! identity without a guest late-binding protocol and a guardian re-key, which
-//! do not exist. This binary never prepares a member, so:
+//! A member is one unused VM launched by its own guardian from an inert
+//! version-2 bootstrap (no project, sandbox, operation, token or customer
+//! secret). Its directory, jail, cgroup and vsock channel are keyed by a
+//! host-chosen slot for the VM's whole life. [`MemberRecord`] is persisted in
+//! the host journal before every effect:
 //!
-//! - Prepare is refused; nothing boots.
-//! - Adopt and inspect answer a definitive `rejected/warm_unsupported` receipt
-//!   for the exact scope at this epoch: no member exists to adopt.
-//! - Retire of a member that never reported a VM name is truthful destruction
-//!   evidence at this epoch; a named member was not created by this binary and
-//!   is refused rather than attested.
-use super::Host;
+//! - Prepare reserves capacity durably, stages and launches the guardian, and
+//!   answers a receipt only after the member endpoint authenticated the boot.
+//! - Adopt verifies operation ownership and the exact registered permit
+//!   ([`HandoffIntent::admits`], plus the launch-authority ledger when permits
+//!   are required), fences the intent durably, then asks the member's guardian
+//!   to re-key: it persists the allocation identity and binding before calling
+//!   the guest, and confirms only after the guest acknowledged the identity and
+//!   the allocation channel authenticated the same boot. The same guardian
+//!   keeps its lifecycle lock, watchdog and cgroup throughout. Only then does
+//!   the allocation record exist with a manifest, so no customer RPC reaches
+//!   the VM before binding.
+//! - Inspect never adopts: a recorded outcome or a durable fence.
+//! - Retire destroys an unadopted member and answers only with guardian-proven
+//!   cleanup. Capacity stays held until then, including for members retained
+//!   from a previous epoch.
+use super::*;
+use crate::warm_member::{MemberRecord, MemberState, Refusal, Step};
 use sandbox_protocol::{
-    HostId,
     supervisor::{WarmAdoptRequest, WarmObservation, WarmPrepareRequest, WarmRetireRequest},
     warm_pool::{
-        self, CleanupReceipt, HandoffIntent, HandoffOutcome, HandoffReceipt, RetireIntent, VERSION,
-        WarmReceipt,
+        self, CleanupReceipt, HandoffIntent, HandoffOutcome, HandoffReceipt, PrepareIntent,
+        RetireIntent, VERSION, WarmReceipt,
     },
 };
-use tonic::Status;
 
-const BLOCKED: &str =
-    "warm adoption unavailable: guest bootstrap binds allocation identity at boot (#188)";
+/// Retained member records (all states). Bounds journal growth.
+pub(super) const MAX_MEMBERS: usize = 256;
+/// Inert member channel life; the store's idle TTL retires members earlier.
+const MEMBER_VALIDITY_MS: i64 = 23 * 3_600_000;
+/// Guardian lease step for an inert member; renewed by maintenance.
+const MEMBER_LEASE_MS: i64 = 120_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Entry {
+    pub record: MemberRecord,
+    /// Inert guardian manifest keyed by `record.slot`.
+    pub manifest: Manifest,
+    #[serde(skip)]
+    pub gate: Arc<Mutex<()>>,
+}
 
 fn now_ms() -> Result<i64, Status> {
     i64::try_from(
@@ -48,23 +67,20 @@ fn reply(receipt: &WarmReceipt) -> Result<WarmObservation, Status> {
     })
 }
 
-fn this_epoch(identity: (HostId, i64), host: HostId, epoch: i64) -> Result<(), Status> {
-    if (host, epoch) != identity {
-        return Err(Status::failed_precondition(
-            "wrong host or supervisor epoch",
-        ));
+fn refusal(error: Refusal) -> Status {
+    match error {
+        Refusal::OtherScope => Status::already_exists(error.to_string()),
+        Refusal::WrongScope | Refusal::Changed => Status::invalid_argument(error.to_string()),
+        Refusal::Adopted | Refusal::State => Status::failed_precondition(error.to_string()),
     }
-    Ok(())
 }
 
-fn handoff(identity: (HostId, i64), request: &WarmAdoptRequest) -> Result<WarmObservation, Status> {
-    let intent: HandoffIntent = warm_pool::decode(&request.intent_json)
-        .map_err(|_| Status::invalid_argument("invalid handoff intent"))?;
-    intent
-        .validate()
-        .map_err(|_| Status::invalid_argument("invalid handoff intent"))?;
-    this_epoch(identity, intent.host_id, intent.supervisor_epoch)?;
-    let receipt = HandoffReceipt {
+fn handoff_reply(receipt: HandoffReceipt) -> Result<WarmObservation, Status> {
+    reply(&WarmReceipt::Handoff { receipt })
+}
+
+fn rejected(intent: &HandoffIntent, reason: &str) -> Result<WarmObservation, Status> {
+    handoff_reply(HandoffReceipt {
         version: VERSION,
         member_id: intent.member_id,
         vm_ref: intent.vm_ref.clone(),
@@ -78,131 +94,802 @@ fn handoff(identity: (HostId, i64), request: &WarmAdoptRequest) -> Result<WarmOb
             .digest()
             .map_err(|_| Status::invalid_argument("invalid handoff intent"))?,
         outcome: HandoffOutcome::Rejected {
-            reason: "warm_unsupported".into(),
+            reason: reason.into(),
         },
-    };
-    reply(&WarmReceipt::Handoff { receipt })
+    })
 }
 
-fn retire(identity: (HostId, i64), request: &WarmRetireRequest) -> Result<WarmObservation, Status> {
-    let intent: RetireIntent = warm_pool::decode(&request.intent_json)
-        .map_err(|_| Status::invalid_argument("invalid retire intent"))?;
-    if intent.version != VERSION {
-        return Err(Status::invalid_argument("invalid retire intent"));
-    }
-    this_epoch(identity, intent.host_id, intent.supervisor_epoch)?;
-    if intent.vm_ref.is_some() {
-        return Err(Status::failed_precondition(BLOCKED));
-    }
-    let receipt = CleanupReceipt {
-        version: VERSION,
-        member_id: intent.member_id,
-        vm_ref: None,
-        host_id: intent.host_id,
-        supervisor_epoch: intent.supervisor_epoch,
-        destroyed: true,
-    };
-    reply(&WarmReceipt::Cleanup { receipt })
+/// Validate a member record and its inert manifest loaded from the journal.
+pub(super) fn validate_retained(config: &Config, key: &str, entry: &Entry) -> anyhow::Result<()> {
+    let r = &entry.record;
+    let m = &entry.manifest;
+    r.validate(config.host)
+        .map_err(|_| anyhow::anyhow!("invalid retained warm member"))?;
+    let member = m
+        .member
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("warm manifest lacks member key"))?;
+    anyhow::ensure!(
+        key == r.member().to_string()
+            && m.is_inert()
+            && member.member == r.member()
+            && member.slot == r.slot
+            && m.start.owner.host == config.host
+            && m.start.owner.epoch == r.epoch()
+            && r.epoch() <= config.epoch
+            && m.config.state_root == config.state_root.join("a")
+            && m.start.vcpu == r.prepare.vcpu
+            && m.start.memory_mib == r.prepare.memory_mib
+            && m.start.disk_mib == r.prepare.disk_mib,
+        "retained warm member identity mismatch"
+    );
+    m.validate()
 }
 
 impl Host {
-    fn identity(&self) -> (HostId, i64) {
+    fn warm_identity(&self) -> (HostId, i64) {
         (self.inner.config.host, self.inner.config.epoch)
+    }
+
+    fn this_epoch(&self, host: HostId, epoch: i64) -> Result<(), Status> {
+        if (host, epoch) != self.warm_identity() {
+            return Err(Status::failed_precondition(
+                "wrong host or supervisor epoch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn member_entry(&self, member: &uuid::Uuid) -> Result<Option<Entry>, Status> {
+        Ok(self.journal()?.warm.get(&member.to_string()).cloned())
+    }
+
+    /// Persist `record` for `member`, re-reading under the journal lock.
+    fn save_member(&self, record: &MemberRecord) -> Result<(), Status> {
+        let mut j = self.journal()?;
+        let entry = j
+            .warm
+            .get_mut(&record.member().to_string())
+            .ok_or_else(|| uncertain("warm member record missing"))?;
+        if entry.record.revision >= record.revision && entry.record != *record {
+            return Err(uncertain("concurrent warm member change"));
+        }
+        entry.record = record.clone();
+        self.save(&mut j)
+    }
+
+    /// Resources held by unadopted members, charged like allocations.
+    pub(super) fn warm_held(j: &Journal) -> (u64, u64, u64) {
+        j.warm
+            .values()
+            .filter(|e| e.record.holds_capacity())
+            .fold((0, 0, 0), |(c, m, d), e| {
+                (
+                    c.saturating_add(u64::from(e.record.prepare.vcpu)),
+                    m.saturating_add(e.record.prepare.memory_mib + MEMORY_OVERHEAD),
+                    d.saturating_add(e.record.prepare.disk_mib + DISK_OVERHEAD),
+                )
+            })
+    }
+
+    fn member_manifest(
+        &self,
+        intent: &PrepareIntent,
+        slot: AllocationId,
+    ) -> Result<Manifest, Status> {
+        let c = &self.inner.config;
+        let image = c
+            .images
+            .get(&intent.image_digest)
+            .ok_or_else(|| Status::permission_denied("image not allowed"))?;
+        if !sandbox_protocol::resources::supported(
+            intent.vcpu.into(),
+            intent.memory_mib.into(),
+            intent.disk_mib.into(),
+        ) {
+            return Err(Status::invalid_argument(
+                "resources outside real VM envelope",
+            ));
+        }
+        if let Some(capabilities) = &c.capabilities
+            && !capabilities.supports(
+                &intent.image_digest,
+                u64::from(intent.vcpu),
+                intent.memory_mib,
+                intent.disk_mib,
+            )
+        {
+            return Err(Status::failed_precondition(
+                "host image/resource compatibility mismatch",
+            ));
+        }
+        let now = now_ms()?;
+        Ok(Manifest {
+            launch_permit: None,
+            config: c.guardian_config(image),
+            start: guardian::Start {
+                owner: guardian::Owner::inert(c.host, intent.member_id, slot, c.epoch),
+                vcpu: intent.vcpu,
+                memory_mib: intent.memory_mib,
+                disk_mib: intent.disk_mib,
+                expires_unix_ms: now + MEMBER_LEASE_MS,
+            },
+            member: Some(guardian::Member {
+                member: intent.member_id,
+                slot,
+                valid_until_unix_ms: now + MEMBER_VALIDITY_MS,
+                bound_from: None,
+            }),
+        })
+    }
+
+    /// Reserve a new member durably, or return the existing one unchanged.
+    fn reserve_member(&self, intent: &PrepareIntent) -> Result<(Entry, bool), Status> {
+        let mut j = self.journal()?;
+        if let Some(entry) = j.warm.get(&intent.member_id.to_string()) {
+            entry.record.check_prepare_retry(intent).map_err(refusal)?;
+            return Ok((entry.clone(), false));
+        }
+        if j.warm.len() >= MAX_MEMBERS {
+            return Err(Status::resource_exhausted("warm member journal full"));
+        }
+        let slot = AllocationId::generate();
+        let manifest = self.member_manifest(intent, slot)?;
+        let (mut cpu, mut memory, mut disk) = Self::warm_held(&j);
+        for r in j.records.values() {
+            if let Some(m) = &r.manifest
+                && !r.released
+            {
+                cpu = cpu.saturating_add(u64::from(m.start.vcpu));
+                memory = memory.saturating_add(m.start.memory_mib + MEMORY_OVERHEAD);
+                disk = disk.saturating_add(m.start.disk_mib + DISK_OVERHEAD);
+            }
+        }
+        let cap = &self.inner.config.capacity;
+        if u64::from(intent.vcpu) > cap.vcpu.saturating_sub(cpu)
+            || intent.memory_mib + MEMORY_OVERHEAD > cap.memory_mib.saturating_sub(memory)
+            || intent.disk_mib + DISK_OVERHEAD > cap.disk_mib.saturating_sub(disk)
+        {
+            return Err(Status::resource_exhausted("host capacity reserved"));
+        }
+        let entry = Entry {
+            record: MemberRecord::new(intent.clone(), slot),
+            manifest,
+            gate: Arc::default(),
+        };
+        j.warm.insert(intent.member_id.to_string(), entry.clone());
+        self.save(&mut j)?;
+        Ok((entry, true))
+    }
+
+    /// Spawn the single-threaded guardian executable for a staged manifest.
+    pub(super) fn spawn_guardian(&self, manifest: &Manifest, label: String) -> bool {
+        match Command::new(&self.inner.config.guardian_binary)
+            .arg("--manifest")
+            .arg(manifest.directory().join("manifest.json"))
+            .arg("run")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || match child.wait() {
+                    Ok(status) if !status.success() => {
+                        eprintln!("sandbox guardian exited unexpectedly for {label}: {status:?}");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("could not wait for sandbox guardian for {label}: {error}");
+                    }
+                });
+                true
+            }
+            Err(error) => {
+                eprintln!("could not launch sandbox guardian for {label}: {error}");
+                false
+            }
+        }
+    }
+
+    /// Authenticate the inert member endpoint and record its boot.
+    fn member_ready(&self, entry: &mut Entry, wait: Duration) -> Result<bool, Status> {
+        let until = Instant::now() + wait;
+        loop {
+            if let Ok(reply) = guardian::control(&entry.manifest, Action::MemberHello)
+                && reply.error.is_none()
+                && let Some(r) = reply.receipt
+                && r.state == GuardianState::Running
+                && r.binding.is_none()
+                && let Some(boot) = r.guest_boot_id
+            {
+                if entry.record.mark_ready(&boot).map_err(refusal)? {
+                    self.save_member(&entry.record)?;
+                }
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub(super) fn warm_prepare_sync(
         &self,
-        _: WarmPrepareRequest,
+        request: WarmPrepareRequest,
     ) -> Result<WarmObservation, Status> {
-        Err(Status::failed_precondition(BLOCKED))
+        let intent: PrepareIntent = warm_pool::decode(&request.intent_json)
+            .map_err(|_| Status::invalid_argument("invalid prepare intent"))?;
+        if intent.version != VERSION || intent.member_id.is_nil() {
+            return Err(Status::invalid_argument("invalid prepare intent"));
+        }
+        self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
+        let (mut entry, fresh) = self.reserve_member(&intent)?;
+        let gate = entry.gate.clone();
+        let _gate = lock(&gate)?;
+        // Re-read under the member gate.
+        entry = self
+            .member_entry(&intent.member_id)?
+            .ok_or_else(|| uncertain("warm member record missing"))?;
+        if fresh || matches!(entry.record.state, MemberState::Preparing) {
+            match entry.manifest.receipt() {
+                // Never staged: stage and launch exactly once under the gate.
+                Err(_) if !entry.manifest.directory().join("receipt.json").exists() => {
+                    if entry.manifest.prepare().is_err()
+                        || !self.spawn_guardian(
+                            &entry.manifest,
+                            format!("warm member {}", intent.member_id),
+                        )
+                    {
+                        if entry.record.retire_locally("prepare_failed") {
+                            self.save_member(&entry.record)?;
+                        }
+                        let _ = self.cleanup_member(&mut entry);
+                        return Err(Status::unavailable(
+                            "warm member launch failed; reservation held until cleanup",
+                        ));
+                    }
+                }
+                Ok(r) if r.state == GuardianState::Stopped => {
+                    if entry.record.retire_locally("prepare_failed") {
+                        self.save_member(&entry.record)?;
+                    }
+                    return Err(Status::unavailable("warm member stopped before ready"));
+                }
+                _ => {}
+            }
+            if !self.member_ready(&mut entry, Duration::from_secs(4))? {
+                return Err(uncertain("warm member readiness pending"));
+            }
+        }
+        match entry.record.prepare_receipt().map_err(refusal)? {
+            Some(receipt) => reply(&WarmReceipt::Prepared { receipt }),
+            None => Err(uncertain("warm member readiness pending")),
+        }
+    }
+
+    /// Validate an adopt/inspect request: operation ownership (claim revision
+    /// fence), exact permit and intent agreement, and permit registration.
+    fn handoff_scope(
+        &self,
+        request: &WarmAdoptRequest,
+    ) -> Result<(Ownership, HandoffIntent, Permit), Status> {
+        let intent: HandoffIntent = warm_pool::decode(&request.intent_json)
+            .map_err(|_| Status::invalid_argument("invalid handoff intent"))?;
+        intent
+            .validate()
+            .map_err(|_| Status::invalid_argument("invalid handoff intent"))?;
+        self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
+        let o = self.owner(request.ownership.clone())?;
+        let permit: Permit = serde_json::from_slice(&request.launch_permit_json)
+            .map_err(|_| Status::invalid_argument("invalid launch permit"))?;
+        if !intent.admits(&permit, &o) {
+            return Err(Status::permission_denied(
+                "permit or ownership does not match handoff intent",
+            ));
+        }
+        Ok((o, intent, permit))
     }
 
     pub(super) fn warm_handoff_sync(
         &self,
         request: WarmAdoptRequest,
+        inspect_only: bool,
     ) -> Result<WarmObservation, Status> {
-        handoff(self.identity(), &request)
+        let (o, intent, permit) = self.handoff_scope(&request)?;
+        // gate() admits a missing allocation record only for the exact
+        // registered active permit when permits are required; fence() rejects
+        // a superseded operation claim before it reaches the member.
+        let allocation_gate = self.gate(&o)?;
+        let _allocation_gate = lock(&allocation_gate)?;
+        let record = self.fence(&o)?;
+        if self.inner.authority.is_some() {
+            let checkpoint = self
+                .journal()?
+                .launch_authority
+                .clone()
+                .ok_or_else(|| uncertain("missing authority checkpoint"))?;
+            let (registered, _guard) = crate::launch_authority::authorize_registered_allocation(
+                &self.inner.config.state_root.join("a"),
+                self.inner.config.host,
+                self.inner.config.epoch,
+                checkpoint.registered_through,
+                intent.allocation_id,
+            )
+            .map_err(|_| Status::failed_precondition("registered active allocation required"))?;
+            if registered != permit {
+                return Err(Status::permission_denied(
+                    "permit is not the registered permit",
+                ));
+            }
+        }
+        let Some(entry) = self.member_entry(&intent.member_id)? else {
+            // The journal records every member before its guardian launches,
+            // so no VM exists for this member at this epoch.
+            return rejected(&intent, "member_unknown");
+        };
+        let gate = entry.gate.clone();
+        let _gate = lock(&gate)?;
+        let mut entry = self
+            .member_entry(&intent.member_id)?
+            .ok_or_else(|| uncertain("warm member record missing"))?;
+        let host = self.inner.config.host;
+        if inspect_only {
+            let (changed, receipt) = entry.record.inspect(&intent, host).map_err(refusal)?;
+            if changed {
+                self.save_member(&entry.record)?;
+            }
+            return handoff_reply(receipt);
+        }
+        if matches!(entry.record.state, MemberState::Ready { .. })
+            && (record.create.is_some() || record.stopped)
+        {
+            // A cold create or stop already owns this allocation.
+            return Err(Status::failed_precondition(
+                "allocation already dispatched or stop-fenced",
+            ));
+        }
+        let (changed, step) = entry.record.begin_bind(&intent, host).map_err(refusal)?;
+        if changed {
+            self.save_member(&entry.record)?;
+        }
+        match step {
+            Step::Answer(receipt) => handoff_reply(receipt),
+            Step::Bind if record.create.is_some() || record.stopped => {
+                Err(uncertain("allocation changed during warm adoption"))
+            }
+            Step::Bind => self.bind_member(&mut entry, &o, &intent, permit, &request),
+        }
+    }
+
+    fn bind_member(
+        &self,
+        entry: &mut Entry,
+        o: &Ownership,
+        intent: &HandoffIntent,
+        permit: Permit,
+        request: &WarmAdoptRequest,
+    ) -> Result<WarmObservation, Status> {
+        deadline(request.allocation_expires_unix_ms)?;
+        let owner = guardian::Owner {
+            host: intent.host_id,
+            project: intent.project_id,
+            sandbox: intent.sandbox_id,
+            allocation: intent.allocation_id,
+            create_operation: intent.create_operation_id,
+            generation: intent.generation,
+            epoch: intent.supervisor_epoch,
+        };
+        let adoption = guardian::Adoption {
+            owner,
+            // Bound to the binding only when permits are enforced, so cleanup
+            // and renewal of the adopted VM use the same authority as Create.
+            permit: self.inner.authority.as_ref().map(|_| permit),
+            intent: intent.clone(),
+            expires_unix_ms: request.allocation_expires_unix_ms,
+        };
+        let response = guardian::control(&entry.manifest, Action::Adopt(Box::new(adoption)))
+            .map_err(uncertain)?;
+        if response.error.as_deref() == Some(guardian::ADOPTION_REFUSED) {
+            let receipt = entry
+                .record
+                .fail_bind("guest_refused_binding")
+                .map_err(refusal)?;
+            self.save_member(&entry.record)?;
+            return handoff_reply(receipt);
+        }
+        if response.error.is_some() {
+            return Err(uncertain("warm adoption unconfirmed"));
+        }
+        let binding = response
+            .receipt
+            .and_then(|r| r.binding)
+            .filter(|b| b.confirmed && b.intent_sha256 == entry_digest(intent))
+            .ok_or_else(|| uncertain("warm adoption unconfirmed"))?;
+        let view = entry.manifest.bound(&binding).map_err(uncertain)?;
+        // The allocation record gains its manifest only now: no command, file
+        // or lease RPC can reach the VM before the binding is confirmed.
+        {
+            let mut j = self.journal()?;
+            let r = j
+                .records
+                .get_mut(&o.allocation_id)
+                .ok_or_else(|| uncertain("record missing"))?;
+            r.create = Some(CreateRequest {
+                ownership: Some(o.clone()),
+                image_digest: entry.record.prepare.image_digest.clone(),
+                resources: Some(sandbox_protocol::supervisor::Resources {
+                    vcpu: entry.record.prepare.vcpu,
+                    memory_mib: entry.record.prepare.memory_mib,
+                    disk_mib: entry.record.prepare.disk_mib,
+                }),
+                allocation_expires_unix_ms: request.allocation_expires_unix_ms,
+                launch_permit_json: request.launch_permit_json.clone(),
+            });
+            r.manifest = Some(view);
+            r.dispatched = true;
+            let entry_record = j
+                .warm
+                .get_mut(&intent.member_id.to_string())
+                .ok_or_else(|| uncertain("warm member record missing"))?;
+            let receipt = entry_record
+                .record
+                .finish_bind(&binding.guest_identity_sha256)
+                .map_err(refusal)?;
+            entry.record = entry_record.record.clone();
+            // Capacity moves from the member to the allocation in one write.
+            self.save(&mut j)?;
+            handoff_reply(receipt)
+        }
+    }
+
+    /// Stop and clean the member's guardian state. Returns proof of cleanup.
+    fn cleanup_member(&self, entry: &mut Entry) -> Result<bool, Status> {
+        if !matches!(entry.record.state, MemberState::Retiring { .. }) {
+            return Ok(matches!(entry.record.state, MemberState::Retired));
+        }
+        let m = &entry.manifest;
+        // A timeout is uncertain. The lifecycle lock prevents racing a live
+        // guardian; fence_unstarted proves absence of unstaged state too.
+        let _ = guardian::control(m, Action::Stop);
+        let receipt = match m.fence_unstarted() {
+            Ok(r) => r,
+            Err(error)
+                if crate::launch_authority::is_lock_contended(&error)
+                    || guardian::is_ownership_busy(&error) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(uncertain(error)),
+        };
+        if receipt.state == GuardianState::Stopped && receipt.cleanup_confirmed {
+            entry.record.mark_retired().map_err(refusal)?;
+            self.save_member(&entry.record)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(super) fn warm_retire_sync(
         &self,
         request: WarmRetireRequest,
     ) -> Result<WarmObservation, Status> {
-        retire(self.identity(), &request)
+        let intent: RetireIntent = warm_pool::decode(&request.intent_json)
+            .map_err(|_| Status::invalid_argument("invalid retire intent"))?;
+        if intent.version != VERSION {
+            return Err(Status::invalid_argument("invalid retire intent"));
+        }
+        // Previous-epoch cleanup uses a distinct envelope (#216) that this
+        // host does not accept yet; retained old members stay reserved.
+        self.this_epoch(intent.host_id, intent.supervisor_epoch)?;
+        let Some(entry) = self.member_entry(&intent.member_id)? else {
+            if intent.vm_ref.is_some() {
+                return Err(Status::failed_precondition("unknown warm member"));
+            }
+            // Every member is journaled before launch: none was prepared.
+            return reply(&WarmReceipt::Cleanup {
+                receipt: CleanupReceipt {
+                    version: VERSION,
+                    member_id: intent.member_id,
+                    vm_ref: None,
+                    host_id: intent.host_id,
+                    supervisor_epoch: intent.supervisor_epoch,
+                    destroyed: true,
+                },
+            });
+        };
+        let gate = entry.gate.clone();
+        let _gate = lock(&gate)?;
+        let mut entry = self
+            .member_entry(&intent.member_id)?
+            .ok_or_else(|| uncertain("warm member record missing"))?;
+        if entry
+            .record
+            .begin_retire(&intent, self.inner.config.host)
+            .map_err(refusal)?
+        {
+            self.save_member(&entry.record)?;
+        }
+        if !self.cleanup_member(&mut entry)? {
+            return Err(Status::unavailable("warm member cleanup pending"));
+        }
+        let receipt = entry
+            .record
+            .cleanup_receipt()
+            .ok_or_else(|| uncertain("warm member cleanup unconfirmed"))?;
+        reply(&WarmReceipt::Cleanup { receipt })
+    }
+
+    /// One bounded maintenance step: clean a retiring member, retire an
+    /// expired one, or renew an idle member's guardian lease.
+    pub(super) fn reconcile_member(&self) -> Result<(), Status> {
+        let candidates: Vec<Entry> = {
+            let j = self.journal()?;
+            j.warm
+                .values()
+                .filter(|e| e.record.needs_cleanup())
+                .cloned()
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let index = self.inner.cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        let entry = &candidates[index];
+        let Ok(_gate) = entry.gate.try_lock() else {
+            return Ok(());
+        };
+        let Some(mut entry) = self.member_entry(&entry.record.member())? else {
+            return Ok(());
+        };
+        let now = now_ms()?;
+        let member = entry
+            .manifest
+            .member
+            .clone()
+            .ok_or_else(|| uncertain("warm manifest lacks member key"))?;
+        let previous = entry.record.epoch() < self.inner.config.epoch;
+        if (previous || now + MEMBER_LEASE_MS >= member.valid_until_unix_ms)
+            && entry.record.retire_locally(if previous {
+                "previous_epoch"
+            } else {
+                "member_expired"
+            })
+        {
+            self.save_member(&entry.record)?;
+        }
+        match &entry.record.state {
+            MemberState::Retiring { .. } => {
+                self.cleanup_member(&mut entry)?;
+            }
+            MemberState::Preparing => {
+                self.member_ready(&mut entry, Duration::ZERO)?;
+            }
+            MemberState::Ready { .. } => {
+                let Ok(reply) = guardian::control(&entry.manifest, Action::Inspect) else {
+                    return Ok(());
+                };
+                let Some(r) = reply.receipt else {
+                    return Ok(());
+                };
+                if r.state != GuardianState::Running {
+                    if entry.record.retire_locally("member_stopped") {
+                        self.save_member(&entry.record)?;
+                    }
+                    return Ok(());
+                }
+                // Renew well before expiry; the guardian refuses renewal once
+                // any binding exists, so this never extends an allocation.
+                if r.expires_unix_ms - now < MEMBER_LEASE_MS / 2 {
+                    let _ = guardian::control(
+                        &entry.manifest,
+                        Action::Renew {
+                            revision: r.renewal_revision + 1,
+                            expires_unix_ms: (now + MEMBER_LEASE_MS)
+                                .min(member.valid_until_unix_ms - 1),
+                        },
+                    );
+                }
+            }
+            // Binding or fenced members are never renewed: their inert lease
+            // lapses and the store retires them.
+            _ => {}
+        }
+        Ok(())
     }
 }
+
+fn entry_digest(intent: &HandoffIntent) -> String {
+    intent.digest().unwrap_or_default()
+}
+
+use sandbox_protocol::allocation_authority::Permit;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use sandbox_protocol::{AllocationId, Id, OperationId, ProjectId, SandboxId};
 
-    fn intent(host: HostId) -> HandoffIntent {
-        HandoffIntent {
+    fn artifact() -> Artifact {
+        Artifact {
+            path: "/nonexistent".into(),
+            sha256: "0".repeat(64),
+        }
+    }
+
+    fn inert(host: HostId, member: uuid::Uuid, slot: AllocationId) -> Manifest {
+        Manifest {
+            launch_permit: None,
+            config: guardian::Config {
+                state_root: "/var/lib/hudson/a".into(),
+                cgroup_parent: "/sys/fs/cgroup/hudson".into(),
+                firecracker: artifact(),
+                jailer: artifact(),
+                kernel: artifact(),
+                rootfs: artifact(),
+                jail_uid: 65534,
+                jail_gid: 65534,
+            },
+            start: guardian::Start {
+                owner: guardian::Owner::inert(host, member, slot, 3),
+                vcpu: 1,
+                memory_mib: 512,
+                disk_mib: 1024,
+                expires_unix_ms: 1_000,
+            },
+            member: Some(guardian::Member {
+                member,
+                slot,
+                valid_until_unix_ms: 2_000,
+                bound_from: None,
+            }),
+        }
+    }
+
+    fn prepare(host: HostId) -> PrepareIntent {
+        PrepareIntent {
             version: VERSION,
-            member_id: OperationId::generate().uuid(),
-            vm_ref: "warm-1".into(),
-            template_id: OperationId::generate().uuid(),
-            allocation_id: AllocationId::generate(),
-            project_id: ProjectId::generate(),
-            sandbox_id: SandboxId::generate(),
-            create_operation_id: OperationId::generate(),
-            generation: 1,
-            permit_serial: 1,
+            member_id: uuid::Uuid::now_v7(),
+            policy_id: uuid::Uuid::now_v7(),
+            template_id: uuid::Uuid::now_v7(),
             host_id: host,
-            supervisor_epoch: 4,
-            claim_revision: 1,
+            supervisor_epoch: 3,
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            vcpu: 1,
+            memory_mib: 512,
+            disk_mib: 1024,
+            operation_id: uuid::Uuid::now_v7(),
+            operation_revision: 1,
         }
     }
 
     #[test]
-    fn real_host_never_adopts_and_attests_only_unnamed_members() {
+    fn journals_and_guardian_files_without_warm_fields_load_unchanged() {
         let host = HostId::generate();
-        let i = intent(host);
-        let request = WarmAdoptRequest {
-            ownership: None,
-            intent_json: warm_pool::encode(&i).unwrap(),
-            launch_permit_json: Vec::new(),
-            allocation_expires_unix_ms: 0,
+        let journal = Journal {
+            launch_authority: None,
+            version: 1,
+            host,
+            epoch: 2,
+            records: BTreeMap::new(),
+            warm: BTreeMap::new(),
+            poisoned: false,
         };
-        let observed = handoff((host, 4), &request).unwrap();
-        assert!(!observed.simulated);
-        let WarmReceipt::Handoff { receipt } = warm_pool::decode(&observed.receipt_json).unwrap()
-        else {
-            panic!()
-        };
-        receipt.verify(&i).unwrap();
-        assert_eq!(
-            receipt.outcome,
-            HandoffOutcome::Rejected {
-                reason: "warm_unsupported".into()
-            }
+        let value = serde_json::to_value(&journal).unwrap();
+        assert!(value.get("warm").is_none());
+        let legacy = serde_json::json!({"version": 1, "host": host, "epoch": 2, "records": {}});
+        let loaded: Journal = serde_json::from_value(legacy).unwrap();
+        assert!(loaded.warm.is_empty());
+        // Cold manifests keep their pre-#188 serialization, so retained
+        // receipt digests still verify after upgrade.
+        let mut cold = inert(host, uuid::Uuid::now_v7(), AllocationId::generate());
+        cold.member = None;
+        let encoded = serde_json::to_value(&cold).unwrap();
+        assert!(encoded.get("member").is_none());
+        let reloaded: Manifest = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&reloaded).unwrap(), encoded);
+        let receipt = serde_json::json!({
+            "version": 1, "owner": cold.start.owner, "digest": "0".repeat(64),
+            "host_boot_id": "b", "state": "Stopped", "cleanup_confirmed": true,
+            "renewal_revision": 0, "expires_unix_ms": 1, "guardian_host_pid": null,
+            "guardian_start_ticks": null, "firecracker_namespace_pid": null,
+            "cgroup_inode": null, "reason": null
+        });
+        let receipt: Receipt = serde_json::from_value(receipt).unwrap();
+        assert!(receipt.binding.is_none());
+        assert!(
+            serde_json::to_value(&receipt)
+                .unwrap()
+                .get("binding")
+                .is_none()
         );
-        assert_eq!(
-            handoff((host, 5), &request).unwrap_err().code(),
-            tonic::Code::FailedPrecondition
-        );
-        let mut retire_intent = RetireIntent {
-            version: VERSION,
-            member_id: i.member_id,
-            vm_ref: None,
-            host_id: host,
-            supervisor_epoch: 4,
-            operation_id: OperationId::generate().uuid(),
-            operation_revision: 1,
+        let mut unknown = serde_json::to_value(&receipt).unwrap();
+        unknown["binding"] = serde_json::json!({"owner": cold.start.owner});
+        assert!(serde_json::from_value::<Receipt>(unknown).is_err());
+    }
+
+    #[test]
+    fn adopted_view_keeps_slot_paths_and_guardian_receipt_identity() {
+        let host = HostId::generate();
+        let member = uuid::Uuid::now_v7();
+        let slot = AllocationId::generate();
+        let m = inert(host, member, slot);
+        assert!(m.is_inert());
+        assert_eq!(m.key(), slot);
+        let owner = guardian::Owner {
+            host,
+            project: ProjectId::generate(),
+            sandbox: SandboxId::generate(),
+            allocation: AllocationId::generate(),
+            create_operation: OperationId::generate(),
+            generation: 1,
+            epoch: 3,
         };
-        let encode = |r: &RetireIntent| WarmRetireRequest {
-            intent_json: warm_pool::encode(r).unwrap(),
+        let mut binding = guardian::Binding {
+            owner: owner.clone(),
+            permit: None,
+            intent_sha256: "1".repeat(64),
+            identity_digest: "2".repeat(64),
+            guest_identity_sha256: "3".repeat(64),
+            identity_expires_unix_ms: 5_000,
+            confirmed: false,
         };
-        assert!(retire((host, 4), &encode(&retire_intent)).is_ok());
-        assert!(retire((host, 3), &encode(&retire_intent)).is_err());
-        retire_intent.vm_ref = Some("warm-1".into());
+        // An unconfirmed binding never yields an allocation view.
+        assert!(m.bound(&binding).is_err());
+        binding.confirmed = true;
+        let view = m.bound(&binding).unwrap();
+        assert!(!view.is_inert());
+        assert_eq!(view.start.owner, owner);
+        assert_eq!(view.key(), slot);
+        assert_eq!(view.directory(), m.directory());
+        assert_eq!(view.group(), m.group());
+        assert_eq!(view.jail_root(), m.jail_root());
+        let (receipt_owner, digest) = view.receipt_identity().unwrap();
         assert_eq!(
-            retire((host, 4), &encode(&retire_intent))
-                .unwrap_err()
-                .code(),
-            tonic::Code::FailedPrecondition
+            (receipt_owner, digest),
+            m.receipt_identity().unwrap(),
+            "the running guardian's receipt identity never changes"
         );
+        assert!(view.bound(&binding).is_err());
+    }
+
+    #[test]
+    fn only_unadopted_unretired_members_hold_capacity() {
+        let host = HostId::generate();
+        let mut journal = Journal {
+            launch_authority: None,
+            version: 1,
+            host,
+            epoch: 3,
+            records: BTreeMap::new(),
+            warm: BTreeMap::new(),
+            poisoned: false,
+        };
+        let mut add = |record: MemberRecord| {
+            let manifest = inert(host, record.member(), record.slot);
+            journal.warm.insert(
+                record.member().to_string(),
+                Entry {
+                    record,
+                    manifest,
+                    gate: Arc::default(),
+                },
+            );
+        };
+        let preparing = MemberRecord::new(prepare(host), AllocationId::generate());
+        let mut retired = MemberRecord::new(prepare(host), AllocationId::generate());
+        assert!(retired.retire_locally("prepare_failed"));
+        let mut retiring = retired.clone();
+        retiring.prepare.member_id = uuid::Uuid::now_v7();
+        assert!(retired.mark_retired().unwrap());
+        add(preparing);
+        add(retiring);
+        add(retired);
+        let (cpu, memory, disk) = Host::warm_held(&journal);
+        assert_eq!(cpu, 2);
+        assert_eq!(memory, 2 * (512 + MEMORY_OVERHEAD));
+        assert_eq!(disk, 2 * (1024 + DISK_OVERHEAD));
     }
 }

@@ -203,6 +203,7 @@ fn failed_durable_intent_write_poison_fences_without_discarding_receipts() {
         host,
         epoch: 1,
         records: BTreeMap::from([(allocation.clone(), record.clone())]),
+        warm: BTreeMap::new(),
         poisoned: false,
     };
     journal::save(&config, &mut journal).unwrap();
