@@ -919,7 +919,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&reloaded).unwrap(), encoded);
         let receipt = serde_json::json!({
             "version": 1, "owner": cold.start.owner, "digest": "0".repeat(64),
-            "host_boot_id": "b", "state": "Stopped", "cleanup_confirmed": true,
+            "host_boot_id": "b", "state": "stopped", "cleanup_confirmed": true,
             "renewal_revision": 0, "expires_unix_ms": 1, "guardian_host_pid": null,
             "guardian_start_ticks": null, "firecracker_namespace_pid": null,
             "cgroup_inode": null, "reason": null
