@@ -1,6 +1,6 @@
 # Python and TypeScript clients
 
-Status: development clients cover the 14 implemented Project API operations. Models and request methods are generated from the same [OpenAPI document](../api/openapi.json) as the [Rust client and CLI](client-cli.md). Version `0.0.0` matches the API/workspace. Python wheels and npm tarballs are built and installed in tests; no package has been published. Supported-host installation, signed distribution and hostile-workload release gates remain unfinished.
+Status: development clients cover the 14 implemented Project API operations. Models and request methods are generated from the same [OpenAPI document](../api/openapi.json) as the [Rust client and CLI](client-cli.md). Package versions match the API and workspace [version](versioning.md). Python wheels and npm tarballs are built and installed in tests; no package has been published. Supported-host installation, signed distribution and hostile-workload release gates remain unfinished.
 
 ## Build and configure
 

@@ -26,7 +26,7 @@ fix: retain disk reservations during cleanup
 ci: validate documentation on pull requests
 ```
 
-Common types are `feat`, `fix`, `docs`, `test`, `refactor`, `ci`, and `chore`; an optional scope is fine. Explain why in the body when useful. This is a writing convention, not a commit-message bot or release trigger. We squash merge, so intermediate commits do not need to be rewritten just to satisfy a message format.
+Common types are `feat`, `fix`, `docs`, `test`, `refactor`, `ci`, and `chore`; an optional scope is fine. Mark breaking changes with `!` (`feat!: ...`) or a `BREAKING CHANGE:` footer. Explain why in the body when useful. We squash merge, so the PR title becomes the commit subject on `main`; intermediate commits do not need to be rewritten. No bot enforces the format, but the [automatic version bump](docs/versioning.md#automatic-bumps) reads `feat`, `fix`, `perf` and breaking markers from `main`, so a mislabeled title produces the wrong release level.
 
 ## Checks available today
 
@@ -64,7 +64,7 @@ Agents follow the same contribution process: isolated worktree, focused branch, 
 
 ## Releases
 
-Merging is not releasing or deploying. There are no runtime releases or publishing workflow yet. Maintainers will publish versioned releases from reviewed `main` commits once the applicable delivery gates have evidence, with release notes, compatibility changes, upgrade instructions, and known limitations. Begin initial releases in `0.x`; select the first version when a usable artifact exists. Breaking changes must be called out even before `1.0`.
+Merging an ordinary PR is not releasing or deploying. The product version lives in [VERSION](VERSION) and every manifest must match it (`python3 scripts/version.py check`, run by `docs-check`). Releases follow [versioning](docs/versioning.md): a maintainer runs the Release workflow to open a `release: hudsonbox vX.Y.Z` PR that bumps the version and prepends a [changelog](CHANGELOG.md) section; after that PR is reviewed and merged, the workflow tags `vX.Y.Z` and publishes the GitHub release. Do not create `v*` tags or releases by hand. Releases publish source and notes only; no binaries, images or packages are published, and no release is a deployment. Versions are `0.x` until a deliberate `1.0.0`; breaking changes must be called out even before `1.0`.
 
 ## Maintainer references
 

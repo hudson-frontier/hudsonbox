@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hudsonbox-mcp"
-version = "0.0.0"
+version = "0.0.1"
 description = "Optional local stdio tools for the authenticated Hudsonbox API"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-dependencies = ["hudsonbox-client==0.0.0", "mcp==2.3.0", "jsonschema==4.26.0"]
+dependencies = ["hudsonbox-client==0.0.1", "mcp==2.3.0", "jsonschema==4.26.0"]
 
 [project.scripts]
 hudsonbox-mcp = "hudsonbox_mcp.__main__:main"

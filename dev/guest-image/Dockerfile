@@ -23,6 +23,7 @@ RUN test "$(uname -m)" = "$HUDSON_ARCH" \
     && mkdir /out \
     && cp target/release/sandbox-guest /out/sandbox-guest \
     && cp Cargo.lock /out/Cargo.lock
+COPY VERSION VERSION
 COPY scripts/guest_image.py scripts/guest_image.py
 COPY dev/guest-image/ dev/guest-image/
 RUN python3 scripts/guest_image.py fetch-kernel --architecture "$HUDSON_ARCH" --directory /src/linux

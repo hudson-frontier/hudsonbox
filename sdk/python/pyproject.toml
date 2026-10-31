@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hudsonbox-client"
-version = "0.0.0"
+version = "0.0.1"
 description = "Project-scoped HTTPS client for Hudsonbox"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
     };
     use std::{net::SocketAddr, path::PathBuf, time::Duration};
     #[derive(Parser)]
+    #[command(display_name = "sandbox-host (hudsonbox)", version)]
     struct Args {
         #[arg(long)]
         config: PathBuf,

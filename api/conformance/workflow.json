@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "api_version": "0.0.0",
+  "api_version": "0.0.1",
   "logical_run_id": "durable-workflow-fixture-v1",
   "sandbox_id": "sbx_01996110-7c00-7000-8000-000000000001",
   "operation_id": "op_01996110-7c00-7000-8000-000000000002",

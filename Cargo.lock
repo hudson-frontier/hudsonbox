@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-api"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-artifacts"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2192,7 +2192,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-cleanup"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "clap",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-client"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-controller"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-fake-host"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guest"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-protocol"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "getrandom 0.3.4",
@@ -2358,7 +2358,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-store"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "hex",
  "percent-encoding",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-supervisor"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",

@@ -10,6 +10,7 @@ use sandbox_store::retention::ResponseRetention;
 use std::{path::PathBuf, time::Duration};
 
 #[derive(Parser)]
+#[command(display_name = "sandbox-cleanup (hudsonbox)", version)]
 struct Args {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,

@@ -14,6 +14,7 @@ capabilities. Supported-host isolation and operational qualification remain inco
 | [Local development](local-development.md) | Prerequisites, build, dependencies and tests |
 | [API and SDKs](api-contract.md) | Customer-facing behavior and retries |
 | [Roadmap](roadmap.md) | Delivery gates and current limitations |
+| [Versioning](versioning.md) | Product version, bumps, changelog and releases |
 | [Product goal](goal.md) | Scope and priorities |
 
 Implementation tasks live in [release #177](https://github.com/hudson-frontier/hudsonbox/issues/177)
